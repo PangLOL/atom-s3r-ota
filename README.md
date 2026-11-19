@@ -23,3 +23,9 @@ version is greater than the `ota_version.txt` written at the last flash
 or update.
 
 `.nojekyll` keeps GitHub Pages from running Jekyll.
+
+Current payload: **2026.11.21-b1** (version **2**).
+
+Version 1 was the OTA-capable gauges fallback. Version 2 is the graphics
+build (original drawn after-backdrop, boost FX, Chao, ring HUD). Device
+secrets are never stored here.
