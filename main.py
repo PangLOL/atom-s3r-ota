@@ -1,11 +1,11 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
-V6: PIX6 pixel-index interpreter. Sprites come from the approved engine sheet
-(idle / idle_trigger / run_slow / run_medium / run_fast, ocean, ground, palms,
-bush, flowers, tiny flowers, rings). Chao, official mouths, and boost FX rips
-are not packed. Aura / shockwave / barrier still use V2 primitives. FACE_ENABLED
-stays off. Companion asset pixidx.bin is fetched from the OTA host if missing;
-this file is not published until you say so.
+V7: PIX6 pixel-index interpreter with art pre-scaled to the locked after/boost
+preview sizes (Sonic 39x36, playfield 128x103, rings 14x14). Sprites: engine-sheet
+Sonic cycles plus after-preview scenery / HUD / rings. Chao, official mouths, and
+boost FX rips are not packed. Aura / shockwave / barrier still use V2 primitives,
+layered on top of Sonic at tip (66, 72), alpha 178. FACE_ENABLED stays off.
+Companion asset pixidx.bin is fetched from the OTA host if missing.
 
 Layout: animation in the top four-fifths. Bottom fifth is a 2-by-2
 grid of horizontal gauges, no labels. Upper left is RPM, upper right
@@ -66,13 +66,13 @@ REFRESH_MS = 50
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 6
-APP_VERSION_NAME = "2026.11.21-v6"
+APP_VERSION = 7
+APP_VERSION_NAME = "2026.11.21-v7"
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
 FX_FRAME_MS = 1000 // 15  # 15 fps, same as S3Vec run_fast
-SONIC_MID_Y = 82
+SONIC_MID_Y = 72
 AURA_TIP_X = 66
 SW_TIP_X = 76
 FACE_ENABLED = False      # sheet has no face / mouth layer; stay off
@@ -366,28 +366,48 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "17d4399ca81a3ed31963379fd3b20bd47488d6546f6aa1b956f0d7c21d4893c4"
+PIXIDX_SHA256 = "6009435444f0016110ed1c5b620b686508de15a4db10e11c3f0a5b98a5fedca8"
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIX6_MAGIC = b"PIX6"
 
 SPEED_SLOW = 40.0
 SPEED_FAST = 80.0
 IDLE_TRIGGER_AFTER_MS = 3500
-SONIC_X = 58
-GROUND_SURFACE_IN_TILE = 40
-PROP_PERIOD = 333
 
-# World-x of mid-ground rings in PROP_PERIOD, groups of 4 then 5 (in 3-8).
-FIELD_RING_X = (36, 54, 72, 90, 180, 196, 212, 228, 244)
+# Locked after-preview layout (128x128). Sonic sprite is 39x36 at top-left
+# (16, 55). Frames use a feet-centre origin, so the blit dest is the exclusive
+# bottom of that box: (35, 91). Feet plant on y 90. Playfield is y 0-102.
+SONIC_X = 16
+SONIC_Y = 55
+SONIC_W = 39
+SONIC_H = 36
+SONIC_FEET_Y = 90
+SONIC_HEAD_Y = 63
+SONIC_FRONT_X = 54
+SONIC_FEET_DEST_X = SONIC_X + SONIC_W // 2  # 35
+SONIC_FEET_DEST_Y = SONIC_Y + SONIC_H       # 91
+AURA_TIP_Y = SONIC_MID_Y  # 72
+AURA_ALPHA = 178
+HUD_RING_POS = (4, 3)
+HUD_BAR_POS = (14, 6)
+GROUND_SURFACE_IN_TILE = 0  # unused; feet dest is locked, backdrop includes ground
+PROP_PERIOD = 384   # 384x103 backdrop width
+RING_PERIOD = 1536  # long gaps between groups of 3-8
+RING_FPS_MS = 1000 // 30  # 33
 
-# Scenery props: (frame_name, world_x)
+# World-x of mid-ground ring centres. First group matches the after still
+# (centres 66, 82, 97 at y 78). Second group of 5 after a long gap.
+FIELD_RING_X = (66, 82, 97, 866, 882, 898, 914, 930)
+FIELD_RING_Y = 78
+
+# Scenery is baked into the 384x103 backdrop. These are kept as a fallback
+# only if a pack has no ocean frame (should not happen in V7).
 SCENERY_PROPS = (
-    ("palm_0", 24),
-    ("palm_1", 90),
-    ("bush_0", 140),
-    ("tiny_flowers_0", 210),
-    ("flowers_0", 250),
-    ("tiny_flowers_2", 310),
+    ("palm_0", 5),
+    ("island_0", 65),
+    ("palm_1", 114),
+    ("bush_0", 0),
+    ("flowers_0", 102),
 )
 
 
@@ -773,29 +793,44 @@ SUNFLOWERS = (
     (174, 9),
 )
 
-# 3x5 bitmap digits for the ring HUD.
+# 5x7 bitmap digits for the ring HUD, with a 1px dark outline.
 DIGITS = (
-    (0b111, 0b101, 0b101, 0b101, 0b111),
-    (0b010, 0b110, 0b010, 0b010, 0b111),
-    (0b111, 0b001, 0b111, 0b100, 0b111),
-    (0b111, 0b001, 0b111, 0b001, 0b111),
-    (0b101, 0b101, 0b111, 0b001, 0b001),
-    (0b111, 0b100, 0b111, 0b001, 0b111),
-    (0b111, 0b100, 0b111, 0b101, 0b111),
-    (0b111, 0b001, 0b001, 0b001, 0b001),
-    (0b111, 0b101, 0b111, 0b101, 0b111),
-    (0b111, 0b101, 0b111, 0b001, 0b111),
+    (0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110),
+    (0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110),
+    (0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111),
+    (0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110),
+    (0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010),
+    (0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110),
+    (0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110),
+    (0b11111, 0b00001, 0b00010, 0b00100, 0b00100, 0b00100, 0b00100),
+    (0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110),
+    (0b01110, 0b10001, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110),
 )
-# fix typo above if any - will check
+COL_HUD_DIGIT = 0xF8F8F8
+COL_HUD_OUTLINE = 0x101018
 
 
-def draw_digit(lcd, x, y, n, color, s=1):
+def draw_digit(lcd, x, y, n, color=None, s=1, outline=None):
     n = int(n) % 10
     bits = DIGITS[n]
-    for row in range(5):
+    if color is None:
+        color = COL_HUD_DIGIT
+    if outline is None:
+        outline = COL_HUD_OUTLINE
+    # outline first
+    for row in range(7):
         rowb = bits[row]
-        for col in range(3):
-            if rowb & (0b100 >> col):
+        for col in range(5):
+            if rowb & (0b10000 >> col):
+                for oy in (-1, 0, 1):
+                    for ox in (-1, 0, 1):
+                        if ox == 0 and oy == 0:
+                            continue
+                        lcd.fillRect(x + col * s + ox, y + row * s + oy, s, s, outline)
+    for row in range(7):
+        rowb = bits[row]
+        for col in range(5):
+            if rowb & (0b10000 >> col):
                 lcd.fillRect(x + col * s, y + row * s, s, s, color)
 
 
@@ -1030,19 +1065,15 @@ class Sprite:
             self._surface = GAUGE_Y - 2
             self.ground_y = self._surface
             return
-        ground = pack.by_name.get("ground")
-        if ground is None:
-            self._ground_top = GAUGE_Y - 2
-            self._surface = GAUGE_Y - 2
-        else:
-            self._ground_top = GAUGE_Y - ground.h
-            self._surface = self._ground_top + GROUND_SURFACE_IN_TILE
+        # Locked after-preview feet dest, independent of the ground tile.
+        self._surface = SONIC_FEET_DEST_Y
+        self._ground_top = GAUGE_Y - 15
         self.ground_y = self._surface
 
     def advance(self, speed, dt_ms):
         if speed is None:
             speed = 0.0
-        period = float(PROP_PERIOD if self.pack is not None else PERIOD)
+        period = float(RING_PERIOD if self.pack is not None else PERIOD)
         self.scroll = (self.scroll + speed * dt_ms * 0.012) % period
         if speed < 1.0:
             self.phase = 0.0
@@ -1094,7 +1125,7 @@ class Sprite:
             self.anim_i = 0
         dur = frames[self.anim_i].duration_ms
         if dur <= 0:
-            dur = 66
+            dur = RING_FPS_MS
         self.anim_accum += dt_ms
         while self.anim_accum >= dur:
             self.anim_accum -= dur
@@ -1111,11 +1142,11 @@ class Sprite:
                 break
             dur = frames[self.anim_i].duration_ms
             if dur <= 0:
-                dur = 66
-        # Spin the mid-ground rings at 15 fps regardless of Sonic's cycle.
+                dur = RING_FPS_MS
+        # Spin the mid-ground rings at 30 fps regardless of Sonic's cycle.
         self.ring_accum += dt_ms
-        while self.ring_accum >= 66:
-            self.ring_accum -= 66
+        while self.ring_accum >= RING_FPS_MS:
+            self.ring_accum -= RING_FPS_MS
             self.ring_i = (self.ring_i + 1) & 7
 
     def _step_sparkles(self, dt_ms):
@@ -1128,8 +1159,8 @@ class Sprite:
         for item in self.sparkles:
             x, y, i, acc = item
             acc += dt_ms
-            while acc >= 66:
-                acc -= 66
+            while acc >= RING_FPS_MS:
+                acc -= RING_FPS_MS
                 i += 1
             if n and i < n:
                 kept.append([x, y, i, acc])
@@ -1137,12 +1168,12 @@ class Sprite:
 
 
     def _collect_rings(self):
-        # A ring counts when its scrolled centre crosses Sonic's mid x.
+        # A ring counts when its scrolled centre crosses Sonic's front.
         off = int(self.scroll)
         mask = 0
         if self.pack is not None:
-            mid = SONIC_X
-            period = PROP_PERIOD
+            mid = SONIC_FRONT_X
+            period = RING_PERIOD
             for i, rx in enumerate(FIELD_RING_X):
                 x = (rx - off) % period
                 if x <= mid:
@@ -1163,24 +1194,44 @@ class Sprite:
                 v >>= 1
             self.rings = (self.rings + n) % 1000
             if self.pack is not None:
-                period = PROP_PERIOD
+                period = RING_PERIOD
                 for i, rx in enumerate(FIELD_RING_X):
                     if (gained >> i) & 1:
                         x = (rx - off) % period
-                        self.sparkles.append([x, self._surface - 18, 0, 0])
+                        self.sparkles.append([x, FIELD_RING_Y, 0, 0])
         self._ring_seen = mask
 
     def _draw_ring_hud(self, lcd):
         # Compact original ring + digits. Kept in the playfield, not in the gauges.
         # Offset from the CAN-fault dot in the upper-left corner.
+        pack = self.pack
+        if pack is not None:
+            pal = pack.pal(1)
+            bar = pack.by_name.get("hud_bar")
+            ring = pack.by_name.get("hud_ring")
+            bx, by = HUD_BAR_POS
+            if bar is not None:
+                blit_frame(lcd, pack, bar, bx, by, pal, 0, GAUGE_Y, False)
+            if ring is not None:
+                blit_frame(lcd, pack, ring, HUD_RING_POS[0], HUD_RING_POS[1], pal, 0, GAUGE_Y, False)
+            dx, dy = bx + 22, by + 4
+            n = int(self.rings) % 1000
+            draw_digit(lcd, dx + 14, dy, n % 10)
+            if n >= 10:
+                draw_digit(lcd, dx + 7, dy, (n // 10) % 10)
+            if n >= 100:
+                draw_digit(lcd, dx, dy, (n // 100) % 10)
+            return
+        # V2 primitive fallback
         x, y = 16, 3
         draw_ring_glyph(lcd, x + 5, y + 6, 5, 6)
         lcd.fillRect(x + 12, y + 1, 26, 12, COL_HUD)
-        # three digits, 3x5 at scale 2 would be wide; use scale 1 with padding.
-        n = int(self.rings)
-        draw_digit(lcd, x + 14, y + 3, (n // 100) % 10, COL_HUD_EDGE, 1)
-        draw_digit(lcd, x + 19, y + 3, (n // 10) % 10, COL_HUD_EDGE, 1)
+        n = int(self.rings) % 1000
         draw_digit(lcd, x + 24, y + 3, n % 10, COL_HUD_EDGE, 1)
+        if n >= 10:
+            draw_digit(lcd, x + 19, y + 3, (n // 10) % 10, COL_HUD_EDGE, 1)
+        if n >= 100:
+            draw_digit(lcd, x + 14, y + 3, (n // 100) % 10, COL_HUD_EDGE, 1)
 
     def _draw_sunflower(self, lcd, x, gy, h):
         stem_x, top = x, gy - h
@@ -1209,8 +1260,9 @@ class Sprite:
         else:
             self._draw_background(lcd)
             tip_y = SONIC_MID_Y
-            self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
             self._draw_sonic(lcd, speed, tps, clt)
+            # Aura is layered on top of Sonic at the locked tip.
+            self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
             self.boost.draw_front(lcd, SW_TIP_X, tip_y)
         self._draw_ring_hud(lcd)
 
@@ -1218,37 +1270,25 @@ class Sprite:
         pack = self.pack
         pal_s = pack.pal(1)
         pal_c = pack.pal(0)
+        pal_b = pack.pal(2) if len(pack.palettes) > 2 else pal_s
         amount = sonic_tint_amount(clt, now)
         if amount > 0:
             pal_c = tint_blue_palette(pal_c, amount)
         ocean = pack.by_name.get("ocean")
-        ground = pack.by_name.get("ground")
         off = int(self.scroll)
+        # Backdrop already includes sky, water, scenery and the grass/dirt band.
+        # Scroll 1:1 with the mid-ground rings so the after still stays aligned.
         if ocean is not None:
-            blit_tiled_x(lcd, pack, ocean, 0, off // 2, pal_s, 0, GAUGE_Y)
-        if ground is not None:
-            blit_tiled_x(lcd, pack, ground, self._ground_top, off, pal_s, 0, GAUGE_Y)
-        surface = self._surface
-        for name, wx in SCENERY_PROPS:
-            fr = pack.by_name.get(name)
-            if fr is None:
-                continue
-            x = (wx - off) % PROP_PERIOD
-            if x > W + fr.w:
-                x -= PROP_PERIOD
-            if x < -fr.w or x > W + fr.w:
-                continue
-            blit_frame(lcd, pack, fr, x, surface, pal_s, 0, GAUGE_Y, True)
-        tip_y = surface - 16
-        self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
+            blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
         ring_frames = pack.cycles.get("rings")
         if ring_frames:
             fr = ring_frames[self.ring_i % len(ring_frames)]
-            ry = surface - 18
+            ry = FIELD_RING_Y
+            period = RING_PERIOD
             for wx in FIELD_RING_X:
-                x = (wx - off) % PROP_PERIOD
+                x = (wx - off) % period
                 if x > W + 40:
-                    x -= PROP_PERIOD
+                    x -= period
                 if -40 < x < W + 40:
                     blit_frame(lcd, pack, fr, x, ry, pal_s, 0, GAUGE_Y, True)
         spark_frames = pack.cycles.get("rings_sparkle")
@@ -1260,8 +1300,10 @@ class Sprite:
         frames = self._cycle_frames(self.anim_tag)
         if frames:
             fr = frames[self.anim_i % len(frames)]
-            blit_frame(lcd, pack, fr, SONIC_X, surface, pal_c, 0, GAUGE_Y, True)
-        self.boost.draw_front(lcd, SW_TIP_X, tip_y)
+            blit_frame(lcd, pack, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, pal_c, 0, GAUGE_Y, True)
+        # Aura / shockwave on top of Sonic, tip 12 px ahead at mid_y 72.
+        self.boost.draw_behind(lcd, AURA_TIP_X, AURA_TIP_Y)
+        self.boost.draw_front(lcd, SW_TIP_X, AURA_TIP_Y)
 
     def _wrapped(self, x, w, off):
         xx = (x - off) % PERIOD
