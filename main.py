@@ -1,26 +1,22 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
-V12: the V11 picture, with on-device timing and skipped redraws.
-Same pre-scaled PIX6 art (Sonic 39x36, playfield 128x103, rings 14x14).
-At pack load the 384x103 ocean tile is pre-rendered into an RGB565 buffer
-(~79 KB) and split into parallax layers: sky/clouds at 0.25, water and
-islands at 0.6, ground and near palms at 1.0. The packed art has no
-mountain band, so 0.4 is unused. Sonic cycles, the HUD ring and bar, field
-rings, and ring sparkles are baked once into RGB565 plus a 1-bit mask.
-Each frame still pushes one 128x103 playfield image. A band is recopied
-only when int(scroll * factor) changes. A scenery stamp is rebuilt only
-inside the rectangles a shifted band or a moved stamp actually dirtied,
-so the window stays pixel-identical to a full V11 compose. Unchanged
-sprite frames are left in place; a small underlay restores the backdrop
-under a sprite that did change (animation, spinning rings, sparkles, or
-the overheat tint). Parked, the parallax compose is skipped. Every two
-seconds a timing line prints average compose / sprite-stamp / push
-milliseconds, one GC sample, total, fps, and how many frames held the
-backdrop. That print does not rebuild the ocean or the sprite cache.
-If the underlay cannot be allocated, drawing stays on the V11 full
-compose. If a stamp fails later, the bake flag is cleared and drawing
-stays on the fillRect interpreter. This file is version 12; it is not
-the published Pages payload until the owner ships it.
+V13: driving benchmark. Same pre-scaled PIX6 art (Sonic 39x36, playfield
+128x103, rings 14x14). Sonic cycles, the HUD ring and bar, field rings,
+and ring sparkles are still baked once into RGB565 plus a 1-bit mask and
+stamped with the viper path when its self-test passes. The packed 384x103
+ocean, its parallax bands, palm stamps, and loop island are not allocated
+or drawn, and the band retain/skip path for those layers does not run.
+In their place the V2 Green Hill fillRect scene is drawn into the 128x103
+window: clouds 0.25, mountains 0.4, water and islands 0.6, ground and near
+palms 1.0. Baked sprites are stamped into that window and one pushImage
+sends the playfield, so a later push cannot wipe the background.
+ground_y is the locked feet dest (palms plant at gy - GRASS_H + 2). Every
+two seconds a timing line prints average compose (the V2 background) /
+sprite-stamp / push milliseconds, one GC sample, total, fps, and hold.
+That print does not rebuild the sprite cache. draw() does not prepare the
+ocean or rebuild sprites. If the bake or a stamp cannot allocate, sprites
+use fillRect on the same V2 background, not the packed ocean. This file is
+version 13; it is not the published Pages payload until the owner ships it.
 The face button is polled every main-loop iteration and during a draw, so a
 450 ms double-press can be caught even if a frame runs long.
 Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
@@ -88,8 +84,8 @@ REFRESH_MS = 50
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 12
-APP_VERSION_NAME = "2026.11.21-v12"
+APP_VERSION = 13
+APP_VERSION_NAME = "2026.11.21-v13"
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
@@ -416,9 +412,10 @@ HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
 GROUND_SURFACE_IN_TILE = 0  # unused; feet dest is locked, backdrop includes ground
 PROP_PERIOD = 384   # 384x103 backdrop width
-# V2 fallback ratios, applied to bands split from the prerendered ocean.
+# V2 parallax ratios. V13 draws these with the primitive Green Hill
+# background. The packed ocean is not split into bands.
 PARALLAX_CLOUDS = 0.25
-PARALLAX_MOUNTAINS = 0.4  # packed art has no mountain band
+PARALLAX_MOUNTAINS = 0.4
 PARALLAX_WATER = 0.6
 PARALLAX_GROUND = 1.0
 HORIZON_Y = 32   # sky/clouds above; water and the horizon line from here
@@ -483,18 +480,16 @@ def _sha256_hex(data):
             h = None
     if h is None:
         return None
+    # This MicroPython build exposes digest and not a hex helper.
     try:
-        return h.hexdigest()
+        digest = h.digest()
     except Exception:
-        try:
-            digest = h.digest()
-        except Exception:
-            return None
-        try:
-            import ubinascii
-            return ubinascii.hexlify(digest).decode()
-        except Exception:
-            return "".join("%02x" % b for b in digest)
+        return None
+    try:
+        import ubinascii
+        return ubinascii.hexlify(digest).decode()
+    except Exception:
+        return "".join("%02x" % b for b in digest)
 
 
 class PixFrame:
@@ -2137,6 +2132,163 @@ class BoostFX:
             draw_barrier(lcd, tip_x, tip_y, self.bar_i)
 
 
+class PlayfieldFB:
+    """128x103 RGB565 target for the V2 primitive background.
+
+    Implements the LCD primitives _draw_background already calls, writing
+    little-endian RGB565. fillEllipse follows the fillRect ellipse in
+    fill_ellipse so the Green Hill scene stays the V2 fillRect picture.
+    A later pushImage of this buffer is the whole playfield, sprites included.
+    """
+
+    def __init__(self, w, h):
+        self.w = w
+        self.h = h
+        self.buf = bytearray(w * h * 2)
+        self._last_c = None
+        self._last_p = None
+        self._span_key = None
+        self._span = None
+
+    def _pair(self, color):
+        if color == self._last_c:
+            return self._last_p
+        v = _rgb888_to_565(color)
+        pair = bytes((v & 0xFF, (v >> 8) & 0xFF))
+        self._last_c = color
+        self._last_p = pair
+        return pair
+
+    def fillRect(self, x, y, w, h, color):
+        x = int(x)
+        y = int(y)
+        w = int(w)
+        h = int(h)
+        if w <= 0 or h <= 0:
+            return
+        if x < 0:
+            w += x
+            x = 0
+        if y < 0:
+            h += y
+            y = 0
+        vw = self.w
+        vh = self.h
+        if x >= vw or y >= vh:
+            return
+        if x + w > vw:
+            w = vw - x
+        if y + h > vh:
+            h = vh - y
+        if w <= 0 or h <= 0:
+            return
+        key = (color, w)
+        if key == self._span_key:
+            span = self._span
+        else:
+            span = self._pair(color) * w
+            self._span_key = key
+            self._span = span
+        buf = self.buf
+        nbytes = w * 2
+        row = 0
+        while row < h:
+            dst = ((y + row) * vw + x) * 2
+            buf[dst:dst + nbytes] = span
+            row += 1
+
+    def fillEllipse(self, x, y, rx, ry, color):
+        # Same coverage as fill_ellipse's fillRect fallback.
+        x = int(x)
+        y = int(y)
+        rx = max(1, int(rx))
+        ry = max(1, int(ry))
+        i = -rx
+        while i <= rx:
+            yy = int(ry * math.sqrt(max(0.0, 1.0 - (i / rx) ** 2)))
+            self.fillRect(x + i, y - yy, 1, yy * 2 + 1, color)
+            i += 1
+
+    def fillCircle(self, x, y, r, color):
+        self.fillEllipse(x, y, r, r, color)
+
+    def _hline(self, y, a, b, color):
+        if a > b:
+            a, b = b, a
+        self.fillRect(a, y, b - a + 1, 1, color)
+
+    def fillTriangle(self, x0, y0, x1, y1, x2, y2, color):
+        # Integer edges so a whole-pixel scroll does not crawl the outline.
+        x0 = int(x0)
+        y0 = int(y0)
+        x1 = int(x1)
+        y1 = int(y1)
+        x2 = int(x2)
+        y2 = int(y2)
+        if y0 > y1:
+            x0, y0, x1, y1 = x1, y1, x0, y0
+        if y1 > y2:
+            x1, y1, x2, y2 = x2, y2, x1, y1
+        if y0 > y1:
+            x0, y0, x1, y1 = x1, y1, x0, y0
+        if y0 == y2:
+            xa = x0
+            if x1 < xa:
+                xa = x1
+            if x2 < xa:
+                xa = x2
+            xb = x0
+            if x1 > xb:
+                xb = x1
+            if x2 > xb:
+                xb = x2
+            self._hline(y0, xa, xb, color)
+            return
+        dx02 = ((x2 - x0) << 16) // (y2 - y0)
+        xa = x0 << 16
+        y = y0
+        if y1 > y0:
+            dx01 = ((x1 - x0) << 16) // (y1 - y0)
+            xb = xa
+            while y < y1:
+                self._hline(y, xa >> 16, xb >> 16, color)
+                xa += dx02
+                xb += dx01
+                y += 1
+        if y2 >= y1:
+            dx12 = 0
+            if y2 > y1:
+                dx12 = ((x2 - x1) << 16) // (y2 - y1)
+            xb = x1 << 16
+            while y <= y2:
+                self._hline(y, xa >> 16, xb >> 16, color)
+                xa += dx02
+                xb += dx12
+                y += 1
+
+    def drawLine(self, x0, y0, x1, y1, color):
+        x0 = int(x0)
+        y0 = int(y0)
+        x1 = int(x1)
+        y1 = int(y1)
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        while True:
+            self.fillRect(x0, y0, 1, 1, color)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = err * 2
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+
+
 class Sprite:
     """Composited chibi Sonic: separate pieces, swapped by speed, retimed by phase."""
 
@@ -2159,6 +2311,7 @@ class Sprite:
         self.sparkles = []  # [x, y, i, accum]
         self._surface = GAUGE_Y - 2
         self._ground_top = GAUGE_Y - 2
+        self._pf_fb = None
         self.ocean_rgb565 = None
         self.ocean_tw = 0
         self.ocean_th = 0
@@ -2172,10 +2325,8 @@ class Sprite:
         self._scratch_len = 0
         self._sprite_bake = False
         self._playfield_stamped = False
-        # Retained playfield. Bands and scenery update only where scroll
-        # actually moved; sprite underlays let animation change without a
-        # full compose. _prepare_ocean(force=False) still returns before
-        # any of this is touched.
+        # V12 retain state. V13 does not use it: the V2 background is
+        # redrawn every frame, and packed scenery is not retained.
         self._retain = False
         self._under_buf = None
         self._under_spans = []
@@ -2209,6 +2360,7 @@ class Sprite:
             self._ground_top = GAUGE_Y - 2
             self._surface = GAUGE_Y - 2
             self.ground_y = self._surface
+            self._pf_fb = None
             self.ocean_rgb565 = None
             self.ocean_window = None
             self.ocean_stamps = []
@@ -2216,15 +2368,39 @@ class Sprite:
             self._ocean_push = True
             self._drop_sprite_cache()
             return
-        # Locked after-preview feet dest, independent of the ground tile.
+        # Locked feet dest is the V2 ground line. Palms plant on
+        # gy - GRASS_H + 2 and the grass crown meets the shoes.
         self._surface = SONIC_FEET_DEST_Y
         self._ground_top = GAUGE_Y - 15
         self.ground_y = self._surface
-        self._prepare_ocean(force=True)
+        self._ocean_push = True
+        self._prepare_playfield(force=True)
         self._prepare_sprites(force=True)
 
+    def _prepare_playfield(self, force=False):
+        """Allocate the 128x103 V2 window once. Does not build an ocean tile."""
+        if not force and self._pf_fb is not None:
+            return
+        self._pf_fb = None
+        self.ocean_rgb565 = None
+        self.ocean_window = None
+        self.ocean_stamps = []
+        self._parallax = False
+        self.ocean_tw = 0
+        self.ocean_th = 0
+        try:
+            self._pf_fb = PlayfieldFB(W, GAUGE_Y)
+        except MemoryError:
+            print("playfield alloc failed")
+            return
+        except Exception as e:
+            print("playfield alloc failed:", e)
+            self._pf_fb = None
+            return
+        print("playfield v2", self._pf_fb.w, self._pf_fb.h, len(self._pf_fb.buf))
+
     def _prepare_ocean(self, force=False):
-        """Pre-render the 384x103 ocean tile into RGB565 once per pack load."""
+        """V12 ocean prerender. V13 does not call this from draw or pack load."""
         if (
             not force
             and self.ocean_rgb565 is not None
@@ -2320,7 +2496,7 @@ class Sprite:
             return
         self._drop_sprite_cache()
         pack = self.pack
-        if pack is None or self.ocean_window is None:
+        if pack is None or self._pf_fb is None:
             return
         frames = _bake_frame_list(pack)
         if not frames:
@@ -2347,7 +2523,6 @@ class Sprite:
         self._sprite_bake = True
         kind = _ensure_stamp()
         print("sprite cache", len(arena), "frames", len(info), kind)
-        self._alloc_underlay(pack)
 
     def _alloc_underlay(self, pack):
         try:
@@ -2551,7 +2726,7 @@ class Sprite:
         clt = values.get("clt") or 0.0
         self.body_col = sonic_body_color(clt, now)
         if self.pack is not None:
-            # Ocean and sprite caches are prepared once at pack load
+            # Sprite cache and the V2 window are prepared once at pack load
             # (_sync_ground), not on every frame.
             self._draw_sheet_scene(lcd, speed, clt, now)
         else:
@@ -2997,9 +3172,12 @@ class Sprite:
 
     def _stamp_playfield_sprites(self, amount, save_under=False):
         pack = self.pack
-        window = self.ocean_window
-        vw = W
-        vh = self._playfield_vh()
+        fb = self._pf_fb
+        if fb is None:
+            raise MemoryError("playfield")
+        window = fb.buf
+        vw = fb.w
+        vh = fb.h
         off = int(self.scroll)
         ring_frames = pack.cycles.get("rings")
         if ring_frames:
@@ -3095,118 +3273,63 @@ class Sprite:
         self._tim_t0 = now
 
     def _draw_sheet_scene(self, lcd, speed, clt, now):
+        """V2 Green Hill in the 128x103 window, baked sprites stamped on top.
+
+        One pushImage carries both, so the panel clear at the start of the
+        tick cannot leave the playfield as flat sky. Packed ocean scenery
+        is not composed. A failed bake or stamp draws the same V2 primitives
+        on the panel and fillRect sprites over them.
+        """
         pack = self.pack
         pal_s = pack.pal(1)
         pal_c = pack.pal(0)
-        pal_b = pack.pal(2) if len(pack.palettes) > 2 else pal_s
         amount = sonic_tint_amount(clt, now)
         if amount > 0:
             pal_c = tint_blue_palette(pal_c, amount)
-        ocean = pack.by_name.get("ocean")
         off = int(self.scroll)
         self._playfield_stamped = False
-        # Backdrop already includes sky, water, scenery and the grass/dirt band.
-        # Scroll 1:1 with the mid-ground rings so the after still stays aligned.
-        # Ocean and sprite caches stay as prepared at pack load.
-        window_ready = False
-        stamped = False
-        used_retain = False
         compose_us = 0
         stamp_us = 0
         push_us = 0
-        held = 0
-        t_enter = _mono_us()
-        ocean_ready = (
-            self.ocean_rgb565 is not None
-            and self._ocean_push
-            and self.ocean_window is not None
-        )
-        if ocean_ready and self._can_retain():
-            try:
-                changed = self._update_backdrop(self.scroll)
-                t1 = _mono_us()
-                self._update_sprites(amount)
-                t2 = _mono_us()
-                compose_us = _us_diff(t1, t_enter)
-                stamp_us = _us_diff(t2, t1)
-                held = 0 if changed else 1
-                window_ready = True
-                stamped = True
-                used_retain = True
-            except MemoryError:
-                self._disable_retain()
-                used_retain = False
-                t_enter = _mono_us()
-            except Exception as e:
-                # Torn window: do not push it. fillRect takes over, and the
-                # bake flag stays clear.
-                self._drop_sprite_cache()
-                window_ready = False
-                stamped = False
-                used_retain = True
-                stamp_us = _us_diff(_mono_us(), t_enter)
-                print("sprite stamp failed:", e)
-        if (
-            ocean_ready
-            and not used_retain
-            and self._ocean_push
-            and self.ocean_window is not None
-            and self.ocean_rgb565 is not None
-        ):
+        fb = self._pf_fb
+        baked = fb is not None and self._sprite_bake and self._arena is not None
+        if baked:
             t0 = _mono_us()
-            if self._parallax:
-                compose_parallax_window(
-                    self.ocean_rgb565,
-                    self.ocean_tw,
-                    self.ocean_th,
-                    self.scroll,
-                    self.ocean_stamps,
-                    self.ocean_window,
-                    W,
-                )
-            else:
-                copy_ocean_window(
-                    self.ocean_rgb565,
-                    self.ocean_tw,
-                    self.ocean_th,
-                    off,
-                    self.ocean_window,
-                    W,
-                )
-            compose_us = _us_diff(_mono_us(), t0)
-            window_ready = True
-            self._pf_valid = False
-            self._sprites_on = False
-        if window_ready and self._sprite_bake and not stamped:
+            self._draw_background(fb, False)
+            t1 = _mono_us()
+            compose_us = _us_diff(t1, t0)
             try:
-                t0 = _mono_us()
                 self._stamp_playfield_sprites(amount, False)
-                stamp_us = _us_diff(_mono_us(), t0)
-                stamped = True
             except Exception as e:
-                # Remember the failure and use fillRect from here on.
+                # Torn window: do not push it. fillRect takes over.
                 self._drop_sprite_cache()
-                window_ready = False
-                stamped = False
                 print("sprite stamp failed:", e)
-        if window_ready:
+                baked = False
+                t0 = _mono_us()
+                self._draw_background(lcd, False)
+                compose_us = _us_diff(_mono_us(), t0)
+            else:
+                t2 = _mono_us()
+                stamp_us = _us_diff(t2, t1)
+                ok = push_rgb565_window(lcd, fb.buf, fb.w, fb.h)
+                push_us = _us_diff(_mono_us(), t2)
+                if ok:
+                    self._playfield_stamped = True
+                else:
+                    t0 = _mono_us()
+                    self._draw_background(lcd, False)
+                    compose_us = _us_diff(_mono_us(), t0)
+        else:
             t0 = _mono_us()
-            ok = push_rgb565_window(lcd, self.ocean_window, W, self.ocean_th)
-            push_us = _us_diff(_mono_us(), t0)
-            if not ok:
-                self._ocean_push = False
-                self._drop_sprite_cache()
-                window_ready = False
-                stamped = False
-            elif stamped:
-                self._playfield_stamped = True
-        if ocean_ready:
-            self._note_timing(compose_us, stamp_us, push_us, held)
+            self._draw_background(lcd, False)
+            compose_us = _us_diff(_mono_us(), t0)
         if not self._playfield_stamped:
-            if not window_ready:
-                if ocean is not None:
-                    blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
+            t0 = _mono_us()
             self._blit_playfield_sprites(lcd, pal_s, pal_c, off)
+            stamp_us = _us_diff(_mono_us(), t0)
+        # compose is the V2 background, stamp the sprites, push the window.
+        # hold stays 0: the primitive background is redrawn every frame.
+        self._note_timing(compose_us, stamp_us, push_us, 0)
         # Aura / shockwave on top of Sonic, after the playfield push.
         self.boost.draw_behind(lcd, AURA_TIP_X, AURA_TIP_Y)
         self.boost.draw_front(lcd, SW_TIP_X, AURA_TIP_Y)
@@ -3217,7 +3340,7 @@ class Sprite:
             if cand < W and cand + w > 0:
                 yield cand
 
-    def _draw_background(self, lcd):
+    def _draw_background(self, lcd, with_rings=True):
         gy = self.ground_y
         lcd.fillRect(0, 0, W, GAUGE_Y, COL_SKY)
         off = int(self.scroll)
@@ -3270,6 +3393,14 @@ class Sprite:
         x = start
         dirt_y = gy - 2
         grass_y = gy - GRASS_H
+        # The pack-is-None ground already ends at the gauges (3px cell).
+        # When gy is the packed feet dest, keep that bevel and continue the
+        # dirt down so the floor is not a strip of sky above the gauges.
+        dirt_h = 3
+        if gy + 2 < GAUGE_Y:
+            dirt_h = GAUGE_Y - dirt_y
+            if dirt_h < 3:
+                dirt_h = 3
         while x < W:
             cx = ((x + off) // TILE) & 1
             on = cx == 0
@@ -3277,10 +3408,10 @@ class Sprite:
             lcd.fillRect(x, grass_y, TILE, GRASS_H - 2, COL_GRASS if on else COL_GRASS_DK)
             # bevelled dirt cell
             base = COL_DIRT if on else COL_DIRT_DK
-            lcd.fillRect(x, dirt_y, TILE, 3, base)
+            lcd.fillRect(x, dirt_y, TILE, dirt_h, base)
             lcd.fillRect(x, dirt_y, TILE, 1, COL_DIRT_HI if on else COL_DIRT)
             lcd.fillRect(x, dirt_y + 2, TILE, 1, COL_DIRT_SH)
-            lcd.fillRect(x, dirt_y, 1, 3, COL_MORTAR)
+            lcd.fillRect(x, dirt_y, 1, dirt_h, COL_MORTAR)
             x += TILE
         # vertical grass blades so the crown reads after-like at 128
         bx = -(off % 3)
@@ -3298,9 +3429,11 @@ class Sprite:
             for x in self._wrapped(sx, 8, off):
                 self._draw_sunflower(lcd, x, gy - GRASS_H, sh)
 
-        for rx, ry, rrx, rry in FIELD_RINGS:
-            for x in self._wrapped(rx, rrx * 2, off):
-                self._draw_field_ring(lcd, x, ry, rrx, rry)
+        # Packed rings replace these gold glyphs. The no-pack path still draws them.
+        if with_rings:
+            for rx, ry, rrx, rry in FIELD_RINGS:
+                for x in self._wrapped(rx, rrx * 2, off):
+                    self._draw_field_ring(lcd, x, ry, rrx, rry)
 
     def _draw_loop(self, lcd, cx, gy):
         # Floating after-style island: dirt strata, grass cap, loop opening.

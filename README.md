@@ -26,38 +26,35 @@ firmware fetches it over Wi-Fi after boot.
 
 `.nojekyll` keeps GitHub Pages from running Jekyll.
 
-## Version 12 is not published
+## Version 13 is not published
 
-This branch is **2026.11.21-v12** (version **12**). It is not the live
+This branch is **2026.11.21-v13** (version **13**). It is not the live
 GitHub Pages payload. Do not treat this branch as an OTA update until it
 is merged and the owner publishes it.
 
-Version 12 keeps the V11 playfield. The 384×103 ocean and the sprite
-cache are still built once when the pack loads. Each frame still pushes
-one 128×103 image. A parallax band is recopied only when
-`int(scroll * factor)` changes. Scenery is restamped only inside the
-rectangles a shifted band or a moved stamp actually dirtied, so the
-pixels match a full V11 compose. Sprite frames that did not change stay
-where they are. A small underlay (9630 bytes) restores the backdrop
-under a sprite that did change: animation, spinning rings, sparkles, or
-the overheat tint. Parked, with nothing in the playfield moving, the
-parallax compose is skipped.
+Version 13 is a driving benchmark. Packed Sonic, the HUD ring and bar,
+field rings, and sparkles are still baked once when the pack loads and
+stamped each frame. The packed 384×103 ocean, parallax bands, palm
+stamps, and loop island are not allocated or drawn. The playfield behind
+those sprites is the V2 Green Hill scene: clouds at 0.25, mountains at
+0.4, water and islands at 0.6, ground and near palms at 1.0. That scene
+is drawn into the 128×103 window, the baked sprites are stamped on top,
+and one image is pushed. `ground_y` is the locked feet dest, so the grass
+crown meets the shoes and palms still plant at `gy - GRASS_H + 2`.
 
 Every two seconds the serial line looks like:
 
 ```text
-timing n=40 compose 1.2 stamp 0.8 push 3.5 gc 0.3 total 5.5 fps 20.0 hold 28
+timing n=40 compose 1.2 stamp 0.8 push 3.5 gc 0.3 total 5.5 fps 20.0 hold 0
 ```
 
-`compose`, `stamp`, `push`, and `total` are average milliseconds per
-frame. `gc` is one `gc.collect()` for that interval. `hold` is how many
-of those frames left the backdrop untouched. Printing the line does not
-rebuild the ocean or the sprite cache.
+`compose` is the V2 background, `stamp` is the baked sprites, and `push`
+is the playfield image. `hold` stays 0 because that background is redrawn
+every frame. Printing the line does not rebuild the sprite cache.
 
-If the underlay cannot be allocated, drawing stays on the V11 full
-compose. If a later stamp fails, the bake flag is cleared and drawing
-stays on the `fillRect` interpreter. Aura, shockwave, and the gauges are
-unchanged.
+If the sprite cache or a stamp cannot be allocated, sprites fall back to
+`fillRect` on the same V2 background. The packed ocean is not used as
+that fallback. Aura, shockwave, and the gauges are unchanged.
 
 `pixidx.bin` is unchanged
 (`dda4ea1e1f3249adc8bccb8fc9fe07bb446fb569d5abb884bd1bf83cfe4ba47e`,
