@@ -24,8 +24,10 @@ or update.
 
 `.nojekyll` keeps GitHub Pages from running Jekyll.
 
-Current payload: **2026.11.21-b1** (version **2**).
+Current payload: **2026.11.21-c5** (version **4**).
 
 Version 1 was the OTA-capable gauges fallback. Version 2 is the graphics
-build (original drawn after-backdrop, boost FX, Chao, ring HUD). Device
-secrets are never stored here.
+build (original drawn after-backdrop, boost FX, Chao, ring HUD). Version 4
+is that graphics firmware with a centered OTA mark so a phone-hotspot check
+can confirm the build on the Atom. The device only replaces `main.py`.
+Device secrets are never stored here.
