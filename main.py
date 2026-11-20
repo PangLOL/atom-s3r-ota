@@ -1,13 +1,21 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
-V10: V9 codebase plus backdrop parallax. Same pre-scaled PIX6 art
-(Sonic 39x36, playfield 128x103, rings 14x14).
+V11: V10 backdrop parallax, plus a once-per-pack sprite cache.
+Same pre-scaled PIX6 art (Sonic 39x36, playfield 128x103, rings 14x14).
 At pack load the 384x103 ocean tile is pre-rendered into an RGB565 buffer
 (~79 KB) and split into parallax layers: sky/clouds at 0.25, water and
 islands at 0.6, ground and near palms at 1.0. The packed art has no
 mountain band, so 0.4 is unused. Each frame composes the 128-wide window
-in RAM and pushes it as one image. Sprites, HUD, and field rings still
-use the fillRect interpreter at full speed (1.0).
+in RAM. Sonic cycles, the HUD ring and bar, field rings, and ring
+sparkles are baked at that same load into RGB565 plus a 1-bit mask.
+Those frames are stamped into the window and the playfield is pushed as
+one image, instead of walking pixidx spans and issuing fillRect. Scroll,
+animation, and the gauges stay live. Overheat still breathes a red tint
+onto Sonic's blue pixels while compositing the visible frame only.
+Aura / shockwave stay V2 primitives drawn after the push. If the sprite
+cache cannot be allocated, drawing falls back to the fillRect interpreter
+and stays there. This file is version 11; it is not the published Pages
+payload until the owner ships it.
 The face button is polled every main-loop iteration and during a draw, so a
 450 ms double-press can be caught even if a frame runs long.
 Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
@@ -75,8 +83,8 @@ REFRESH_MS = 50
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 10
-APP_VERSION_NAME = "2026.11.21-v10"
+APP_VERSION = 11
+APP_VERSION_NAME = "2026.11.21-v11"
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
@@ -1083,6 +1091,283 @@ def compose_parallax_window(tile, tw, th, scroll, stamps, window, vw):
         _blit_stamp(window, vw, tw, st, scroll)
 
 
+# Sprite frames baked once at pack load. The mask bit for pixel i is
+# bit (i & 7) of byte i >> 3, LSB = lowest x on the row. Transparent
+# index 0 stays clear so a stamp never paints a solid box.
+_BAKE_REQUIRED = (
+    "idle",
+    "idle_trigger",
+    "run_slow",
+    "run_medium",
+    "run_fast",
+    "rings",
+)
+_BAKE_NAMED = ("hud_ring", "hud_bar")
+_STAMP_KIND = None
+_stamp_viper = None
+
+
+def _bake_frame_list(pack):
+    """Sonic cycles, HUD, field rings, and sparkles. None if a required set is missing."""
+    frames = []
+    for key in _BAKE_REQUIRED:
+        cyc = pack.cycles.get(key)
+        if not cyc:
+            return None
+        frames.extend(cyc)
+    for name in _BAKE_NAMED:
+        fr = pack.by_name.get(name)
+        if fr is None:
+            return None
+        frames.append(fr)
+    spark = pack.cycles.get("rings_sparkle")
+    if spark:
+        frames.extend(spark)
+    return frames
+
+
+def prerender_sprite_into(pack, frame, rgb, mask):
+    """Write one frame's LE RGB565 and 1-bit mask into caller-owned buffers."""
+    w = frame.w
+    h = frame.h
+    pal_id = frame.pal_id
+    if pal_id < 0 or pal_id >= len(pack.palettes_565):
+        pal_id = 0
+    pal565 = pack.palettes_565[pal_id]
+    ncolors = len(pal565)
+    data = pack.data
+    base = pack.pix_off + frame.data_offset
+    bpp4 = pack.bpp == 4
+    row_bytes = ((w + 1) // 2) if bpp4 else w
+    for y in range(h):
+        row = base + y * row_bytes
+        dst = y * w
+        for x in range(w):
+            if bpp4:
+                b = data[row + (x >> 1)]
+                idx = (b >> 4) if (x & 1) == 0 else (b & 0x0F)
+            else:
+                idx = data[row + x]
+            if idx == 0 or idx >= ncolors:
+                continue
+            di = dst + x
+            mask[di >> 3] = mask[di >> 3] | (1 << (di & 7))
+            v = pal565[idx]
+            o = di * 2
+            rgb[o] = v & 0xFF
+            rgb[o + 1] = (v >> 8) & 0xFF
+
+
+def build_sprite_arena(pack, frames):
+    """One allocation: every baked frame, then a scratch strip for Sonic tint."""
+    sizes = []
+    total = 0
+    max_rgb = 0
+    for fr in frames:
+        rgb_len = fr.w * fr.h * 2
+        mask_len = (fr.w * fr.h + 7) // 8
+        if rgb_len > max_rgb:
+            max_rgb = rgb_len
+        sizes.append((fr, total, total + rgb_len, rgb_len, mask_len))
+        total += rgb_len + mask_len
+    scratch_off = total
+    total += max_rgb
+    arena = bytearray(total)
+    info = {}
+    for fr, rgb_off, mask_off, rgb_len, mask_len in sizes:
+        rgb = memoryview(arena)[rgb_off:rgb_off + rgb_len]
+        mask = memoryview(arena)[mask_off:mask_off + mask_len]
+        prerender_sprite_into(pack, fr, rgb, mask)
+        info[fr.name] = (rgb_off, mask_off)
+    return arena, info, scratch_off, max_rgb
+
+
+def stamp_sprite_rgb565(window, vw, vh, rgb, mask, sw, sh, dest_x, dest_y):
+    """Copy opaque baked pixels into the playfield window. Clips to the window."""
+    if sw <= 0 or sh <= 0 or vw <= 0 or vh <= 0:
+        return
+    if dest_y >= 0:
+        y0 = 0
+    else:
+        y0 = 0 - dest_y
+    y1 = sh
+    lim = vh - dest_y
+    if y1 > lim:
+        y1 = lim
+    if y0 >= y1:
+        return
+    if dest_x >= 0:
+        x0 = 0
+    else:
+        x0 = 0 - dest_x
+    x1 = sw
+    limx = vw - dest_x
+    if x1 > limx:
+        x1 = limx
+    if x0 >= x1:
+        return
+    for y in range(y0, y1):
+        wy = dest_y + y
+        sy = y * sw
+        row_base = wy * vw
+        for x in range(x0, x1):
+            di = sy + x
+            if mask[di >> 3] & (1 << (di & 7)):
+                si = di * 2
+                wi = (row_base + dest_x + x) * 2
+                window[wi] = rgb[si]
+                window[wi + 1] = rgb[si + 1]
+
+
+def _viper_stamp_ok():
+    """Tiny clip + high-bit check. A mismatch keeps the Python stamp."""
+    if _stamp_viper is None:
+        return False
+    sw = 8
+    sh = 2
+    rgb = bytearray(sw * sh * 2)
+    mask = bytearray((sw * sh + 7) // 8)
+    for i in range(sw * sh):
+        if (i & 1) == 0:
+            continue
+        mask[i >> 3] = mask[i >> 3] | (1 << (i & 7))
+        rgb[i * 2] = (0xF0 + i) & 0xFF
+        rgb[i * 2 + 1] = (0x80 + i * 3) & 0xFF
+    vw = 6
+    vh = 4
+    try:
+        for dest_x, dest_y in ((0, 0), (-2, -1), (4, 1), (9, 0)):
+            a = bytearray(vw * vh * 2)
+            b = bytearray(vw * vh * 2)
+            for i in range(len(a)):
+                a[i] = 0x11
+                b[i] = 0x11
+            _stamp_viper(a, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
+            stamp_sprite_rgb565(b, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
+            if a != b:
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _ensure_stamp():
+    global _STAMP_KIND
+    if _STAMP_KIND is not None:
+        return _STAMP_KIND
+    if _stamp_viper is not None and _viper_stamp_ok():
+        _STAMP_KIND = "viper"
+    else:
+        _STAMP_KIND = "py"
+    return _STAMP_KIND
+
+
+def stamp_baked(window, vw, vh, rgb, mask, sw, sh, dest_x, dest_y):
+    kind = _STAMP_KIND
+    if kind is None:
+        kind = _ensure_stamp()
+    if kind == "viper":
+        _stamp_viper(window, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
+    else:
+        stamp_sprite_rgb565(window, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
+
+
+def tint_sonic_scratch(pack, frame, arena, scratch_off, amount):
+    """Recolor one Sonic frame into the arena scratch. Base cache stays put.
+
+    Non-blue indices keep the packed RGB565 (the same value fillRect would
+    round-trip). Blue indices use the breathing mix, then 565.
+    """
+    w = frame.w
+    h = frame.h
+    pal_id = frame.pal_id
+    if pal_id < 0 or pal_id >= len(pack.palettes):
+        pal_id = 0
+    pal888 = pack.palettes[pal_id]
+    pal565 = pack.palettes_565[pal_id]
+    tinted = tint_blue_palette(pal888, amount)
+    pairs = []
+    ncolors = len(pal565)
+    for i in range(ncolors):
+        if i == 0:
+            pairs.append((0, 0))
+            continue
+        if tinted[i] == pal888[i]:
+            v = pal565[i]
+        else:
+            v = _rgb888_to_565(tinted[i])
+        pairs.append((v & 0xFF, (v >> 8) & 0xFF))
+    scratch = memoryview(arena)[scratch_off:scratch_off + (w * h * 2)]
+    data = pack.data
+    base = pack.pix_off + frame.data_offset
+    bpp4 = pack.bpp == 4
+    row_bytes = ((w + 1) // 2) if bpp4 else w
+    di = 0
+    for y in range(h):
+        row = base + y * row_bytes
+        for x in range(w):
+            if bpp4:
+                b = data[row + (x >> 1)]
+                idx = (b >> 4) if (x & 1) == 0 else (b & 0x0F)
+            else:
+                idx = data[row + x]
+            if idx <= 0 or idx >= ncolors:
+                scratch[di] = 0
+                scratch[di + 1] = 0
+            else:
+                lo, hi = pairs[idx]
+                scratch[di] = lo
+                scratch[di + 1] = hi
+            di += 2
+    return scratch
+
+
+try:
+    import micropython
+
+    @micropython.viper
+    def _stamp_viper(window, vw: int, vh: int, rgb, mask, sw: int, sh: int, dest_x: int, dest_y: int):
+        wp = ptr8(window)
+        rp = ptr8(rgb)
+        mp = ptr8(mask)
+        y0 = 0
+        if dest_y < 0:
+            y0 = 0 - dest_y
+        y1 = sh
+        lim = vh - dest_y
+        if y1 > lim:
+            y1 = lim
+        if y0 >= y1:
+            return
+        x0 = 0
+        if dest_x < 0:
+            x0 = 0 - dest_x
+        x1 = sw
+        limx = vw - dest_x
+        if x1 > limx:
+            x1 = limx
+        if x0 >= x1:
+            return
+        y = y0
+        while y < y1:
+            wy = dest_y + y
+            row_base = wy * vw
+            sy = y * sw
+            x = x0
+            while x < x1:
+                di = sy + x
+                if mp[di >> 3] & (1 << (di & 7)):
+                    si = di * 2
+                    wx = dest_x + x
+                    wi = (row_base + wx) * 2
+                    wp[wi] = rp[si]
+                    wp[wi + 1] = rp[si + 1]
+                x += 1
+            y += 1
+except Exception:
+    _stamp_viper = None
+
+
 def _pixidx_geometry_ok(pack):
     """V7/V8 art: 384x103 backdrop and 39x36 Sonic. A leftover V6 pack fails this."""
     ocean = pack.by_name.get("ocean")
@@ -1590,6 +1875,12 @@ class Sprite:
         self.ocean_stamps = []
         self._parallax = False
         self._ocean_push = True
+        self._arena = None
+        self._bake_at = {}
+        self._scratch_off = 0
+        self._scratch_len = 0
+        self._sprite_bake = False
+        self._playfield_stamped = False
         self._sync_ground()
 
     def _sync_ground(self):
@@ -1603,12 +1894,14 @@ class Sprite:
             self.ocean_stamps = []
             self._parallax = False
             self._ocean_push = True
+            self._drop_sprite_cache()
             return
         # Locked after-preview feet dest, independent of the ground tile.
         self._surface = SONIC_FEET_DEST_Y
         self._ground_top = GAUGE_Y - 15
         self.ground_y = self._surface
         self._prepare_ocean(force=True)
+        self._prepare_sprites(force=True)
 
     def _prepare_ocean(self, force=False):
         """Pre-render the 384x103 ocean tile into RGB565 once per pack load."""
@@ -1667,6 +1960,48 @@ class Sprite:
         self.ocean_stamps = stamps
         self._parallax = parallax
         print("ocean rgb565", len(buf), "window", len(window))
+
+    def _drop_sprite_cache(self):
+        self._arena = None
+        self._bake_at = {}
+        self._scratch_off = 0
+        self._scratch_len = 0
+        self._sprite_bake = False
+        self._playfield_stamped = False
+
+    def _prepare_sprites(self, force=False):
+        """Bake Sonic, HUD, and field rings once per pack load. Not per frame."""
+        if not force and self._sprite_bake and self._arena is not None:
+            return
+        self._drop_sprite_cache()
+        pack = self.pack
+        if pack is None or self.ocean_window is None:
+            return
+        frames = _bake_frame_list(pack)
+        if not frames:
+            return
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            arena, info, scratch_off, scratch_len = build_sprite_arena(pack, frames)
+        except MemoryError:
+            print("sprite cache alloc failed")
+            self._drop_sprite_cache()
+            return
+        except Exception as e:
+            print("sprite cache failed:", e)
+            self._drop_sprite_cache()
+            return
+        self._arena = arena
+        self._bake_at = info
+        self._scratch_off = scratch_off
+        self._scratch_len = scratch_len
+        self._sprite_bake = True
+        kind = _ensure_stamp()
+        print("sprite cache", len(arena), "frames", len(info), kind)
 
     def advance(self, speed, dt_ms):
         if speed is None:
@@ -1799,26 +2134,31 @@ class Sprite:
                         self.sparkles.append([x, FIELD_RING_Y, 0, 0])
         self._ring_seen = mask
 
+    def _draw_hud_digits(self, lcd, bx, by):
+        dx, dy = bx + 22, by + 4
+        n = int(self.rings) % 1000
+        draw_digit(lcd, dx + 14, dy, n % 10)
+        if n >= 10:
+            draw_digit(lcd, dx + 7, dy, (n // 10) % 10)
+        if n >= 100:
+            draw_digit(lcd, dx, dy, (n // 100) % 10)
+
     def _draw_ring_hud(self, lcd):
         # Compact original ring + digits. Kept in the playfield, not in the gauges.
         # Offset from the CAN-fault dot in the upper-left corner.
         pack = self.pack
         if pack is not None:
-            pal = pack.pal(1)
-            bar = pack.by_name.get("hud_bar")
-            ring = pack.by_name.get("hud_ring")
             bx, by = HUD_BAR_POS
-            if bar is not None:
-                blit_frame(lcd, pack, bar, bx, by, pal, 0, GAUGE_Y, False)
-            if ring is not None:
-                blit_frame(lcd, pack, ring, HUD_RING_POS[0], HUD_RING_POS[1], pal, 0, GAUGE_Y, False)
-            dx, dy = bx + 22, by + 4
-            n = int(self.rings) % 1000
-            draw_digit(lcd, dx + 14, dy, n % 10)
-            if n >= 10:
-                draw_digit(lcd, dx + 7, dy, (n // 10) % 10)
-            if n >= 100:
-                draw_digit(lcd, dx, dy, (n // 100) % 10)
+            # Ring and bar were already stamped into the pushed playfield.
+            if not self._playfield_stamped:
+                pal = pack.pal(1)
+                bar = pack.by_name.get("hud_bar")
+                ring = pack.by_name.get("hud_ring")
+                if bar is not None:
+                    blit_frame(lcd, pack, bar, bx, by, pal, 0, GAUGE_Y, False)
+                if ring is not None:
+                    blit_frame(lcd, pack, ring, HUD_RING_POS[0], HUD_RING_POS[1], pal, 0, GAUGE_Y, False)
+            self._draw_hud_digits(lcd, bx, by)
             return
         # V2 primitive fallback
         x, y = 16, 3
@@ -1853,10 +2193,11 @@ class Sprite:
         clt = values.get("clt") or 0.0
         self.body_col = sonic_body_color(clt, now)
         if self.pack is not None:
-            # Ocean / parallax buffers are prepared once at pack load
+            # Ocean and sprite caches are prepared once at pack load
             # (_sync_ground), not on every frame.
             self._draw_sheet_scene(lcd, speed, clt, now)
         else:
+            self._playfield_stamped = False
             self._draw_background(lcd)
             tip_y = SONIC_MID_Y
             self._draw_sonic(lcd, speed, tps, clt)
@@ -1864,6 +2205,93 @@ class Sprite:
             self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
             self.boost.draw_front(lcd, SW_TIP_X, tip_y)
         self._draw_ring_hud(lcd)
+
+    def _field_ring_xs(self, off):
+        period = RING_PERIOD
+        found = []
+        for wx in FIELD_RING_X:
+            x = (wx - off) % period
+            if x > W + 40:
+                x -= period
+            if -40 < x < W + 40:
+                found.append(x)
+        return found
+
+    def _blit_playfield_sprites(self, lcd, pal_s, pal_c, off):
+        pack = self.pack
+        ring_frames = pack.cycles.get("rings")
+        if ring_frames:
+            fr = ring_frames[self.ring_i % len(ring_frames)]
+            ry = FIELD_RING_Y
+            for x in self._field_ring_xs(off):
+                blit_frame(lcd, pack, fr, x, ry, pal_s, 0, GAUGE_Y, True)
+        spark_frames = pack.cycles.get("rings_sparkle")
+        if spark_frames:
+            for item in self.sparkles:
+                x, y, i, _acc = item
+                if i < len(spark_frames):
+                    blit_frame(lcd, pack, spark_frames[i], int(x), int(y), pal_s, 0, GAUGE_Y, True)
+        frames = self._cycle_frames(self.anim_tag)
+        if frames:
+            fr = frames[self.anim_i % len(frames)]
+            blit_frame(lcd, pack, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, pal_c, 0, GAUGE_Y, True)
+
+    def _stamp_frame(self, window, vw, vh, fr, dest_x, dest_y, use_origin, amount):
+        at = self._bake_at.get(fr.name)
+        if at is None:
+            raise KeyError(fr.name)
+        rgb_off, mask_off = at
+        n = fr.w * fr.h
+        rgb = memoryview(self._arena)[rgb_off:rgb_off + (n * 2)]
+        mask = memoryview(self._arena)[mask_off:mask_off + ((n + 7) // 8)]
+        if amount > 0:
+            rgb = tint_sonic_scratch(
+                self.pack, fr, self._arena, self._scratch_off, amount
+            )
+        if use_origin:
+            x0 = dest_x - fr.origin_x
+            y0 = dest_y - fr.origin_y
+        else:
+            x0 = dest_x
+            y0 = dest_y
+        stamp_baked(window, vw, vh, rgb, mask, fr.w, fr.h, int(x0), int(y0))
+
+    def _stamp_playfield_sprites(self, amount):
+        pack = self.pack
+        window = self.ocean_window
+        vw = W
+        vh = self.ocean_th
+        if vh > GAUGE_Y:
+            vh = GAUGE_Y
+        off = int(self.scroll)
+        ring_frames = pack.cycles.get("rings")
+        if ring_frames:
+            fr = ring_frames[self.ring_i % len(ring_frames)]
+            ry = FIELD_RING_Y
+            for x in self._field_ring_xs(off):
+                self._stamp_frame(window, vw, vh, fr, x, ry, True, 0)
+        spark_frames = pack.cycles.get("rings_sparkle")
+        if spark_frames:
+            for item in self.sparkles:
+                x, y, i, _acc = item
+                if i < len(spark_frames):
+                    self._stamp_frame(
+                        window, vw, vh, spark_frames[i], int(x), int(y), True, 0
+                    )
+        frames = self._cycle_frames(self.anim_tag)
+        if frames:
+            fr = frames[self.anim_i % len(frames)]
+            self._stamp_frame(
+                window, vw, vh, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, True, amount
+            )
+        bar = pack.by_name.get("hud_bar")
+        if bar is not None:
+            self._stamp_frame(window, vw, vh, bar, HUD_BAR_POS[0], HUD_BAR_POS[1], False, 0)
+        ring = pack.by_name.get("hud_ring")
+        if ring is not None:
+            self._stamp_frame(
+                window, vw, vh, ring, HUD_RING_POS[0], HUD_RING_POS[1], False, 0
+            )
 
     def _draw_sheet_scene(self, lcd, speed, clt, now):
         pack = self.pack
@@ -1875,9 +2303,15 @@ class Sprite:
             pal_c = tint_blue_palette(pal_c, amount)
         ocean = pack.by_name.get("ocean")
         off = int(self.scroll)
+        self._playfield_stamped = False
         # Backdrop already includes sky, water, scenery and the grass/dirt band.
         # Scroll 1:1 with the mid-ground rings so the after still stays aligned.
-        if self.ocean_rgb565 is not None and self._ocean_push:
+        window_ready = False
+        if (
+            self.ocean_rgb565 is not None
+            and self._ocean_push
+            and self.ocean_window is not None
+        ):
             if self._parallax:
                 compose_parallax_window(
                     self.ocean_rgb565,
@@ -1888,10 +2322,8 @@ class Sprite:
                     self.ocean_window,
                     W,
                 )
-                ok = push_rgb565_window(lcd, self.ocean_window, W, self.ocean_th)
             else:
-                ok = blit_ocean_window(
-                    lcd,
+                copy_ocean_window(
                     self.ocean_rgb565,
                     self.ocean_tw,
                     self.ocean_th,
@@ -1899,34 +2331,32 @@ class Sprite:
                     self.ocean_window,
                     W,
                 )
+            window_ready = True
+        stamped = False
+        if window_ready and self._sprite_bake:
+            try:
+                self._stamp_playfield_sprites(amount)
+                stamped = True
+            except Exception as e:
+                # Remember the failure and use fillRect from here on.
+                self._drop_sprite_cache()
+                window_ready = False
+                print("sprite stamp failed:", e)
+        if window_ready:
+            ok = push_rgb565_window(lcd, self.ocean_window, W, self.ocean_th)
             if not ok:
                 self._ocean_push = False
+                self._drop_sprite_cache()
+                window_ready = False
+                stamped = False
+            elif stamped:
+                self._playfield_stamped = True
+        if not self._playfield_stamped:
+            if not window_ready:
                 if ocean is not None:
                     blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
-        elif ocean is not None:
-            blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
-        ring_frames = pack.cycles.get("rings")
-        if ring_frames:
-            fr = ring_frames[self.ring_i % len(ring_frames)]
-            ry = FIELD_RING_Y
-            period = RING_PERIOD
-            for wx in FIELD_RING_X:
-                x = (wx - off) % period
-                if x > W + 40:
-                    x -= period
-                if -40 < x < W + 40:
-                    blit_frame(lcd, pack, fr, x, ry, pal_s, 0, GAUGE_Y, True)
-        spark_frames = pack.cycles.get("rings_sparkle")
-        if spark_frames:
-            for item in self.sparkles:
-                x, y, i, _acc = item
-                if i < len(spark_frames):
-                    blit_frame(lcd, pack, spark_frames[i], int(x), int(y), pal_s, 0, GAUGE_Y, True)
-        frames = self._cycle_frames(self.anim_tag)
-        if frames:
-            fr = frames[self.anim_i % len(frames)]
-            blit_frame(lcd, pack, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, pal_c, 0, GAUGE_Y, True)
-        # Aura / shockwave on top of Sonic, tip 12 px ahead at mid_y 72.
+            self._blit_playfield_sprites(lcd, pal_s, pal_c, off)
+        # Aura / shockwave on top of Sonic, after the playfield push.
         self.boost.draw_behind(lcd, AURA_TIP_X, AURA_TIP_Y)
         self.boost.draw_front(lcd, SW_TIP_X, AURA_TIP_Y)
 
