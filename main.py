@@ -1,9 +1,13 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
-V9: same pre-scaled PIX6 art as V8 (Sonic 39x36, playfield 128x103, rings 14x14).
+V10: V9 codebase plus backdrop parallax. Same pre-scaled PIX6 art
+(Sonic 39x36, playfield 128x103, rings 14x14).
 At pack load the 384x103 ocean tile is pre-rendered into an RGB565 buffer
-(~79 KB). Each frame copies only the 128-wide visible window as one image
-blit. Sprites, HUD, and field rings still use the fillRect interpreter.
+(~79 KB) and split into parallax layers: sky/clouds at 0.25, water and
+islands at 0.6, ground and near palms at 1.0. The packed art has no
+mountain band, so 0.4 is unused. Each frame composes the 128-wide window
+in RAM and pushes it as one image. Sprites, HUD, and field rings still
+use the fillRect interpreter at full speed (1.0).
 The face button is polled every main-loop iteration and during a draw, so a
 450 ms double-press can be caught even if a frame runs long.
 Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
@@ -71,8 +75,8 @@ REFRESH_MS = 50
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 9
-APP_VERSION_NAME = "2026.11.21-v9"
+APP_VERSION = 10
+APP_VERSION_NAME = "2026.11.21-v10"
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
@@ -399,6 +403,13 @@ HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
 GROUND_SURFACE_IN_TILE = 0  # unused; feet dest is locked, backdrop includes ground
 PROP_PERIOD = 384   # 384x103 backdrop width
+# V2 fallback ratios, applied to bands split from the prerendered ocean.
+PARALLAX_CLOUDS = 0.25
+PARALLAX_MOUNTAINS = 0.4  # packed art has no mountain band
+PARALLAX_WATER = 0.6
+PARALLAX_GROUND = 1.0
+HORIZON_Y = 32   # sky/clouds above; water and the horizon line from here
+GRASS_Y = 88     # near ground (grass, dirt, planted palms) from here
 RING_PERIOD = 1536  # long gaps between groups of 3-8
 RING_FPS_MS = 1000 // 30  # 33
 
@@ -720,6 +731,356 @@ def blit_ocean_window(lcd, tile, tw, th, scroll, window, vw=W):
         except Exception:
             pass
     return False
+
+
+
+def push_rgb565_window(lcd, window, vw, th):
+    """Push a precomposed RGB565 window as one image copy."""
+    if hasattr(lcd, "pushImage"):
+        try:
+            lcd.pushImage(0, 0, vw, th, window)
+            return True
+        except Exception:
+            pass
+    if hasattr(lcd, "writePixels"):
+        try:
+            if hasattr(lcd, "setAddrWindow"):
+                lcd.setAddrWindow(0, 0, vw - 1, th - 1)
+            lcd.writePixels(window)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _565_at(buf, tw, x, y):
+    i = (y * tw + x) * 2
+    return buf[i] | (buf[i + 1] << 8)
+
+
+def _set_565(buf, tw, x, y, val):
+    i = (y * tw + x) * 2
+    buf[i] = val & 0xFF
+    buf[i + 1] = (val >> 8) & 0xFF
+
+
+def _is_backdrop_888(c):
+    r = (c >> 16) & 0xFF
+    g = (c >> 8) & 0xFF
+    b = c & 0xFF
+    if b >= 240 and 120 <= g <= 210 and r <= 40:
+        return True
+    if b >= 180 and g >= 160:
+        return True
+    return False
+
+
+def _copy_rows(tile, tw, y0, y1, scroll, out, vw, out_y):
+    off = int(scroll) % tw
+    if off < 0:
+        off += tw
+    width_y = y1 - y0
+    n1 = tw - off
+    if n1 > vw:
+        n1 = vw
+    end1 = n1 * 2
+    rest = (vw - n1) * 2
+    for row in range(width_y):
+        src = (y0 + row) * tw * 2
+        dst = (out_y + row) * vw * 2
+        out[dst:dst + end1] = tile[src + off * 2:src + off * 2 + end1]
+        if rest:
+            out[dst + end1:dst + end1 + rest] = tile[src:src + rest]
+
+
+def _object_mask(tile, tw, th, grass_y):
+    n = tw * grass_y
+    mask = bytearray(n)
+    for y in range(grass_y):
+        row = y * tw
+        for x in range(tw):
+            c = _rgb565_to_888(_565_at(tile, tw, x, y))
+            if not _is_backdrop_888(c):
+                mask[row + x] = 1
+    return mask
+
+
+def _components(mask, tw, grass_y):
+    n = tw * grass_y
+    seen = bytearray(n)
+    comps = []
+    neigh = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
+    for i0 in range(n):
+        if mask[i0] == 0 or seen[i0]:
+            continue
+        stack = [i0]
+        seen[i0] = 1
+        pts = []
+        while stack:
+            i = stack.pop()
+            pts.append(i)
+            y = i // tw
+            x = i - y * tw
+            for dy, dx in neigh:
+                ny = y + dy
+                nx = x + dx
+                if nx < 0:
+                    nx += tw
+                elif nx >= tw:
+                    nx -= tw
+                if ny < 0 or ny >= grass_y:
+                    continue
+                j = ny * tw + nx
+                if mask[j] and not seen[j]:
+                    seen[j] = 1
+                    stack.append(j)
+        if len(pts) >= 8:
+            comps.append(pts)
+    return comps
+
+
+def _pts_bbox(pts, tw, wrap_ok=True):
+    y0 = 10000
+    y1 = -1
+    xs = []
+    for i in pts:
+        y = i // tw
+        x = i - y * tw
+        if y < y0:
+            y0 = y
+        if y > y1:
+            y1 = y
+        xs.append(x)
+    xs.sort()
+    x_min = xs[0]
+    x_max = xs[-1]
+    width = x_max - x_min + 1
+    wrapped = wrap_ok and (x_max - x_min > tw // 2)
+    if wrapped:
+        # width = tw - largest gap
+        largest = xs[0] + tw - xs[-1]
+        for k in range(len(xs) - 1):
+            gap = xs[k + 1] - xs[k]
+            if gap > largest:
+                largest = gap
+        width = tw - largest + 1
+    return x_min, x_max, y0, y1, width, wrapped
+
+
+def _row_widths(pts, tw):
+    # returns dict-like list of (y, width) by scanning
+    counts = {}
+    for i in pts:
+        y = i // tw
+        counts[y] = counts.get(y, 0) + 1
+    return counts
+
+
+def _should_cut(upper, lower, tw, grass_y, cut_y):
+    if not upper or not lower:
+        return False
+    _a, _b, uy0, uy1, uw, _w = _pts_bbox(upper, tw)
+    _a, _b, ly0, ly1, lw, _w2 = _pts_bbox(lower, tw)
+    uh = uy1 - uy0 + 1
+    lh = ly1 - ly0 + 1
+    lower_grass = ly1 >= grass_y - 2
+    case_island = uw >= 35 and uy0 <= 40
+    case_bush = lower_grass and lh <= 20 and lw >= 12 and uw <= 8
+    return case_island or case_bush
+
+
+def _split_necks(pts, tw, grass_y):
+    if len(pts) < 20:
+        return [pts]
+    counts = _row_widths(pts, tw)
+    ys = sorted(counts.keys())
+    y_top = ys[0]
+    y_bot = ys[-1]
+    if y_bot < grass_y - 3 or y_top > 70:
+        return [pts]
+    necks = []
+    for y in ys:
+        w_ = counts[y]
+        if 50 <= y <= 84 and w_ <= 6:
+            above = 0
+            below = 0
+            for yy in ys:
+                if yy < y:
+                    above += counts[yy]
+                elif yy > y:
+                    below += counts[yy]
+            if above >= 40 and below >= 20:
+                necks.append((y, w_))
+    if not necks:
+        return [pts]
+    cut_y = necks[0][0]
+    for y, w_ in necks:
+        if y >= cut_y:
+            cut_y = y
+    # narrowest among lowest 8
+    best = None
+    for y, w_ in necks:
+        if y >= cut_y - 8 and (best is None or w_ < best[1] or (w_ == best[1] and y > best[0])):
+            best = (y, w_)
+    cut_y = best[0]
+    upper = [i for i in pts if (i // tw) < cut_y]
+    lower = [i for i in pts if (i // tw) >= cut_y]
+    if not _should_cut(upper, lower, tw, grass_y, cut_y):
+        return [pts]
+    out = []
+    for part in (upper, lower):
+        if 20 < len(part) < len(pts):
+            out.extend(_split_necks(part, tw, grass_y))
+        else:
+            out.append(part)
+    return out
+
+
+def _classify(pts, tw, grass_y):
+    counts = _row_widths(pts, tw)
+    ys = sorted(counts.keys())
+    y_top = ys[0]
+    y_bot = ys[-1]
+    solid_base = None
+    y = y_bot
+    while y >= y_top:
+        if counts.get(y, 0) >= 8:
+            solid_base = y
+            break
+        y -= 1
+    touches = y_bot >= grass_y - 2
+    mid_mass = 0
+    low_mass = 0
+    for y, c in counts.items():
+        if y <= 70:
+            mid_mass += c
+        if y >= 80:
+            low_mass += c
+    width = _pts_bbox(pts, tw)[4]
+    if width >= 35 and mid_mass > 80 and (solid_base is None or solid_base <= 72):
+        return 0.6
+    if touches and solid_base is not None and solid_base >= 84 and y_top >= 60:
+        return 1.0
+    if touches and y_top <= 50:
+        return 1.0
+    if not touches:
+        return 0.6
+    return 1.0 if touches else 0.6
+
+
+def _inpaint(tile, tw, th, mask_pts, grass_y):
+    flagged = {}
+    for i in mask_pts:
+        flagged[i] = 1
+    for y in range(grass_y):
+        last = None
+        for x in range(tw):
+            i = y * tw + x
+            if i not in flagged:
+                last = _565_at(tile, tw, x, y)
+            elif last is not None:
+                _set_565(tile, tw, x, y, last)
+        last = None
+        x = tw - 1
+        while x >= 0:
+            i = y * tw + x
+            if i not in flagged:
+                last = _565_at(tile, tw, x, y)
+            elif last is not None:
+                _set_565(tile, tw, x, y, last)
+            x -= 1
+
+
+def _make_stamp(tile, tw, pts, factor):
+    # may split wrapped stamps
+    groups = [pts]
+    xs_wrap = _pts_bbox(pts, tw)[5]
+    if xs_wrap:
+        mid = tw // 2
+        low = [i for i in pts if (i - (i // tw) * tw) < mid]
+        high = [i for i in pts if (i - (i // tw) * tw) >= mid]
+        groups = [g for g in (low, high) if g]
+    stamps = []
+    for g in groups:
+        x0, x1, y0, y1, _w, wrapped = _pts_bbox(g, tw, wrap_ok=False)
+        sw = x1 - x0 + 1
+        sh = y1 - y0 + 1
+        sbuf = bytearray(sw * sh * 2)
+        mask = bytearray((sw * sh + 7) // 8)
+        for i in g:
+            y = i // tw
+            x = i - y * tw
+            dx = x - x0
+            dy = y - y0
+            di = dy * sw + dx
+            val = _565_at(tile, tw, x, y)
+            sbuf[di * 2] = val & 0xFF
+            sbuf[di * 2 + 1] = (val >> 8) & 0xFF
+            mask[di >> 3] |= 1 << (di & 7)
+        stamps.append((factor, x0, y0, sw, sh, sbuf, mask))
+    return stamps
+
+
+def _blit_stamp(window, vw, tw, stamp, scroll):
+    factor, ox, oy, sw, sh, sbuf, mask = stamp
+    off = int(scroll * factor) % tw
+    if off < 0:
+        off += tw
+    sx = ox - off
+    # normalize into a range that we can try sx, sx+tw, sx-tw
+    for cand in (sx, sx - tw, sx + tw):
+        if cand + sw <= 0 or cand >= vw:
+            continue
+        src_x0 = 0
+        dst_x0 = cand
+        if dst_x0 < 0:
+            src_x0 = -dst_x0
+            dst_x0 = 0
+        src_x1 = sw
+        if cand + sw > vw:
+            src_x1 = vw - cand
+        if src_x1 <= src_x0:
+            continue
+        for dy in range(sh):
+            wy = oy + dy
+            row_i = dy * sw
+            dst_row = wy * vw
+            for dx in range(src_x0, src_x1):
+                di = row_i + dx
+                if mask[di >> 3] & (1 << (di & 7)):
+                    wx = dst_x0 + (dx - src_x0)
+                    si = di * 2
+                    diw = (dst_row + wx) * 2
+                    window[diw] = sbuf[si]
+                    window[diw + 1] = sbuf[si + 1]
+
+
+def build_parallax_layers(tile, tw, th):
+    """In-place inpaint of tile plus a list of stamps. Runs once at pack load."""
+    grass_y = GRASS_Y if th >= GRASS_Y else th
+    mask = _object_mask(tile, tw, th, grass_y)
+    comps = _components(mask, tw, grass_y)
+    parts = []
+    for c in comps:
+        parts.extend(_split_necks(c, tw, grass_y))
+    stamps = []
+    all_pts = []
+    for pts in parts:
+        if len(pts) < 8:
+            continue
+        factor = _classify(pts, tw, grass_y)
+        stamps.extend(_make_stamp(tile, tw, pts, factor))
+        all_pts.extend(pts)
+    _inpaint(tile, tw, th, all_pts, grass_y)
+    return stamps
+
+
+def compose_parallax_window(tile, tw, th, scroll, stamps, window, vw):
+    _copy_rows(tile, tw, 0, HORIZON_Y, scroll * PARALLAX_CLOUDS, window, vw, 0)
+    _copy_rows(tile, tw, HORIZON_Y, GRASS_Y, scroll * PARALLAX_WATER, window, vw, HORIZON_Y)
+    _copy_rows(tile, tw, GRASS_Y, th, scroll * PARALLAX_GROUND, window, vw, GRASS_Y)
+    for st in stamps:
+        _blit_stamp(window, vw, tw, st, scroll)
 
 
 def _pixidx_geometry_ok(pack):
@@ -1226,6 +1587,8 @@ class Sprite:
         self.ocean_tw = 0
         self.ocean_th = 0
         self.ocean_window = None
+        self.ocean_stamps = []
+        self._parallax = False
         self._ocean_push = True
         self._sync_ground()
 
@@ -1237,18 +1600,30 @@ class Sprite:
             self.ground_y = self._surface
             self.ocean_rgb565 = None
             self.ocean_window = None
+            self.ocean_stamps = []
+            self._parallax = False
             self._ocean_push = True
             return
         # Locked after-preview feet dest, independent of the ground tile.
         self._surface = SONIC_FEET_DEST_Y
         self._ground_top = GAUGE_Y - 15
         self.ground_y = self._surface
-        self._prepare_ocean()
+        self._prepare_ocean(force=True)
 
-    def _prepare_ocean(self):
+    def _prepare_ocean(self, force=False):
         """Pre-render the 384x103 ocean tile into RGB565 once per pack load."""
+        if (
+            not force
+            and self.ocean_rgb565 is not None
+            and self.ocean_window is not None
+            and self.ocean_tw > 0
+            and self.ocean_th > 0
+        ):
+            return
         self.ocean_rgb565 = None
         self.ocean_window = None
+        self.ocean_stamps = []
+        self._parallax = False
         self.ocean_tw = 0
         self.ocean_th = 0
         self._ocean_push = True
@@ -1267,10 +1642,30 @@ class Sprite:
         except Exception as e:
             print("ocean rgb565 prerender failed:", e)
             return
+        stamps = []
+        parallax = False
+        try:
+            stamps = build_parallax_layers(buf, tw, th)
+            parallax = True
+            print("ocean parallax stamps", len(stamps))
+        except MemoryError:
+            print("ocean parallax alloc failed, using 1.0 scroll")
+            try:
+                buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+            except Exception:
+                pass
+        except Exception as e:
+            print("ocean parallax failed:", e)
+            try:
+                buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+            except Exception:
+                pass
         self.ocean_rgb565 = buf
         self.ocean_tw = tw
         self.ocean_th = th
         self.ocean_window = window
+        self.ocean_stamps = stamps
+        self._parallax = parallax
         print("ocean rgb565", len(buf), "window", len(window))
 
     def advance(self, speed, dt_ms):
@@ -1458,7 +1853,8 @@ class Sprite:
         clt = values.get("clt") or 0.0
         self.body_col = sonic_body_color(clt, now)
         if self.pack is not None:
-            self._sync_ground()
+            # Ocean / parallax buffers are prepared once at pack load
+            # (_sync_ground), not on every frame.
             self._draw_sheet_scene(lcd, speed, clt, now)
         else:
             self._draw_background(lcd)
@@ -1482,15 +1878,27 @@ class Sprite:
         # Backdrop already includes sky, water, scenery and the grass/dirt band.
         # Scroll 1:1 with the mid-ground rings so the after still stays aligned.
         if self.ocean_rgb565 is not None and self._ocean_push:
-            ok = blit_ocean_window(
-                lcd,
-                self.ocean_rgb565,
-                self.ocean_tw,
-                self.ocean_th,
-                off,
-                self.ocean_window,
-                W,
-            )
+            if self._parallax:
+                compose_parallax_window(
+                    self.ocean_rgb565,
+                    self.ocean_tw,
+                    self.ocean_th,
+                    self.scroll,
+                    self.ocean_stamps,
+                    self.ocean_window,
+                    W,
+                )
+                ok = push_rgb565_window(lcd, self.ocean_window, W, self.ocean_th)
+            else:
+                ok = blit_ocean_window(
+                    lcd,
+                    self.ocean_rgb565,
+                    self.ocean_tw,
+                    self.ocean_th,
+                    off,
+                    self.ocean_window,
+                    W,
+                )
             if not ok:
                 self._ocean_push = False
                 if ocean is not None:
