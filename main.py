@@ -1,28 +1,30 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
-V12: the V11 picture, with on-device timing and skipped redraws.
-Same pre-scaled PIX6 art (Sonic 39x36, playfield 128x103, rings 14x14).
-At pack load the 384x103 ocean tile is pre-rendered into an RGB565 buffer
-(~79 KB) and split into parallax layers: sky/clouds at 0.25, water and
-islands at 0.6, ground and near palms at 1.0. The packed art has no
-mountain band, so 0.4 is unused. Sonic cycles, the HUD ring and bar, field
-rings, and ring sparkles are baked once into RGB565 plus a 1-bit mask.
-Each frame still pushes one 128x103 playfield image. A band is recopied
-only when int(scroll * factor) changes. A scenery stamp is rebuilt only
-inside the rectangles a shifted band or a moved stamp actually dirtied,
-so the window stays pixel-identical to a full V11 compose. Unchanged
-sprite frames are left in place; a small underlay restores the backdrop
-under a sprite that did change (animation, spinning rings, sparkles, or
-the overheat tint). Parked, the parallax compose is skipped. Every two
-seconds a timing line prints average compose / sprite-stamp / push
-milliseconds, one GC sample, total, fps, and how many frames held the
-backdrop. That print does not rebuild the ocean or the sprite cache.
-If the underlay cannot be allocated, drawing stays on the V11 full
-compose. If a stamp fails later, the bake flag is cleared and drawing
-stays on the fillRect interpreter. This file is version 12; it is not
-the published Pages payload until the owner ships it.
-The face button is polled every main-loop iteration and during a draw, so a
-450 ms double-press can be caught even if a frame runs long.
+V14: the V12 packed ocean and scenery, drawn so a moving world does not
+rebuild every stamp in Python. Same pre-scaled PIX6 art (Sonic 39x36,
+playfield 128x103, rings 14x14). pixidx.bin is unchanged. At pack load the
+384x103 ocean tile is pre-rendered into an RGB565 buffer and split into
+parallax layers: sky/clouds at 0.25, water and islands at 0.6, ground and
+near palms at 1.0. The packed art has no mountain band, so 0.4 is unused.
+Scenery stamps (loop island, palms, bushes) blit through the same kind of
+viper loop Sonic and the HUD already use. A viper self-test failure stays
+on the V12 Python blit, so the pixels do not change.
+When a band's scroll offset moves by less than a screen, the 128-wide
+window is shifted and only the new columns are copied, then stamps that
+overlap that strip (or that did not move with the band) are restamped.
+The result matches a full compose at the same scroll. Unchanged offsets
+still skip the compose. Sprite frames that did not change stay where they
+are; the underlay restores the backdrop under a sprite that did.
+Each frame still pushes one 128x103 playfield image. When that push lands,
+the full-screen clear and the second canvas flush are skipped: gauges
+repaint y 103-127 themselves. The every-two-seconds line keeps the V12
+fields and adds fill and flush. total stays compose+stamp+push so it
+compares with V12; fill and flush are the previously untimed panel work.
+The face button (BtnA / Btn / BtnPWR only) is polled through compose,
+blits, flushes, and OTA checks. The OTA client stays, on its existing
+schedule; its HTTP fetch cannot block forever. A machine.WDT is armed
+after the first heavy alloc, fed from the loop, and not used as a routine
+reboot. This file is version 14. It is not the published Pages payload.
 Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
 barrier still use V2 primitives, layered on top of Sonic at tip (66, 72),
 alpha 178. FACE_ENABLED stays off.
@@ -88,8 +90,14 @@ REFRESH_MS = 50
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 12
-APP_VERSION_NAME = "2026.11.21-v12"
+APP_VERSION = 14
+APP_VERSION_NAME = "2026.11.21-v14"
+# Long enough that a main.py / pixidx write is not reset, short enough that
+# a stuck idle loop comes back without a power cycle. Not a routine reboot.
+WDT_TIMEOUT_MS = 30000
+# Caps a hung version.json / main.py / pixidx GET. The poll interval stays
+# in ota_client (90s). Button and the WDT are serviced while the GET runs.
+OTA_HTTP_TIMEOUT_MS = 3000
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
@@ -748,18 +756,42 @@ def blit_ocean_window(lcd, tile, tw, th, scroll, window, vw=W):
 
 
 def push_rgb565_window(lcd, window, vw, th):
-    """Push a precomposed RGB565 window as one image copy."""
+    """Push a precomposed RGB565 window as one image copy.
+
+    Strips keep the face button live if the panel transfer is slow. A driver
+    that rejects a strip falls back to one full pushImage, same pixels.
+    """
+    if vw <= 0 or th <= 0:
+        return False
     if hasattr(lcd, "pushImage"):
         try:
-            lcd.pushImage(0, 0, vw, th, window)
+            # Views of the stable window, so a strip cannot race a reused scratch.
+            mv = memoryview(window)
+            step = 16
+            y = 0
+            while y < th:
+                h = th - y
+                if h > step:
+                    h = step
+                off = y * vw * 2
+                n = h * vw * 2
+                lcd.pushImage(0, y, vw, h, mv[off:off + n])
+                y += h
+                _service()
             return True
         except Exception:
-            pass
+            try:
+                lcd.pushImage(0, 0, vw, th, window)
+                _service()
+                return True
+            except Exception:
+                pass
     if hasattr(lcd, "writePixels"):
         try:
             if hasattr(lcd, "setAddrWindow"):
                 lcd.setAddrWindow(0, 0, vw - 1, th - 1)
             lcd.writePixels(window)
+            _service()
             return True
         except Exception:
             pass
@@ -1034,7 +1066,189 @@ def _make_stamp(tile, tw, pts, factor):
     return stamps
 
 
-def _blit_stamp(window, vw, tw, stamp, scroll):
+# Face-button hook and the idle watchdog. Both stay None until main() arms
+# them, so a host pixel compare never touches the panel or the WDT.
+_BTN_HOOK = None
+_WDT = None
+_HTTP_STATE = {"busy": False, "done": False}
+_SOCKET_TIMEOUT_S = None
+_SOCKET_PATCHED = False
+_ROW_SCRATCH = bytearray(W * 2)
+_SCENERY_KIND = None
+_blit_stamp_viper = None
+_blit_stamp_clip_viper = None
+
+
+def _service():
+    """Poll the face button and feed the watchdog. Safe from compose and I/O."""
+    hook = _BTN_HOOK
+    if hook is not None:
+        try:
+            hook()
+        except Exception:
+            pass
+    wdt = _WDT
+    if wdt is not None:
+        try:
+            wdt.feed()
+        except Exception:
+            pass
+
+
+def _init_wdt():
+    """Arm a long watchdog after boot allocs. A failed port just leaves it off."""
+    global _WDT
+    if _WDT is not None:
+        return
+    try:
+        import machine
+    except ImportError:
+        return
+    ctor = getattr(machine, "WDT", None)
+    if ctor is None:
+        return
+    for timeout in (WDT_TIMEOUT_MS, 15000, 8000, 5000):
+        try:
+            _WDT = ctor(timeout=timeout)
+            print("wdt", timeout)
+            return
+        except Exception:
+            _WDT = None
+
+
+def _arm_socket_timeout(seconds):
+    """New sockets inherit this timeout. getaddrinfo may still block; see OTA."""
+    global _SOCKET_TIMEOUT_S, _SOCKET_PATCHED
+    _SOCKET_TIMEOUT_S = seconds
+    if _SOCKET_PATCHED:
+        return
+    mods = []
+    for name in ("usocket", "socket"):
+        try:
+            mods.append(__import__(name))
+        except ImportError:
+            pass
+    def wrap(orig):
+        def socket_fn(*args, **kwargs):
+            sock = orig(*args, **kwargs)
+            timeout = _SOCKET_TIMEOUT_S
+            if timeout is not None:
+                try:
+                    sock.settimeout(timeout)
+                except Exception:
+                    pass
+            return sock
+        return socket_fn
+    for mod in mods:
+        if hasattr(mod, "socket"):
+            try:
+                mod.socket = wrap(mod.socket)
+            except Exception:
+                pass
+        try:
+            mod.setdefaulttimeout(seconds)
+        except Exception:
+            pass
+    _SOCKET_PATCHED = True
+
+
+def _call_bounded(fn, timeout_ms):
+    """Run fn while the face button stays live. (True, value) or (False, err).
+
+    The socket timeout is what unblocks a hung GET. The waiter also returns
+    so the gauge loop cannot sit inside one check. A second check does not
+    start while the first thread is still inside the socket.
+    """
+    st = _HTTP_STATE
+    if st["busy"]:
+        _service()
+        if st["done"]:
+            st["busy"] = False
+            st["done"] = False
+        return False, "busy"
+    seconds = (timeout_ms + 200) / 1000.0
+    if seconds < 0.2:
+        seconds = 0.2
+    _arm_socket_timeout(seconds)
+    st["busy"] = True
+    st["done"] = False
+    box = []
+
+    def work():
+        try:
+            box.append(fn())
+        except Exception as e:
+            box.append(e)
+        st["done"] = True
+
+    started = False
+    try:
+        import _thread
+        _thread.start_new_thread(work, ())
+        started = True
+    except Exception:
+        started = False
+    if not started:
+        try:
+            value = fn()
+        except Exception as e:
+            st["busy"] = False
+            st["done"] = False
+            _service()
+            return False, "http " + str(e)
+        st["busy"] = False
+        st["done"] = False
+        _service()
+        return True, value
+    wait_ms = timeout_ms + 800
+    t0 = time.ticks_ms()
+    while not st["done"]:
+        _service()
+        if time.ticks_diff(time.ticks_ms(), t0) >= wait_ms:
+            # Leave busy set. The thread clears done when the socket returns.
+            return False, "timeout"
+        try:
+            time.sleep_ms(20)
+        except Exception:
+            time.sleep(0.02)
+    st["busy"] = False
+    st["done"] = False
+    _service()
+    if not box:
+        return False, "empty"
+    item = box[0]
+    if isinstance(item, BaseException):
+        return False, "http " + str(item)
+    return True, item
+
+
+def _install_ota_fetch_timeout(mod):
+    """Bound ota_client HTTP without changing its 90s poll or update rules."""
+    if mod is None or getattr(mod, "_atom_http_timeout", False):
+        return
+    orig = getattr(mod, "_http_get", None)
+    if orig is not None:
+        def _http_get(url):
+            ok, val = _call_bounded(lambda: orig(url), OTA_HTTP_TIMEOUT_MS)
+            if not ok:
+                return None, val
+            return val
+        mod._http_get = _http_get
+    orig_apply = getattr(mod, "apply_update", None)
+    if orig_apply is not None:
+        def apply_update(doc, version_url):
+            # Feed across the file swap. The GET itself is already bounded.
+            _service()
+            try:
+                return orig_apply(doc, version_url)
+            finally:
+                _service()
+        mod.apply_update = apply_update
+    mod._atom_http_timeout = True
+
+
+def _blit_stamp_py(window, vw, tw, stamp, scroll):
+    """V12 scenery blit. The viper path has to match these pixels."""
     factor, ox, oy, sw, sh, sbuf, mask = stamp
     off = int(scroll * factor) % tw
     if off < 0:
@@ -1054,7 +1268,11 @@ def _blit_stamp(window, vw, tw, stamp, scroll):
             src_x1 = vw - cand
         if src_x1 <= src_x0:
             continue
+        row = 0
         for dy in range(sh):
+            if (row & 7) == 0:
+                _service()
+            row += 1
             wy = oy + dy
             row_i = dy * sw
             dst_row = wy * vw
@@ -1066,6 +1284,22 @@ def _blit_stamp(window, vw, tw, stamp, scroll):
                     diw = (dst_row + wx) * 2
                     window[diw] = sbuf[si]
                     window[diw + 1] = sbuf[si + 1]
+
+
+def _blit_stamp(window, vw, tw, stamp, scroll):
+    _service()
+    kind = _SCENERY_KIND
+    if kind is None:
+        kind = _ensure_scenery()
+    if kind == "viper":
+        try:
+            factor, ox, oy, sw, sh, sbuf, mask = stamp
+            off = _norm_off(scroll * factor, tw)
+            _blit_stamp_viper(window, vw, tw, sbuf, mask, sw, sh, ox, oy, off)
+            return
+        except Exception:
+            _drop_scenery_viper()
+    _blit_stamp_py(window, vw, tw, stamp, scroll)
 
 
 def build_parallax_layers(tile, tw, th):
@@ -1089,11 +1323,13 @@ def build_parallax_layers(tile, tw, th):
 
 
 def compose_parallax_window(tile, tw, th, scroll, stamps, window, vw):
+    _service()
     _copy_rows(tile, tw, 0, HORIZON_Y, scroll * PARALLAX_CLOUDS, window, vw, 0)
     _copy_rows(tile, tw, HORIZON_Y, GRASS_Y, scroll * PARALLAX_WATER, window, vw, HORIZON_Y)
     _copy_rows(tile, tw, GRASS_Y, th, scroll * PARALLAX_GROUND, window, vw, GRASS_Y)
     for st in stamps:
         _blit_stamp(window, vw, tw, st, scroll)
+    _service()
 
 
 def _norm_off(value, tw):
@@ -1102,6 +1338,53 @@ def _norm_off(value, tw):
     if off < 0:
         off += tw
     return off
+
+
+def _signed_delta(old, new, tw):
+    """Smallest scroll step from old to new, in (-tw/2, tw/2]."""
+    d = (new - old) % tw
+    if d > (tw // 2):
+        d -= tw
+    return d
+
+
+def _shift_window_band(window, vw, tile, tw, y0, y1, delta, off_new):
+    """Slide band rows by delta and paint the columns that entered the screen.
+
+    delta > 0 moves existing pixels left (scroll offset increased). The new
+    columns are the backdrop at off_new, same pixels _copy_rows would write.
+    """
+    if delta == 0 or y1 <= y0 or vw <= 0:
+        return
+    scratch = _ROW_SCRATCH
+    y = y0
+    if delta > 0:
+        keep = vw - delta
+        n = keep * 2
+        src = delta * 2
+        x0 = vw - delta
+        x1 = vw
+        while y < y1:
+            if ((y - y0) & 7) == 0:
+                _service()
+            row = y * vw * 2
+            scratch[0:n] = window[row + src:row + src + n]
+            window[row:row + n] = scratch[0:n]
+            _copy_partial_row(tile, tw, y, off_new, window, x0, x1, vw)
+            y += 1
+        return
+    e = 0 - delta
+    keep = vw - e
+    n = keep * 2
+    dst = e * 2
+    while y < y1:
+        if ((y - y0) & 7) == 0:
+            _service()
+        row = y * vw * 2
+        scratch[0:n] = window[row:row + n]
+        window[row + dst:row + dst + n] = scratch[0:n]
+        _copy_partial_row(tile, tw, y, off_new, window, 0, e, vw)
+        y += 1
 
 
 def _mono_us():
@@ -1310,8 +1593,8 @@ def _stamp_screen_rects(ox, oy, sw, sh, off, tw, vw, vh):
     return found
 
 
-def _blit_stamp_clip(window, vw, tw, stamp, scroll, clip):
-    """Stamp pixels that land inside clip. Matches _blit_stamp inside that box."""
+def _blit_stamp_clip_py(window, vw, tw, stamp, scroll, clip):
+    """Stamp pixels that land inside clip. Matches _blit_stamp_py inside that box."""
     factor, ox, oy, sw, sh, sbuf, mask = stamp
     cx, cy, cw, ch = clip
     if cw <= 0 or ch <= 0 or sw <= 0 or sh <= 0:
@@ -1379,7 +1662,28 @@ def _blit_stamp_clip(window, vw, tw, stamp, scroll, clip):
                     window[diw] = sbuf[si]
                     window[diw + 1] = sbuf[si + 1]
                 dx += 1
+            if (dy & 7) == 0:
+                _service()
             dy += 1
+
+
+def _blit_stamp_clip(window, vw, tw, stamp, scroll, clip):
+    _service()
+    kind = _SCENERY_KIND
+    if kind is None:
+        kind = _ensure_scenery()
+    if kind == "viper":
+        try:
+            factor, ox, oy, sw, sh, sbuf, mask = stamp
+            cx, cy, cw, ch = clip
+            off = _norm_off(scroll * factor, tw)
+            _blit_stamp_clip_viper(
+                window, vw, tw, sbuf, mask, sw, sh, ox, oy, off, cx, cy, cw, ch
+            )
+            return
+        except Exception:
+            _drop_scenery_viper()
+    _blit_stamp_clip_py(window, vw, tw, stamp, scroll, clip)
 
 
 # Sprite frames baked once at pack load. The mask bit for pixel i is
@@ -1659,6 +1963,203 @@ except Exception:
     _stamp_viper = None
 
 
+def _drop_scenery_viper():
+    global _SCENERY_KIND
+    _SCENERY_KIND = "py"
+
+
+def _viper_scenery_ok():
+    """Full and clipped scenery blits against the Python loops. A miss stays on Python."""
+    if _blit_stamp_viper is None or _blit_stamp_clip_viper is None:
+        return False
+    tw = 12
+    vw = 16
+    sw = 10
+    sh = 4
+    sbuf = bytearray(sw * sh * 2)
+    mask = bytearray((sw * sh + 7) // 8)
+    i = 0
+    while i < sw * sh:
+        if (i % 3) != 0:
+            mask[i >> 3] = mask[i >> 3] | (1 << (i & 7))
+            sbuf[i * 2] = (0xA0 + i) & 0xFF
+            sbuf[i * 2 + 1] = (0x10 + i * 5) & 0xFF
+        i += 1
+    stamp = (1.0, 0, 1, sw, sh, sbuf, mask)
+    vh = 8
+    cases = (
+        (0, None),
+        (2, None),
+        (5, (1, 0, 6, 3)),
+        (0, (0, 1, 16, 2)),
+        (11, (14, 2, 4, 5)),
+        (3, (-4, -2, 8, 3)),
+        (0, (20, 0, 4, 4)),
+    )
+    try:
+        for off, clip in cases:
+            a = bytearray(vw * vh * 2)
+            b = bytearray(vw * vh * 2)
+            fill = 0x3C
+            j = 0
+            while j < len(a):
+                a[j] = fill
+                b[j] = fill
+                j += 1
+            # factor is 1.0, so the Python blit mods scroll by tw. Keep off < tw.
+            wrapped = off % tw
+            _blit_stamp_viper(a, vw, tw, sbuf, mask, sw, sh, 0, 1, wrapped)
+            _blit_stamp_py(b, vw, tw, stamp, wrapped)
+            if a != b:
+                return False
+            if clip is not None:
+                j = 0
+                while j < len(a):
+                    a[j] = fill
+                    b[j] = fill
+                    j += 1
+                cx, cy, cw, ch = clip
+                _blit_stamp_clip_viper(
+                    a, vw, tw, sbuf, mask, sw, sh, 0, 1, wrapped, cx, cy, cw, ch
+                )
+                _blit_stamp_clip_py(b, vw, tw, stamp, wrapped, clip)
+                if a != b:
+                    return False
+    except Exception:
+        return False
+    return True
+
+
+def _ensure_scenery():
+    global _SCENERY_KIND
+    if _SCENERY_KIND is not None:
+        return _SCENERY_KIND
+    if _blit_stamp_viper is not None and _viper_scenery_ok():
+        _SCENERY_KIND = "viper"
+    else:
+        _SCENERY_KIND = "py"
+    return _SCENERY_KIND
+
+
+try:
+    import micropython
+
+    @micropython.viper
+    def _blit_stamp_viper(window, vw: int, tw: int, sbuf, mask, sw: int, sh: int, ox: int, oy: int, off: int):
+        wp = ptr8(window)
+        sp = ptr8(sbuf)
+        mp = ptr8(mask)
+        if sw <= 0 or sh <= 0 or vw <= 0:
+            return
+        sx = ox - off
+        k = 0
+        while k < 3:
+            if k == 0:
+                cand = sx
+            elif k == 1:
+                cand = sx - tw
+            else:
+                cand = sx + tw
+            k += 1
+            if cand + sw > 0 and cand < vw:
+                src_x0 = 0
+                dst_x0 = cand
+                if dst_x0 < 0:
+                    src_x0 = 0 - dst_x0
+                    dst_x0 = 0
+                src_x1 = sw
+                if cand + sw > vw:
+                    src_x1 = vw - cand
+                if src_x1 > src_x0:
+                    dy = 0
+                    while dy < sh:
+                        wy = oy + dy
+                        row_i = dy * sw
+                        dst_row = wy * vw
+                        dx = src_x0
+                        while dx < src_x1:
+                            di = row_i + dx
+                            if mp[di >> 3] & (1 << (di & 7)):
+                                wx = dst_x0 + (dx - src_x0)
+                                si = di * 2
+                                wi = (dst_row + wx) * 2
+                                wp[wi] = sp[si]
+                                wp[wi + 1] = sp[si + 1]
+                            dx += 1
+                        dy += 1
+
+    @micropython.viper
+    def _blit_stamp_clip_viper(
+        window, vw: int, tw: int, sbuf, mask, sw: int, sh: int,
+        ox: int, oy: int, off: int, cx: int, cy: int, cw: int, ch: int,
+    ):
+        wp = ptr8(window)
+        sp = ptr8(sbuf)
+        mp = ptr8(mask)
+        if cw <= 0 or ch <= 0 or sw <= 0 or sh <= 0 or vw <= 0:
+            return
+        cright = cx + cw
+        cbot = cy + ch
+        sx = ox - off
+        k = 0
+        while k < 3:
+            if k == 0:
+                cand = sx
+            elif k == 1:
+                cand = sx - tw
+            else:
+                cand = sx + tw
+            k += 1
+            if cand + sw > 0 and cand < vw:
+                src_x0 = 0
+                dst_x0 = cand
+                if dst_x0 < 0:
+                    src_x0 = 0 - dst_x0
+                    dst_x0 = 0
+                src_x1 = sw
+                if cand + sw > vw:
+                    src_x1 = vw - cand
+                if src_x1 > src_x0:
+                    if dst_x0 < cx:
+                        shift = cx - dst_x0
+                        src_x0 += shift
+                        dst_x0 = cx
+                    dest_end = dst_x0 + (src_x1 - src_x0)
+                    if dest_end > cright:
+                        src_x1 -= dest_end - cright
+                    if src_x1 > src_x0:
+                        dy0 = 0
+                        if oy < cy:
+                            dy0 = cy - oy
+                        dy1 = sh
+                        if oy + dy1 > cbot:
+                            dy1 = cbot - oy
+                        if dy0 < 0:
+                            dy0 = 0
+                        if dy1 > sh:
+                            dy1 = sh
+                        if dy0 < dy1:
+                            dy = dy0
+                            while dy < dy1:
+                                wy = oy + dy
+                                row_i = dy * sw
+                                dst_row = wy * vw
+                                dx = src_x0
+                                while dx < src_x1:
+                                    di = row_i + dx
+                                    if mp[di >> 3] & (1 << (di & 7)):
+                                        wx = dst_x0 + (dx - src_x0)
+                                        si = di * 2
+                                        wi = (dst_row + wx) * 2
+                                        wp[wi] = sp[si]
+                                        wp[wi + 1] = sp[si + 1]
+                                    dx += 1
+                                dy += 1
+except Exception:
+    _blit_stamp_viper = None
+    _blit_stamp_clip_viper = None
+
+
 def _pixidx_geometry_ok(pack):
     """V7/V8 art: 384x103 backdrop and 39x36 Sonic. A leftover V6 pack fails this."""
     ocean = pack.by_name.get("ocean")
@@ -1743,27 +2244,26 @@ def try_fetch_pixidx():
             import requests
         except ImportError:
             return None
-    try:
-        resp = requests.get(PIXIDX_URL)
-    except Exception:
-        return None
-    try:
-        status = getattr(resp, "status_code", None)
-        if status is None:
-            status = getattr(resp, "status", 200)
-        if int(status) != 200:
+    def _read_body():
+        try:
+            resp = requests.get(PIXIDX_URL, timeout=OTA_HTTP_TIMEOUT_MS / 1000.0)
+        except TypeError:
+            resp = requests.get(PIXIDX_URL)
+        try:
+            status = getattr(resp, "status_code", None)
+            if status is None:
+                status = getattr(resp, "status", 200)
+            if int(status) != 200:
+                return None
+            return resp.content
+        finally:
             try:
                 resp.close()
             except Exception:
                 pass
-            return None
-        data = resp.content
-        resp.close()
-    except Exception:
-        try:
-            resp.close()
-        except Exception:
-            pass
+
+    ok, data = _call_bounded(_read_body, OTA_HTTP_TIMEOUT_MS)
+    if not ok or not data:
         return None
     got = _sha256_hex(data)
     if got is not None and got != PIXIDX_SHA256:
@@ -1781,8 +2281,18 @@ def try_fetch_pixidx():
         print("fetched pixidx.bin is not the current pack")
         return None
     try:
+        _service()
         with open(PIXIDX_NAME, "wb") as f:
-            f.write(data)
+            i = 0
+            n = len(data)
+            while i < n:
+                nxt = i + 1024
+                if nxt > n:
+                    nxt = n
+                f.write(data[i:nxt])
+                i = nxt
+                # Feed between chunks so the watchdog cannot fire mid-write.
+                _service()
     except Exception as e:
         print("pixidx save failed:", e)
         return None
@@ -2191,6 +2701,8 @@ class Sprite:
         self._dirty = bytearray(0)
         self._band_off = [0, 0, 0]
         self._band_new = [0, 0, 0]
+        self._band_mode = [0, 0, 0]
+        self._band_delta = [0, 0, 0]
         self._stamp_off = []
         self._stamp_new = []
         self._flat_off = -1
@@ -2199,6 +2711,8 @@ class Sprite:
         self._tim_compose = 0
         self._tim_stamp = 0
         self._tim_push = 0
+        self._tim_fill = 0
+        self._tim_flush = 0
         self._tim_hold = 0
         self._tim_t0 = 0
         self._sync_ground()
@@ -2291,6 +2805,8 @@ class Sprite:
         self._dirty = bytearray(th)
         self._band_off = [0, 0, 0]
         self._band_new = [0, 0, 0]
+        self._band_mode = [0, 0, 0]
+        self._band_delta = [0, 0, 0]
         n = len(self.ocean_stamps) if self.ocean_stamps else 0
         self._stamp_off = [0] * n
         self._stamp_new = [0] * n
@@ -2677,33 +3193,99 @@ class Sprite:
         self._under_used = 0
         del self._under_spans[:]
 
-    def _collect_dirty_clips(self):
-        """Rectangles whose backdrop pixels are not already correct."""
-        clips = []
-        band_clips = []
+    def _band_spans(self):
         th = self.ocean_th
-        vw = W
-        spans = (
+        return (
             (0, HORIZON_Y, 0),
             (HORIZON_Y, GRASS_Y, 1),
             (GRASS_Y, th, 2),
         )
-        oldb = self._band_off
-        newb = self._band_new
-        for y0, y1, idx in spans:
-            if y1 <= y0 or oldb[idx] == newb[idx]:
+
+    def _apply_band_scroll(self):
+        """Shift a band that only moved a few columns. Large jumps stay full restores.
+
+        mode 0: offset unchanged. mode 1: window rows already shifted, new
+        columns painted from the tile. mode 2: caller must restore the band.
+        """
+        th = self.ocean_th
+        tw = self.ocean_tw
+        window = self.ocean_window
+        tile = self.ocean_rgb565
+        for y0, y1, idx in self._band_spans():
+            self._band_mode[idx] = 0
+            self._band_delta[idx] = 0
+            if y1 <= y0:
                 continue
             if y0 < 0:
                 y0 = 0
-            if y0 >= th:
-                continue
             if y1 > th:
                 y1 = th
             if y1 <= y0:
                 continue
-            box = (0, y0, vw, y1 - y0)
-            clips.append(box)
-            band_clips.append(box)
+            old = self._band_off[idx]
+            new = self._band_new[idx]
+            if old == new:
+                continue
+            d = _signed_delta(old, new, tw)
+            self._band_delta[idx] = d
+            if d != 0 and d > -W and d < W:
+                _shift_window_band(window, W, tile, tw, y0, y1, d, new)
+                self._band_mode[idx] = 1
+            else:
+                self._band_mode[idx] = 2
+
+    def _stamp_carried(self, oy, sh, d_stamp):
+        """True when the shift already left this stamp on its new pixels.
+
+        The exposed columns are still clean backdrop. A stamp that crosses a
+        band which moved by a different delta, or a band that was not shifted,
+        is not carried and has to be erased and redrawn.
+        """
+        y1 = oy + sh
+        saw = False
+        for by0, by1, idx in self._band_spans():
+            if y1 <= by0 or oy >= by1:
+                continue
+            saw = True
+            mode = self._band_mode[idx]
+            if mode == 1:
+                if self._band_delta[idx] != d_stamp:
+                    return False
+            elif mode == 0:
+                if d_stamp != 0:
+                    return False
+            else:
+                return False
+        return saw
+
+    def _collect_dirty_clips(self):
+        """Rectangles whose backdrop pixels are not already correct.
+
+        A shifted band only dirties the columns that entered the screen.
+        Stamps that rode along with that shift are restamped there. Stamps
+        that did not are restored at the old and new screen boxes.
+        """
+        clips = []
+        th = self.ocean_th
+        vw = W
+        for y0, y1, idx in self._band_spans():
+            mode = self._band_mode[idx]
+            if mode == 0 or y1 <= y0:
+                continue
+            if y0 < 0:
+                y0 = 0
+            if y1 > th:
+                y1 = th
+            if y1 <= y0:
+                continue
+            if mode == 2:
+                clips.append((0, y0, vw, y1 - y0))
+                continue
+            d = self._band_delta[idx]
+            if d > 0:
+                clips.append((vw - d, y0, d, y1 - y0))
+            elif d < 0:
+                clips.append((0, y0, 0 - d, y1 - y0))
         stamps = self.ocean_stamps
         old = self._stamp_off
         new = self._stamp_new
@@ -2711,27 +3293,40 @@ class Sprite:
         i = 0
         n = len(stamps)
         while i < n:
-            if old[i] != new[i]:
-                st = stamps[i]
-                rects = []
-                for off in (old[i], new[i]):
-                    rects.extend(
-                        _stamp_screen_rects(st[1], st[2], st[3], st[4], off, tw, vw, th)
-                    )
-                rects = _merge_x_rects(rects)
-                for box in rects:
-                    pieces = [box]
-                    for bx, by, bw, bh in band_clips:
-                        if bw < vw or bx > 0:
+            st = stamps[i]
+            d_stamp = _signed_delta(old[i], new[i], tw)
+            if not self._stamp_carried(st[2], st[4], d_stamp):
+                old_rects = _stamp_screen_rects(
+                    st[1], st[2], st[3], st[4], old[i], tw, vw, th
+                )
+                new_rects = _stamp_screen_rects(
+                    st[1], st[2], st[3], st[4], new[i], tw, vw, th
+                )
+                for box in old_rects:
+                    clips.append(box)
+                for box in new_rects:
+                    clips.append(box)
+                # A band shift has already slid this stamp's pixels by the
+                # band delta. That is not the stamp's own delta, so the
+                # pixels now sit outside the pre-shift box. Cover that spot.
+                for by0, by1, idx in self._band_spans():
+                    if self._band_mode[idx] != 1:
+                        continue
+                    bd = self._band_delta[idx]
+                    if bd == 0 or by1 <= by0:
+                        continue
+                    band = (0, by0, vw, by1 - by0)
+                    for box in old_rects:
+                        inter = _rect_intersect(box, band)
+                        if inter is None:
                             continue
-                        nxt = []
-                        for px, py, pw, ph in pieces:
-                            nxt.extend(_subtract_y(px, py, pw, ph, by, by + bh))
-                        pieces = nxt
-                    for piece in pieces:
-                        if piece[2] > 0 and piece[3] > 0:
-                            clips.append(piece)
+                        x, y, w, h = inter
+                        moved = _clip_box(x - bd, y, w, h, vw, th)
+                        if moved is not None:
+                            clips.append(moved)
             i += 1
+            if (i & 3) == 0:
+                _service()
         return clips
 
     def _clips_cover_all(self, clips):
@@ -2816,6 +3411,8 @@ class Sprite:
                     if inter is not None:
                         _blit_stamp_clip(window, vw, tw, st, scroll, inter)
             i += 1
+            if (i & 3) == 0:
+                _service()
 
     def _update_flat(self, scroll):
         off = _norm_off(scroll, self.ocean_tw)
@@ -2853,6 +3450,8 @@ class Sprite:
         if not self._pf_valid:
             self._compose_full(scroll)
             return True
+        _service()
+        self._apply_band_scroll()
         clips = self._collect_dirty_clips()
         if not clips:
             self._commit_offs()
@@ -3052,8 +3651,21 @@ class Sprite:
         if held:
             self._tim_hold += 1
 
+    def note_chrome(self, fill_us, flush_us):
+        """fillScreen and the full-canvas push. 0 when that work was skipped."""
+        if fill_us < 0:
+            fill_us = 0
+        if flush_us < 0:
+            flush_us = 0
+        self._tim_fill += fill_us
+        self._tim_flush += flush_us
+
     def report_timing(self, now):
-        """One serial line per 2 seconds. Does not rebuild caches."""
+        """One serial line per 2 seconds. Does not rebuild caches.
+
+        total stays compose+stamp+push so it compares with V12. fill and
+        flush are the panel clear and the second canvas push.
+        """
         n = self._tim_n
         if n <= 0 or self._tim_t0 == 0:
             return
@@ -3070,17 +3682,20 @@ class Sprite:
                 gc_us = 0
         except Exception:
             gc_us = 0
+        _service()
         total_us = self._tim_compose + self._tim_stamp + self._tim_push
         fps_tenths = 0
         if elapsed > 0:
             fps_tenths = (n * 10000) // elapsed
         print(
-            "timing n=%d compose %s stamp %s push %s gc %s total %s fps %s hold %d"
+            "timing n=%d compose %s stamp %s push %s fill %s flush %s gc %s total %s fps %s hold %d"
             % (
                 n,
                 _fmt_tenths(_avg_tenths_ms(self._tim_compose, n)),
                 _fmt_tenths(_avg_tenths_ms(self._tim_stamp, n)),
                 _fmt_tenths(_avg_tenths_ms(self._tim_push, n)),
+                _fmt_tenths(_avg_tenths_ms(self._tim_fill, n)),
+                _fmt_tenths(_avg_tenths_ms(self._tim_flush, n)),
                 _fmt_tenths(_avg_tenths_ms(gc_us, 1)),
                 _fmt_tenths(_avg_tenths_ms(total_us, n)),
                 _fmt_tenths(fps_tenths),
@@ -3091,6 +3706,8 @@ class Sprite:
         self._tim_compose = 0
         self._tim_stamp = 0
         self._tim_push = 0
+        self._tim_fill = 0
+        self._tim_flush = 0
         self._tim_hold = 0
         self._tim_t0 = now
 
@@ -3530,6 +4147,7 @@ class ButtonWatch:
 
 class Dashboard:
     def __init__(self, lcd, pack=None, button=None):
+        self.panel = lcd
         self.lcd, self._use_push = make_canvas(lcd)
         self.sprite = Sprite(pack)
         self.button = button
@@ -3541,6 +4159,16 @@ class Dashboard:
         if self.button is not None:
             self.button.poll(now)
 
+    def _direct_playfield(self):
+        """The playfield image is pushed onto the panel, so a clear would erase it."""
+        sp = self.sprite
+        return (
+            sp.pack is not None
+            and sp._ocean_push
+            and sp.ocean_window is not None
+            and sp.ocean_rgb565 is not None
+        )
+
     def tick(self, values, fault, now):
         self._poll_button(now)
         dt = time.ticks_diff(now, self._last_ms)
@@ -3550,18 +4178,44 @@ class Dashboard:
         speed = values.get("spd") or 0.0
         self.sprite.advance(speed, dt)
 
-        lcd = self.lcd
-        lcd.fillScreen(COL_BG)
+        # pushImage already covers y 0-102. Gauges repaint y 103-127.
+        # Skipping fillScreen and the canvas push avoids a second full-panel
+        # flush and a clear that would wipe the playfield.
+        direct = self._direct_playfield()
+        surface = self.panel if direct else self.lcd
+        fill_us = 0
+        flush_us = 0
+        if not direct:
+            _service()
+            t0 = _mono_us()
+            surface.fillScreen(COL_BG)
+            fill_us = _us_diff(_mono_us(), t0)
+            if fill_us < 0:
+                fill_us = 0
+            _service()
+        noted = self.sprite._tim_n
+        self.sprite.draw(surface, values, now)
         self._poll_button(now)
-        self.sprite.draw(lcd, values, now)
-        self._poll_button(now)
-        self._draw_gauges(values)
-        self._draw_fault(fault)
-        if self._use_push:
+        prev = self.lcd
+        self.lcd = surface
+        try:
+            self._draw_gauges(values)
+            self._draw_fault(fault)
+        finally:
+            self.lcd = prev
+        if (not direct) and self._use_push:
+            _service()
+            t0 = _mono_us()
             try:
-                lcd.push(0, 0)
+                surface.push(0, 0)
             except Exception:
                 self._use_push = False
+            flush_us = _us_diff(_mono_us(), t0)
+            if flush_us < 0:
+                flush_us = 0
+            _service()
+        if self.sprite._tim_n != noted:
+            self.sprite.note_chrome(fill_us, flush_us)
         self._poll_button(now)
         self.sprite.report_timing(now)
 
@@ -3624,22 +4278,34 @@ def pull_frames(bus, values):
         if msg[0] == ID_RPM and data is not None and len(data) >= 5:
             values["brk"] = 1.0 if (data[4] & 0x01) else 0.0
         n += 1
+        if (n & 7) == 0:
+            _service()
         if n >= 64:
             break
     return n
 
 
 def main():
+    global _BTN_HOOK
     M5.begin()
     lcd = Lcd
     pack = try_load_pixidx()
     sweep = Sweep()
     button = ButtonWatch(find_btn(), sweep.start)
+    # Ocean and sprite caches allocate here. Arm the watchdog after that so
+    # the first build cannot reset the device.
     ui = Dashboard(lcd, pack, button=button)
+    _init_wdt()
+
+    def _face_hook():
+        button.poll(time.ticks_ms())
+
+    _BTN_HOOK = _face_hook
     try:
         import ota_client
     except ImportError:
         ota_client = None
+    _install_ota_fetch_timeout(ota_client)
     _last_fetch_ms = -PIXIDX_FETCH_EVERY_MS
 
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
@@ -3653,6 +4319,7 @@ def main():
         bus = None
 
     while True:
+        _service()
         now = time.ticks_ms()
         # Poll every iteration, not only when a frame has finished.
         button.poll(now)
@@ -3669,10 +4336,12 @@ def main():
             fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
 
         if ota_client is not None:
+            _service()
             try:
                 ota_client.poll(now)
             except Exception:
                 pass
+            _service()
 
         if ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
             # Keep retrying while the current pack is missing or was rejected

@@ -26,38 +26,39 @@ firmware fetches it over Wi-Fi after boot.
 
 `.nojekyll` keeps GitHub Pages from running Jekyll.
 
-## Version 12 is not published
+## Version 14 is not published
 
-This branch is **2026.11.21-v12** (version **12**). It is not the live
-GitHub Pages payload. Do not treat this branch as an OTA update until it
-is merged and the owner publishes it.
+Live GitHub Pages still serve version **12**. This branch is
+**2026.11.21-v14** (version **14**). It is not an OTA update until it is
+merged and the owner publishes it. Do not flash it from this branch
+unless you mean to.
 
-Version 12 keeps the V11 playfield. The 384×103 ocean and the sprite
-cache are still built once when the pack loads. Each frame still pushes
-one 128×103 image. A parallax band is recopied only when
-`int(scroll * factor)` changes. Scenery is restamped only inside the
-rectangles a shifted band or a moved stamp actually dirtied, so the
-pixels match a full V11 compose. Sprite frames that did not change stay
-where they are. A small underlay (9630 bytes) restores the backdrop
-under a sprite that did change: animation, spinning rings, sparkles, or
-the overheat tint. Parked, with nothing in the playfield moving, the
-parallax compose is skipped.
+Version 14 keeps the V12 packed ocean and scenery stamps. `pixidx.bin`
+is the same file. Scenery blits go through viper when a startup self-test
+matches the Python loops; otherwise the V12 Python blit stays. A parallax
+band that moves by less than a screen is shifted in the 128-wide window
+and only the new columns are copied. Stamps that did not move with that
+band are erased and redrawn. The pixels match a full compose. Parked,
+with nothing moving, the compose is still skipped.
+
+When the playfield image is pushed onto the panel, the full-screen clear
+and the second canvas flush are skipped. Gauges still repaint y 103–127.
+The face button is polled through compose, blits, flushes, and the OTA
+check. The OTA client is unchanged aside from a timeout on its HTTP fetch.
+A machine watchdog is armed after the boot allocations.
 
 Every two seconds the serial line looks like:
 
 ```text
-timing n=40 compose 1.2 stamp 0.8 push 3.5 gc 0.3 total 5.5 fps 20.0 hold 28
+timing n=40 compose 1.2 stamp 0.8 push 3.5 fill 0.0 flush 0.0 gc 0.3 total 5.5 fps 20.0 hold 28
 ```
 
-`compose`, `stamp`, `push`, and `total` are average milliseconds per
-frame. `gc` is one `gc.collect()` for that interval. `hold` is how many
-of those frames left the backdrop untouched. Printing the line does not
-rebuild the ocean or the sprite cache.
-
-If the underlay cannot be allocated, drawing stays on the V11 full
-compose. If a later stamp fails, the bake flag is cleared and drawing
-stays on the `fillRect` interpreter. Aura, shockwave, and the gauges are
-unchanged.
+`compose`, `stamp`, `push`, and `total` are the V12 averages
+(`total` is still compose + stamp + push). `fill` is `fillScreen` and
+`flush` is the full-canvas `push`. Both are 0 when the playfield image
+already updated the panel. `gc` is one `gc.collect()` for that interval.
+`hold` is how many frames left the backdrop untouched. Printing the line
+does not rebuild the ocean or the sprite cache.
 
 `pixidx.bin` is unchanged
 (`dda4ea1e1f3249adc8bccb8fc9fe07bb446fb569d5abb884bd1bf83cfe4ba47e`,
