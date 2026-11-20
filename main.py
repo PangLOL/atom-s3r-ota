@@ -1,7 +1,11 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
-V8: same pre-scaled PIX6 art as V7 (Sonic 39x36, playfield 128x103, rings 14x14).
-Sprites: engine-sheet Sonic cycles plus after-preview scenery / HUD / rings.
+V9: same pre-scaled PIX6 art as V8 (Sonic 39x36, playfield 128x103, rings 14x14).
+At pack load the 384x103 ocean tile is pre-rendered into an RGB565 buffer
+(~79 KB). Each frame copies only the 128-wide visible window as one image
+blit. Sprites, HUD, and field rings still use the fillRect interpreter.
+The face button is polled every main-loop iteration and during a draw, so a
+450 ms double-press can be caught even if a frame runs long.
 Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
 barrier still use V2 primitives, layered on top of Sonic at tip (66, 72),
 alpha 178. FACE_ENABLED stays off.
@@ -67,8 +71,8 @@ REFRESH_MS = 50
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 8
-APP_VERSION_NAME = "2026.11.21-v8"
+APP_VERSION = 9
+APP_VERSION_NAME = "2026.11.21-v9"
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
@@ -503,12 +507,16 @@ class PixIdx:
         self.colors = colors
         self.pix_off = pix_off
         self.palettes = []
+        self.palettes_565 = []
         for p in range(n_pal):
             pal = [0] * colors
+            pal565 = [0] * colors
             for i in range(1, colors):
                 val = _u16(data, pal_off + (p * colors + i) * 2)
+                pal565[i] = val
                 pal[i] = _rgb565_to_888(val)
             self.palettes.append(pal)
+            self.palettes_565.append(pal565)
         self.frames = []
         self.by_name = {}
         for n in range(n_frames):
@@ -627,6 +635,91 @@ def blit_tiled_x(lcd, pack, frame, y, scroll, pal, clip_t=0, clip_b=103):
     while x < W:
         blit_frame(lcd, pack, frame, x, y, pal, clip_t, clip_b, False)
         x += tw
+
+
+def _rgb888_to_565(c):
+    r = (c >> 16) & 0xFF
+    g = (c >> 8) & 0xFF
+    b = c & 0xFF
+    return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+
+
+def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
+    """Bake the ocean tile into a little-endian RGB565 buffer once at pack load.
+
+    Index 0 (transparent in the sprite blitter) is filled with the sky
+    background so a window copy is fully opaque.
+    """
+    w = frame.w
+    h = frame.h
+    buf = bytearray(w * h * 2)
+    pal_id = frame.pal_id
+    if pal_id < 0 or pal_id >= len(pack.palettes_565):
+        pal_id = 0
+    pal565 = pack.palettes_565[pal_id]
+    bg = _rgb888_to_565(bg_color)
+    pairs = [bytes((bg & 0xFF, (bg >> 8) & 0xFF))] * pack.colors
+    for i in range(1, min(len(pal565), pack.colors)):
+        v = pal565[i]
+        pairs[i] = bytes((v & 0xFF, (v >> 8) & 0xFF))
+    data = pack.data
+    base = pack.pix_off + frame.data_offset
+    bpp4 = pack.bpp == 4
+    row_bytes = ((w + 1) // 2) if bpp4 else w
+    di = 0
+    for y in range(h):
+        row = base + y * row_bytes
+        for x in range(w):
+            if bpp4:
+                b = data[row + (x >> 1)]
+                idx = (b >> 4) if (x & 1) == 0 else (b & 0x0F)
+            else:
+                idx = data[row + x]
+            if idx >= len(pairs):
+                idx = 0
+            pair = pairs[idx]
+            buf[di] = pair[0]
+            buf[di + 1] = pair[1]
+            di += 2
+    return buf, w, h
+
+
+def copy_ocean_window(tile, tw, th, scroll, out, vw=W):
+    """Wrap-copy a vw-wide window of the 384-wide RGB565 tile into out."""
+    off = int(scroll) % tw
+    if off < 0:
+        off += tw
+    n1 = tw - off
+    if n1 > vw:
+        n1 = vw
+    end1 = n1 * 2
+    rest = (vw - n1) * 2
+    for y in range(th):
+        src = y * tw * 2
+        dst = y * vw * 2
+        out[dst:dst + end1] = tile[src + off * 2:src + off * 2 + end1]
+        if rest:
+            out[dst + end1:dst + end1 + rest] = tile[src:src + rest]
+
+
+def blit_ocean_window(lcd, tile, tw, th, scroll, window, vw=W):
+    """Copy the visible 128-wide window, then push it as one image."""
+    copy_ocean_window(tile, tw, th, scroll, window, vw)
+    if hasattr(lcd, "pushImage"):
+        try:
+            lcd.pushImage(0, 0, vw, th, window)
+            return True
+        except Exception:
+            pass
+    if hasattr(lcd, "writePixels"):
+        try:
+            if hasattr(lcd, "setAddrWindow"):
+                lcd.setAddrWindow(0, 0, vw - 1, th - 1)
+            lcd.writePixels(window)
+            return True
+        except Exception:
+            pass
+    return False
 
 
 def _pixidx_geometry_ok(pack):
@@ -1129,6 +1222,11 @@ class Sprite:
         self.sparkles = []  # [x, y, i, accum]
         self._surface = GAUGE_Y - 2
         self._ground_top = GAUGE_Y - 2
+        self.ocean_rgb565 = None
+        self.ocean_tw = 0
+        self.ocean_th = 0
+        self.ocean_window = None
+        self._ocean_push = True
         self._sync_ground()
 
     def _sync_ground(self):
@@ -1137,11 +1235,43 @@ class Sprite:
             self._ground_top = GAUGE_Y - 2
             self._surface = GAUGE_Y - 2
             self.ground_y = self._surface
+            self.ocean_rgb565 = None
+            self.ocean_window = None
+            self._ocean_push = True
             return
         # Locked after-preview feet dest, independent of the ground tile.
         self._surface = SONIC_FEET_DEST_Y
         self._ground_top = GAUGE_Y - 15
         self.ground_y = self._surface
+        self._prepare_ocean()
+
+    def _prepare_ocean(self):
+        """Pre-render the 384x103 ocean tile into RGB565 once per pack load."""
+        self.ocean_rgb565 = None
+        self.ocean_window = None
+        self.ocean_tw = 0
+        self.ocean_th = 0
+        self._ocean_push = True
+        pack = self.pack
+        if pack is None:
+            return
+        ocean = pack.by_name.get("ocean")
+        if ocean is None or ocean.w <= 0 or ocean.h <= 0:
+            return
+        try:
+            buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+            window = bytearray(W * th * 2)
+        except MemoryError:
+            print("ocean rgb565 alloc failed")
+            return
+        except Exception as e:
+            print("ocean rgb565 prerender failed:", e)
+            return
+        self.ocean_rgb565 = buf
+        self.ocean_tw = tw
+        self.ocean_th = th
+        self.ocean_window = window
+        print("ocean rgb565", len(buf), "window", len(window))
 
     def advance(self, speed, dt_ms):
         if speed is None:
@@ -1351,7 +1481,21 @@ class Sprite:
         off = int(self.scroll)
         # Backdrop already includes sky, water, scenery and the grass/dirt band.
         # Scroll 1:1 with the mid-ground rings so the after still stays aligned.
-        if ocean is not None:
+        if self.ocean_rgb565 is not None and self._ocean_push:
+            ok = blit_ocean_window(
+                lcd,
+                self.ocean_rgb565,
+                self.ocean_tw,
+                self.ocean_th,
+                off,
+                self.ocean_window,
+                W,
+            )
+            if not ok:
+                self._ocean_push = False
+                if ocean is not None:
+                    blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
+        elif ocean is not None:
             blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
         ring_frames = pack.cycles.get("rings")
         if ring_frames:
@@ -1650,15 +1794,66 @@ def make_canvas(lcd):
     return lcd, False
 
 
+class ButtonWatch:
+    """Poll the face button on every call. Double-press starts the bench sweep.
+
+    M5.update() is done here so a mid-draw poll still sees a fresh click,
+    and wasClicked is always read in the same call that updates it.
+    """
+
+    def __init__(self, btn, on_double=None):
+        self.btn = btn
+        self.on_double = on_double
+        self.last_click_ms = -1000
+        self.pending_click = False
+
+    def poll(self, now=None):
+        if now is None:
+            now = time.ticks_ms()
+        M5.update()
+        btn = self.btn
+        if btn is None:
+            return False
+        tapped = False
+        if hasattr(btn, "wasDoubleClicked"):
+            try:
+                tapped = bool(btn.wasDoubleClicked())
+            except Exception:
+                tapped = False
+        if not tapped and hasattr(btn, "wasClicked"):
+            try:
+                clicked = bool(btn.wasClicked())
+            except Exception:
+                clicked = False
+            if clicked:
+                if self.pending_click and time.ticks_diff(now, self.last_click_ms) <= DBL_TAP_MS:
+                    tapped = True
+                    self.pending_click = False
+                else:
+                    self.pending_click = True
+                    self.last_click_ms = now
+        if self.pending_click and time.ticks_diff(now, self.last_click_ms) > DBL_TAP_MS:
+            self.pending_click = False
+        if tapped and self.on_double is not None:
+            self.on_double(now)
+        return tapped
+
+
 class Dashboard:
-    def __init__(self, lcd, pack=None):
+    def __init__(self, lcd, pack=None, button=None):
         self.lcd, self._use_push = make_canvas(lcd)
         self.sprite = Sprite(pack)
+        self.button = button
         self._last_fill = {g[0]: -1 for g in GAUGES}
         self._fault_shown = None
         self._last_ms = time.ticks_ms()
 
+    def _poll_button(self, now):
+        if self.button is not None:
+            self.button.poll(now)
+
     def tick(self, values, fault, now):
+        self._poll_button(now)
         dt = time.ticks_diff(now, self._last_ms)
         if dt < 0 or dt > 500:
             dt = REFRESH_MS
@@ -1668,7 +1863,9 @@ class Dashboard:
 
         lcd = self.lcd
         lcd.fillScreen(COL_BG)
+        self._poll_button(now)
         self.sprite.draw(lcd, values, now)
+        self._poll_button(now)
         self._draw_gauges(values)
         self._draw_fault(fault)
         if self._use_push:
@@ -1676,6 +1873,7 @@ class Dashboard:
                 lcd.push(0, 0)
             except Exception:
                 self._use_push = False
+        self._poll_button(now)
 
     def _draw_gauges(self, values):
         lcd = self.lcd
@@ -1745,9 +1943,9 @@ def main():
     M5.begin()
     lcd = Lcd
     pack = try_load_pixidx()
-    ui = Dashboard(lcd, pack)
     sweep = Sweep()
-    btn = find_btn()
+    button = ButtonWatch(find_btn(), sweep.start)
+    ui = Dashboard(lcd, pack, button=button)
     try:
         import ota_client
     except ImportError:
@@ -1757,8 +1955,6 @@ def main():
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
     last_rx_ms = 0
     last_draw_ms = 0
-    last_click_ms = -1000
-    pending_click = False
 
     bus = None
     try:
@@ -1767,33 +1963,9 @@ def main():
         bus = None
 
     while True:
-        M5.update()
         now = time.ticks_ms()
-
-        tapped = False
-        if btn is not None:
-            if hasattr(btn, "wasDoubleClicked"):
-                try:
-                    tapped = bool(btn.wasDoubleClicked())
-                except Exception:
-                    tapped = False
-            if not tapped and hasattr(btn, "wasClicked"):
-                try:
-                    clicked = bool(btn.wasClicked())
-                except Exception:
-                    clicked = False
-                if clicked:
-                    if pending_click and time.ticks_diff(now, last_click_ms) <= DBL_TAP_MS:
-                        tapped = True
-                        pending_click = False
-                    else:
-                        pending_click = True
-                        last_click_ms = now
-            if pending_click and time.ticks_diff(now, last_click_ms) > DBL_TAP_MS:
-                pending_click = False
-
-        if tapped:
-            sweep.start(now)
+        # Poll every iteration, not only when a frame has finished.
+        button.poll(now)
 
         if sweep.active:
             swept = sweep.step(now)
