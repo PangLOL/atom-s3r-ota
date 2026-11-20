@@ -1,11 +1,12 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
-V7: PIX6 pixel-index interpreter with art pre-scaled to the locked after/boost
-preview sizes (Sonic 39x36, playfield 128x103, rings 14x14). Sprites: engine-sheet
-Sonic cycles plus after-preview scenery / HUD / rings. Chao, official mouths, and
-boost FX rips are not packed. Aura / shockwave / barrier still use V2 primitives,
-layered on top of Sonic at tip (66, 72), alpha 178. FACE_ENABLED stays off.
-Companion asset pixidx.bin is fetched from the OTA host if missing.
+V8: same pre-scaled PIX6 art as V7 (Sonic 39x36, playfield 128x103, rings 14x14).
+Sprites: engine-sheet Sonic cycles plus after-preview scenery / HUD / rings.
+Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
+barrier still use V2 primitives, layered on top of Sonic at tip (66, 72),
+alpha 178. FACE_ENABLED stays off.
+Companion asset pixidx.bin is fetched from the OTA host if missing, stale, or
+the wrong size / geometry (a leftover V6 pack must not be used).
 
 Layout: animation in the top four-fifths. Bottom fifth is a 2-by-2
 grid of horizontal gauges, no labels. Upper left is RPM, upper right
@@ -66,8 +67,8 @@ REFRESH_MS = 50
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 7
-APP_VERSION_NAME = "2026.11.21-v7"
+APP_VERSION = 8
+APP_VERSION_NAME = "2026.11.21-v8"
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
@@ -367,7 +368,9 @@ def find_btn():
 
 PIXIDX_NAME = "pixidx.bin"
 PIXIDX_SHA256 = "6009435444f0016110ed1c5b620b686508de15a4db10e11c3f0a5b98a5fedca8"
+PIXIDX_SIZE = 107656
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
+PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
 
 SPEED_SLOW = 40.0
@@ -437,11 +440,33 @@ def _rgb565_to_888(c):
 
 
 def _sha256_hex(data):
+    """Best-effort sha256 hex. Returns None if the hash module is missing
+    or the digest API is too limited — callers must not treat that as a match.
+    """
+    h = None
     try:
         import hashlib
-        return hashlib.sha256(data).hexdigest()
+        h = hashlib.sha256(data)
     except Exception:
+        try:
+            import uhashlib
+            h = uhashlib.sha256(data)
+        except Exception:
+            h = None
+    if h is None:
         return None
+    try:
+        return h.hexdigest()
+    except Exception:
+        try:
+            digest = h.digest()
+        except Exception:
+            return None
+        try:
+            import ubinascii
+            return ubinascii.hexlify(digest).decode()
+        except Exception:
+            return "".join("%02x" % b for b in digest)
 
 
 class PixFrame:
@@ -604,6 +629,38 @@ def blit_tiled_x(lcd, pack, frame, y, scroll, pal, clip_t=0, clip_b=103):
         x += tw
 
 
+def _pixidx_geometry_ok(pack):
+    """V7/V8 art: 384x103 backdrop and 39x36 Sonic. A leftover V6 pack fails this."""
+    ocean = pack.by_name.get("ocean")
+    sonic = pack.by_name.get("run_fast_0")
+    if sonic is None:
+        sonic = pack.by_name.get("idle_0")
+    if ocean is None or ocean.w != 384 or ocean.h != 103:
+        return False
+    if sonic is None or sonic.w != 39 or sonic.h != 36:
+        return False
+    return True
+
+
+def _pixidx_is_current(data, pack=None):
+    """Accept only the published V7/V8 pixel-index file.
+
+    Hash is required to match when a sha256 API is available. If hashing is
+    unavailable, size plus frame geometry still reject a leftover V6 pack.
+    """
+    if not data or len(data) != PIXIDX_SIZE:
+        return False
+    got = _sha256_hex(data)
+    if got is not None and got != PIXIDX_SHA256:
+        return False
+    if pack is None:
+        try:
+            pack = PixIdx(data)
+        except Exception:
+            return False
+    return _pixidx_geometry_ok(pack)
+
+
 def _read_local_pixidx():
     try:
         with open(PIXIDX_NAME, "rb") as f:
@@ -620,11 +677,18 @@ def try_load_pixidx():
     if got is not None and got != PIXIDX_SHA256:
         print("pixidx.bin sha256 mismatch")
         return None
+    if len(data) != PIXIDX_SIZE:
+        print("pixidx.bin size mismatch")
+        return None
     try:
-        return PixIdx(data)
+        pack = PixIdx(data)
     except Exception as e:
         print("pixidx parse failed:", e)
         return None
+    if not _pixidx_is_current(data, pack):
+        print("pixidx.bin is not the current pack")
+        return None
+    return pack
 
 
 def try_fetch_pixidx():
@@ -633,6 +697,8 @@ def try_fetch_pixidx():
     Does not touch secrets.py. Relies on ota_client having joined the hotspot,
     or on whatever STA is already connected. Safe to call when the file is
     not yet published — the request fails and V2 primitives keep drawing.
+    A leftover local pack is never treated as success; only the current
+    sha256 / size / geometry is saved and used.
     """
     try:
         import ota_client
@@ -673,16 +739,23 @@ def try_fetch_pixidx():
     if got is not None and got != PIXIDX_SHA256:
         print("fetched pixidx.bin sha256 mismatch")
         return None
+    if len(data) != PIXIDX_SIZE:
+        print("fetched pixidx.bin size mismatch")
+        return None
     try:
         pack = PixIdx(data)
     except Exception as e:
         print("fetched pixidx parse failed:", e)
+        return None
+    if not _pixidx_is_current(data, pack):
+        print("fetched pixidx.bin is not the current pack")
         return None
     try:
         with open(PIXIDX_NAME, "wb") as f:
             f.write(data)
     except Exception as e:
         print("pixidx save failed:", e)
+        return None
     return pack
 
 
@@ -1679,7 +1752,7 @@ def main():
         import ota_client
     except ImportError:
         ota_client = None
-    _fetch_tried = False
+    _last_fetch_ms = -PIXIDX_FETCH_EVERY_MS
 
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
     last_rx_ms = 0
@@ -1739,8 +1812,9 @@ def main():
             except Exception:
                 pass
 
-        if ui.sprite.pack is None and not _fetch_tried:
-            # After ota_client has had a chance to join Wi-Fi, try the companion asset once.
+        if ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
+            # Keep retrying while the current pack is missing or was rejected
+            # (a leftover V6 file must not block the download).
             wifi_ok = False
             if ota_client is not None and hasattr(ota_client, "wifi_connected"):
                 try:
@@ -1748,7 +1822,7 @@ def main():
                 except Exception:
                     wifi_ok = False
             if wifi_ok or ota_client is None:
-                _fetch_tried = True
+                _last_fetch_ms = now
                 try:
                     fetched = try_fetch_pixidx()
                 except Exception:
