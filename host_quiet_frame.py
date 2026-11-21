@@ -122,19 +122,20 @@ def main():
             steps += 1
         counts.append(steps)
     assert counts == [1, 1, 2], counts
-    # The present path steps once and drops that leftover.
-    # 12 ms paint: sleep the leftover 21 ms, not another full quantum,
-    # and not a deadline that ignores the time already spent.
-    assert fw.pace_after(1000, 1012) == 1033
-    assert fw.pace_remain(1000, 1012) == fw.RING_FPS_MS - 12
-    assert fw.pace_remain(1000, 1012) != fw.RING_FPS_MS
-    assert fw.pace_remain(1000, 1012) != 0
-    # 27 ms sweep paint still has a few ms left. 40 ms and 50 ms slip.
-    assert fw.pace_remain(1000, 1027) == fw.RING_FPS_MS - 27
-    assert fw.pace_after(1000, 1040) is None
-    assert fw.pace_remain(1000, 1040) == 0
-    assert fw.pace_after(1000, 1050) is None
-    assert fw.pace_remain(1000, 1050) == 0
+    # Microseconds, not a 10 ms tick. A 12 ms paint counted as 10 ms
+    # would leave 23 ms, and sleep_ms would round that up to 30 ms.
+    q = fw.RING_FPS_MS * 1000
+    assert fw.pace_remain(0, 12000) == q - 12000
+    assert fw.pace_remain(0, 12000) == 21000
+    assert fw.pace_remain(0, 12000) != 30000
+    assert fw.pace_remain(0, 10000) == 23000
+    assert fw.pace_after(0, 12000) == 33000
+    # 27 ms still has leftover. 40 ms and 50 ms sleep 0.
+    assert fw.pace_remain(0, 27000) == q - 27000
+    assert fw.pace_after(0, 40000) is None
+    assert fw.pace_remain(0, 40000) == 0
+    assert fw.pace_after(0, 50000) is None
+    assert fw.pace_remain(0, 50000) == 0
     assert fw.live_can(None, 0, 1000) is False
     assert fw.live_can(object(), 0, 1000) is False
     assert fw.live_can(object(), 1000, 2500) is True

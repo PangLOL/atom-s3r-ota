@@ -1980,35 +1980,57 @@ def next_draw_deadline(now):
         return now + RING_FPS_MS
 
 
-def pace_after(started, finished, quantum=None):
-    """Deadline for the next present after work that began at started.
+def _pace_us():
+    """Ring quantum in microseconds. ticks_ms rounds this to the 10 ms tick."""
+    return RING_FPS_MS * 1000
 
-    The quantum includes the paint. The deadline is `finished + leftover`,
-    not `finished + quantum` and not `started + quantum` sampled before
-    the paint. If the paint already used the quantum, return None so the
-    loop draws again immediately instead of queueing a catch-up.
+
+def _ticks_add(now, delta):
+    try:
+        return time.ticks_add(now, delta)
+    except Exception:
+        return now + delta
+
+
+def pace_after(started, finished, quantum=None):
+    """Deadline, in the same ticks as started and finished.
+
+    Pass microsecond samples. The deadline is finished plus the leftover
+    microseconds, not a millisecond remainder that sleep_ms rounds up to
+    the next 10 ms tick. None means the paint already used the quantum.
     """
     if quantum is None:
-        quantum = RING_FPS_MS
-    spent = time.ticks_diff(finished, started)
+        quantum = _pace_us()
+    spent = _us_diff(finished, started)
     if spent < 0 or spent >= quantum:
         return None
-    remain = quantum - spent
-    try:
-        return time.ticks_add(finished, remain)
-    except Exception:
-        return finished + remain
+    return _ticks_add(finished, quantum - spent)
 
 
 def pace_remain(started, finished, quantum=None):
-    """Milliseconds to sleep after `finished`. 0 when the frame was late."""
+    """Microseconds to sleep after finished. 0 when the frame was late."""
     deadline = pace_after(started, finished, quantum)
     if deadline is None:
         return 0
-    remain = time.ticks_diff(deadline, finished)
+    remain = _us_diff(deadline, finished)
     if remain < 0:
         return 0
     return remain
+
+
+def _sleep_us(us):
+    """One sleep. A 10 ms RTOS tick makes sleep_ms round a short leftover up."""
+    if us <= 0:
+        return
+    try:
+        time.sleep_us(us)
+        return
+    except Exception:
+        pass
+    try:
+        time.sleep(us / 1000000.0)
+    except Exception:
+        pass
 
 
 def live_can(bus, last_rx_ms, now):
@@ -6018,24 +6040,17 @@ def main():
 
     while True:
         _feed_wdt()
-        now = time.ticks_ms()
-        if not draw_due(now, next_draw):
-            # One sleep for the whole remainder. A 1 ms loop pays a Python
-            # round-trip per millisecond and, on a 10 ms RTOS tick, turns
-            # an 18 ms leftover into about another full 33 ms.
-            remain = time.ticks_diff(next_draw, now)
+        if next_draw is not None:
+            # Sleep the microsecond leftover once. Do not come back and
+            # sleep_ms a remainder smaller than the 10 ms tick.
+            remain = _us_diff(next_draw, _mono_us())
             if remain > 0:
-                try:
-                    time.sleep_ms(remain)
-                except Exception:
-                    try:
-                        time.sleep(remain / 1000.0)
-                    except Exception:
-                        pass
-            continue
+                _feed_wdt()
+                _sleep_us(remain)
+        now = time.ticks_ms()
         if present_t0 is None:
             present_t0 = now
-        frame_started = now
+        frame_started = _mono_us()
         _report_presented(now)
         button.poll(now)
 
@@ -6097,11 +6112,7 @@ def main():
 
         _flow_add("loop", _us_diff(_mono_us(), loop_mark))
         ui.tick(values, fault, now)
-        try:
-            finished = time.ticks_ms()
-        except Exception:
-            finished = frame_started
-        next_draw = pace_after(frame_started, finished)
+        next_draw = pace_after(frame_started, _mono_us())
         loop_mark = _mono_us()
 
 
