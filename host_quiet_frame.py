@@ -96,7 +96,52 @@ def main():
     fw.stamp_disk565(clean, vw, vh, fw.DOT_X, fw.DOT_Y, fw.DOT_R, fw.COL_ERR)
     restored = bytearray(sky)
     assert restored == sky
-    print("quiet frame ok", "rpm fill", fill0, "dot", hex(want))
+    assert fw.anim_dt(40) == 40
+    assert fw.anim_dt(50) == 50
+    assert fw.anim_dt(134) == fw.REFRESH_MS
+    assert fw.anim_dt(600) == fw.REFRESH_MS
+    assert fw.anim_dt(-1) == fw.REFRESH_MS
+    cruise = 80.0
+    stalled = cruise * 134 * 0.012
+    stepped = cruise * fw.anim_dt(134) * 0.012
+    assert stepped == cruise * fw.REFRESH_MS * 0.012
+    assert stepped < stalled
+
+    assert fw.collect_due(False, 2000000, 2000) is True
+    assert fw.collect_due(False, 2000000, 500) is False
+    assert fw.collect_due(True, 2000000, 20000) is False
+    assert fw.collect_due(True, 40 * 1024, 2000) is False
+    assert fw.collect_due(True, 40 * 1024, fw.GC_MOVE_MIN_MS) is True
+    assert fw.collect_due(True, fw.GC_CRITICAL_FREE - 1, 0) is True
+    assert fw.collect_due(True, -1, 20000) is False
+    assert fw.collect_due(False, -1, 2000) is True
+
+    import gc
+    calls = {"n": 0}
+    saved_collect = gc.collect
+    saved_free = getattr(gc, "mem_free", None)
+    gc.collect = lambda: calls.__setitem__("n", calls["n"] + 1)
+    gc.mem_free = lambda: 2000000
+    try:
+        sprite = fw.Sprite(None)
+        sprite._tim_n = 4
+        sprite._tim_t0 = 1000
+        sprite._tim_gc_at = 0
+        sprite.report_timing(3500, 80.0)
+        assert calls["n"] == 0, calls
+        sprite._tim_n = 4
+        sprite._tim_t0 = 1000
+        sprite._tim_gc_at = 0
+        sprite.report_timing(3500, 0.0)
+        assert calls["n"] == 1, calls
+    finally:
+        gc.collect = saved_collect
+        if saved_free is None:
+            del gc.mem_free
+        else:
+            gc.mem_free = saved_free
+
+    print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped)
 
 
 if __name__ == "__main__":

@@ -94,10 +94,16 @@ CLT_MIN, CLT_MAX = -40, 125
 
 WATCHDOG_MS = 2000
 REFRESH_MS = 50
-# REFRESH_MS stays the stall cap (dt > 500 ms) and the old 20 fps budget.
-# The loop does not wait out that budget. 16 ms is a 60 fps ceiling so a
-# native frame can run at 30-60 fps. It is not a 12-15 fps motion cap.
+# One motion step. A gap longer than this used to fast-forward the scroll
+# (the old clamp was 500 ms, so a 134 ms collect still jumped). The loop
+# does not wait out REFRESH_MS. 16 ms is a 60 fps ceiling so a native
+# frame can run at 30-60 fps. It is not a 12-15 fps motion cap.
 FRAME_MIN_MS = 16
+# Full gc.collect while moving was the two-second hitch. Collect when
+# stopped, or while moving only if the heap is actually low.
+GC_LOW_FREE = 64 * 1024
+GC_CRITICAL_FREE = 24 * 1024
+GC_MOVE_MIN_MS = 15000
 # A full 128x103 RGB565 push is about 26 KB. 800 ms is well past a slow
 # SPI transfer and still shorter than the 30 s watchdog. The driver call
 # itself has no timeout; this bound is the one the handoff waits on.
@@ -1944,6 +1950,38 @@ def _us_diff(later, earlier):
     return later - earlier
 
 
+def anim_dt(dt):
+    """Milliseconds of scroll, boost, and cycle to apply for one frame.
+
+    A stall longer than REFRESH_MS does not catch up. The picture holds,
+    then motion continues from the same speed instead of jumping ahead.
+    """
+    if dt < 0 or dt > REFRESH_MS:
+        return REFRESH_MS
+    return dt
+
+
+def collect_due(moving, free, since_ms):
+    """Whether this window should run gc.collect.
+
+    moving: speed >= 1, the same cutoff advance() uses for idle.
+    free: gc.mem_free(), or -1 if it could not be read.
+    since_ms: time since the last collect. A large value if none yet.
+    Stopped scenery collects on the two-second cadence. A drive skips
+    that collect unless the heap is low, and a merely-low heap waits
+    GC_MOVE_MIN_MS so the hitch stays rare. Critical free collects now.
+    """
+    if free >= 0 and free < GC_CRITICAL_FREE:
+        return True
+    if since_ms < 2000:
+        return False
+    if not moving:
+        return True
+    if free >= 0 and free < GC_LOW_FREE and since_ms >= GC_MOVE_MIN_MS:
+        return True
+    return False
+
+
 def _ms_diff(later, earlier):
     fn = getattr(time, "ticks_diff", None)
     if fn is not None:
@@ -3449,6 +3487,7 @@ class Sprite:
         self._tim_full = 0
         self._tim_t0 = 0
         self._tim_gc_at = 0
+        self._gc_pending = 0
         self._fx_in_buffer = False
         self._corner_pushed = False
         self._dot_on_play = False
@@ -4848,14 +4887,28 @@ class Sprite:
         except Exception:
             return 0
 
-    def report_timing(self, now):
+    def _collect_since(self, now):
+        if self._tim_gc_at == 0:
+            return GC_MOVE_MIN_MS
+        since = _ms_diff(now, self._tim_gc_at)
+        if since < 0:
+            return 0
+        return since
+
+    def _collect_due(self, speed, now):
+        if speed is None:
+            speed = 0.0
+        return collect_due(speed >= 1.0, _mem_free(), self._collect_since(now))
+
+    def report_timing(self, now, speed=0.0):
         """One serial line per 2 seconds. Does not rebuild caches.
 
         The V14 fields stay in front so old logs still compare. hud, sonic,
         and rings are the stamp split (they sit inside stamp, along with
         the playfield shift and the backdrop copies). shift and full count
         backdrop updates. A USB CDC that has not drained the previous line
-        skips the print; the counters stay, and gc still runs on this cadence.
+        skips the print; the counters stay. gc is the collect in this
+        window, or 0 when the scenery is moving and the heap is not low.
         """
         n = self._tim_n
         if n <= 0 or self._tim_t0 == 0:
@@ -4863,15 +4916,18 @@ class Sprite:
         elapsed = _ms_diff(now, self._tim_t0)
         if elapsed < 2000:
             return
+        gc_us = 0
+        if self._collect_due(speed, now):
+            gc_us = self._timing_gc()
+            self._tim_gc_at = now
+            self._gc_pending = gc_us
+            _service()
         if not _stdout_can_write():
-            if self._tim_gc_at == 0 or _ms_diff(now, self._tim_gc_at) >= 2000:
-                self._timing_gc()
-                self._tim_gc_at = now
-                _service()
             return
-        gc_us = self._timing_gc()
-        self._tim_gc_at = now
         _service()
+        if gc_us == 0:
+            gc_us = self._gc_pending
+        self._gc_pending = 0
         total_us = self._tim_compose + self._tim_stamp + self._tim_push
         fps_tenths = 0
         if elapsed > 0:
@@ -5686,9 +5742,7 @@ class Dashboard:
 
     def tick(self, values, fault, now):
         self._poll_button(now)
-        dt = time.ticks_diff(now, self._last_ms)
-        if dt < 0 or dt > 500:
-            dt = REFRESH_MS
+        dt = anim_dt(time.ticks_diff(now, self._last_ms))
         self._last_ms = now
         speed = values.get("spd") or 0.0
         t_adv = _mono_us()
@@ -5742,7 +5796,7 @@ class Dashboard:
         if self.sprite._tim_n != noted:
             self.sprite.note_chrome(fill_us, flush_us)
         self._poll_button(now)
-        self.sprite.report_timing(now)
+        self.sprite.report_timing(now, speed)
 
     def _draw_gauges(self, values):
         """Update the four bars in place.
