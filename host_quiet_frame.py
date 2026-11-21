@@ -122,6 +122,48 @@ def main():
             steps += 1
         counts.append(steps)
     assert counts == [1, 1, 2], counts
+    # The present path steps once and drops that leftover.
+    assert fw.pace_after(1000, 1012) == 1033
+    assert fw.pace_after(1000, 1050) is None
+    assert fw.live_can(None, 0, 1000) is False
+    assert fw.live_can(object(), 0, 1000) is False
+    assert fw.live_can(object(), 1000, 2500) is True
+    assert fw.live_can(object(), 1000, 1000 + fw.WATCHDOG_MS + 1) is False
+    start, armed, idle = fw.auto_sweep_due(5000, 0, False, False, True, None)
+    assert start is False and armed is True
+    start, armed, idle = fw.auto_sweep_due(10000, 0, False, False, True, None)
+    assert start is True and armed is False and idle is None
+    start, armed, idle = fw.auto_sweep_due(12000, 0, True, False, True, None)
+    assert start is False and armed is False and idle is None
+    start, armed, idle = fw.auto_sweep_due(10000, 0, False, True, True, None)
+    assert start is False and armed is True
+    start, armed, idle = fw.auto_sweep_due(5000, 0, False, False, False, 1000)
+    assert start is False and idle == 1000
+    start, armed, idle = fw.auto_sweep_due(21000, 0, False, False, False, 1000)
+    assert start is True and armed is False
+
+    class _Fr(object):
+        duration_ms = 33
+
+    sprite = fw.Sprite(None)
+    sprite.pack = type("Pack", (), {})()
+    sprite.pack.cycles = {
+        "idle": [_Fr(), _Fr(), _Fr()],
+        "run_fast": [_Fr(), _Fr()],
+    }
+    sprite.anim_tag = "idle"
+    sprite.anim_i = 0
+    sprite.ring_i = 0
+    sprite.idle_wait = 0
+    sprite.triggering = False
+    sprite._step_anim(0.0, 45)
+    assert sprite.anim_i == 1 and sprite.ring_i == 1
+    sprite._step_anim(0.0, 90)
+    assert sprite.anim_i == 2 and sprite.ring_i == 2
+    sprite._step_anim(120.0, 80)
+    assert sprite.anim_tag == "run_fast" and sprite.anim_i == 0
+    sprite._step_anim(120.0, 80)
+    assert sprite.anim_i == 1 and sprite.ring_i == 4
     assert fw.anim_dt(40) == 40
     assert fw.anim_dt(50) == 50
     assert fw.anim_dt(134) == fw.REFRESH_MS

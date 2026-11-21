@@ -1980,6 +1980,62 @@ def next_draw_deadline(now):
         return now + RING_FPS_MS
 
 
+def pace_after(started, finished, quantum=None):
+    """Deadline for the next present after work that began at started.
+
+    The quantum includes the paint. If the paint already used it, return
+    None so the loop draws again immediately instead of queueing a catch-up.
+    """
+    if quantum is None:
+        quantum = RING_FPS_MS
+    spent = time.ticks_diff(finished, started)
+    if spent < 0 or spent >= quantum:
+        return None
+    remain = quantum - spent
+    try:
+        return time.ticks_add(finished, remain)
+    except Exception:
+        return finished + remain
+
+
+def live_can(bus, last_rx_ms, now):
+    """True when a CAN frame has arrived inside the fault watchdog."""
+    if bus is None or not last_rx_ms:
+        return False
+    gap = time.ticks_diff(now, last_rx_ms)
+    if gap < 0:
+        return False
+    return gap <= WATCHDOG_MS
+
+
+# Off-vehicle only. 10 s after the first present, then 20 s after each
+# sweep returns to rest. Never while a sweep is running or CAN is live.
+AUTO_SWEEP_BOOT_MS = 10000
+AUTO_SWEEP_IDLE_MS = 20000
+
+
+def auto_sweep_due(now, present_t0, active, can_live, boot_armed, idle_since):
+    """Return (start, boot_armed, idle_since).
+
+    present_t0 is the first present, not boot. active suppresses a start.
+    can_live suppresses every auto start. boot_armed is the first wait.
+    After any sweep, idle_since counts 20 s of rest.
+    """
+    if active:
+        return False, False, None
+    if present_t0 is None or can_live:
+        return False, boot_armed, idle_since
+    if boot_armed:
+        if time.ticks_diff(now, present_t0) >= AUTO_SWEEP_BOOT_MS:
+            return True, False, None
+        return False, True, idle_since
+    if idle_since is None:
+        idle_since = now
+    if time.ticks_diff(now, idle_since) >= AUTO_SWEEP_IDLE_MS:
+        return True, False, None
+    return False, False, idle_since
+
+
 def anim_dt(dt):
     """Milliseconds of scroll, boost, and cycle to apply for one frame.
 
@@ -3799,21 +3855,17 @@ class Sprite:
                 tag = "run_medium"
             else:
                 tag = "run_fast"
+        frames = self._cycle_frames(tag)
+        if not frames:
+            return
         if tag != self.anim_tag:
+            # Show the first frame of the new cycle for this present.
             self.anim_tag = tag
             self.anim_i = 0
             self.anim_accum = 0
-        frames = self._cycle_frames(self.anim_tag)
-        if not frames:
-            return
-        if self.anim_i >= len(frames):
-            self.anim_i = 0
-        dur = frames[self.anim_i].duration_ms
-        if dur <= 0:
-            dur = RING_FPS_MS
-        self.anim_accum += dt_ms
-        while self.anim_accum >= dur:
-            self.anim_accum -= dur
+        else:
+            # One Sonic frame per present. A late paint must not spend
+            # leftover dt on a second step.
             self.anim_i += 1
             if self.anim_i >= len(frames):
                 self.anim_i = 0
@@ -3821,18 +3873,7 @@ class Sprite:
                     self.triggering = False
                     self.anim_tag = "idle"
                     self.idle_wait = 0
-                    break
-            frames = self._cycle_frames(self.anim_tag)
-            if not frames:
-                break
-            dur = frames[self.anim_i].duration_ms
-            if dur <= 0:
-                dur = RING_FPS_MS
-        # Spin the mid-ground rings at 30 fps regardless of Sonic's cycle.
-        self.ring_accum += dt_ms
-        while self.ring_accum >= RING_FPS_MS:
-            self.ring_accum -= RING_FPS_MS
-            self.ring_i = (self.ring_i + 1) & 7
+        self.ring_i = (self.ring_i + 1) & 7
 
     def _step_sparkles(self, dt_ms):
         if not self.sparkles:
@@ -5951,6 +5992,9 @@ def main():
     last_rx_ms = 0
     next_draw = None
     last_ota_ms = 0
+    present_t0 = None
+    boot_sweep_armed = True
+    sweep_idle_since = None
     loop_mark = _mono_us()
 
     bus = None
@@ -5971,6 +6015,9 @@ def main():
                 except Exception:
                     pass
             continue
+        if present_t0 is None:
+            present_t0 = now
+        frame_started = now
         _report_presented(now)
         button.poll(now)
 
@@ -5984,6 +6031,22 @@ def main():
                 if pull_frames(bus, values):
                     last_rx_ms = now
             fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
+
+        start_auto, boot_sweep_armed, sweep_idle_since = auto_sweep_due(
+            now,
+            present_t0,
+            sweep.active,
+            live_can(bus, last_rx_ms, now),
+            boot_sweep_armed,
+            sweep_idle_since,
+        )
+        if start_auto:
+            sweep.start(now)
+            swept = sweep.step(now)
+            if swept is not None:
+                values.update(swept)
+            fault = False
+            print("auto-sweep")
 
         if ota_client is not None and (
             last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
@@ -6016,7 +6079,11 @@ def main():
 
         _flow_add("loop", _us_diff(_mono_us(), loop_mark))
         ui.tick(values, fault, now)
-        next_draw = next_draw_deadline(now)
+        try:
+            finished = time.ticks_ms()
+        except Exception:
+            finished = frame_started
+        next_draw = pace_after(frame_started, finished)
         loop_mark = _mono_us()
 
 

@@ -96,10 +96,15 @@ split the stamp. If the USB CDC has not drained, the print is skipped
 and those counters stay. `gc` is the collect in that window. The two-second collect does not
 run at idle or while moving unless the heap is under 64 KB, so `gc`
 stays 0.0 on the bench and on a drive when memory is healthy. Presents
-are paced to the 33 ms ring step, so a frame does not land early and
-the rings advance one step per paint. `ota_client.poll` runs about
-once a second; the client still owns the 90 s fetch. A frame gap
-longer than 50 ms does not fast-forward the scroll. While native
+aim for the 33 ms ring step, and the wait is only the time left after
+the paint. A late frame slips that deadline instead of queueing
+another present. Rings and Sonic advance one frame per present;
+leftover time is not spent on a second step. Scroll still uses the
+measured gap, capped at 50 ms. Off-vehicle, with no live CAN, the bench
+sweep starts 10 s after the first present and again after 20 s of rest
+(`auto-sweep` on the serial line). A face-button press still starts it.
+`ota_client.poll` runs about once a second; the client still owns the
+90 s fetch. While native
 rendering is on, `shift` stays 0: a frame that
 changed is rebuilt in C rather than band-shifted. `full` counts those
 rebuilds. `hold` counts frames whose scroll offsets, sprites, boost
