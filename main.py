@@ -1,30 +1,37 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
-V14: the V12 packed ocean and scenery, drawn so a moving world does not
-rebuild every stamp in Python. Same pre-scaled PIX6 art (Sonic 39x36,
+V15: the V14 packed picture, composited so a scroll does not restamp
+sprites that did not change. Same pre-scaled PIX6 art (Sonic 39x36,
 playfield 128x103, rings 14x14). pixidx.bin is unchanged. At pack load the
 384x103 ocean tile is pre-rendered into an RGB565 buffer and split into
 parallax layers: sky/clouds at 0.25, water and islands at 0.6, ground and
 near palms at 1.0. The packed art has no mountain band, so 0.4 is unused.
 Scenery stamps (loop island, palms, bushes) blit through the same kind of
 viper loop Sonic and the HUD already use. A viper self-test failure stays
-on the V12 Python blit, so the pixels do not change.
-When a band's scroll offset moves by less than a screen, the 128-wide
-window is shifted and only the new columns are copied, then stamps that
-overlap that strip (or that did not move with the band) are restamped.
-The result matches a full compose at the same scroll. Unchanged offsets
-still skip the compose. Sprite frames that did not change stay where they
-are; the underlay restores the backdrop under a sprite that did.
+on the V12 Python blit, so the pixels do not change. That self-test runs
+while the caches are built, not inside the first timed frame.
+The ocean window stays clean: no sprites. When a band's scroll offset
+moves by less than a screen, that window is shifted and only the new
+columns plus scenery that did not ride along are patched. A second
+128-wide playfield is what gets pushed. It is shifted the same way, then
+only sprites whose pixels are no longer correct are copied back from the
+clean backdrop and stamped. The HUD bar and ring icon stay while the sky
+under them is still. Sonic is restamped when his frame, his tint, or the
+backdrop under him changes. Rings and sparkles update in their own rects.
+Unchanged offsets still skip the backdrop. The pixels match a full
+compose plus the same stamps.
 Each frame still pushes one 128x103 playfield image. When that push lands,
 the full-screen clear and the second canvas flush are skipped: gauges
-repaint y 103-127 themselves. The every-two-seconds line keeps the V12
-fields and adds fill and flush. total stays compose+stamp+push so it
-compares with V12; fill and flush are the previously untimed panel work.
-The face button (BtnA / Btn / BtnPWR only) is polled through compose,
-blits, flushes, and OTA checks. The OTA client stays, on its existing
-schedule; its HTTP fetch cannot block forever. A machine.WDT is armed
-after the first heavy alloc, fed from the loop, and not used as a routine
-reboot. This file is version 14. It is not the published Pages payload.
+repaint y 103-127 themselves. The every-two-seconds line keeps the V14
+fields and adds hud, sonic, rings, shift, and full. total stays
+compose+stamp+push so it compares with V12 and V14. If the USB CDC cannot
+take the line, the print is skipped and the counters stay, so a host that
+is not reading cannot stall the loop. The face button (BtnA / Btn /
+BtnPWR only) is polled through compose, blits, flushes, and OTA checks.
+The OTA client stays, on its existing schedule; its HTTP fetch cannot
+block forever. A machine.WDT is armed after the first heavy alloc, fed
+from the loop, and not used as a routine reboot. This file is version 15.
+It is not the published Pages payload.
 Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
 barrier still use V2 primitives, layered on top of Sonic at tip (66, 72),
 alpha 178. FACE_ENABLED stays off.
@@ -90,8 +97,8 @@ REFRESH_MS = 50
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 14
-APP_VERSION_NAME = "2026.11.21-v14"
+APP_VERSION = 15
+APP_VERSION_NAME = "2026.11.21-v15"
 # Long enough that a main.py / pixidx write is not reset, short enough that
 # a stuck idle loop comes back without a power cycle. Not a routine reboot.
 WDT_TIMEOUT_MS = 30000
@@ -1077,6 +1084,48 @@ _ROW_SCRATCH = bytearray(W * 2)
 _SCENERY_KIND = None
 _blit_stamp_viper = None
 _blit_stamp_clip_viper = None
+# 0 unknown, 1 poll has reported writable, 2 this port has no poll.
+_STDOUT_POLL = 0
+
+
+def _stdout_can_write():
+    """True when a short print should not block on a full USB CDC buffer.
+
+    MicroPython's stream poll is ioctl(3, 4): MP_STREAM_POLL / POLL_WR.
+    A missing ioctl keeps the V14 print. A zero result is trusted only
+    after one poll has come back writable, so a port that always returns
+    0 still prints. Counters stay put when this returns False.
+    """
+    global _STDOUT_POLL
+    if _STDOUT_POLL == 2:
+        return True
+    try:
+        import sys
+        out = sys.stdout
+        ioctl = getattr(out, "ioctl", None)
+        if ioctl is None:
+            buf = getattr(out, "buffer", None)
+            ioctl = getattr(buf, "ioctl", None) if buf is not None else None
+        if ioctl is None:
+            _STDOUT_POLL = 2
+            return True
+        got = ioctl(3, 4)
+    except Exception:
+        _STDOUT_POLL = 2
+        return True
+    ready = False
+    try:
+        if got is not None and (int(got) & 4) != 0:
+            ready = True
+    except Exception:
+        _STDOUT_POLL = 2
+        return True
+    if ready:
+        _STDOUT_POLL = 1
+        return True
+    if _STDOUT_POLL == 1:
+        return False
+    return True
 
 
 def _service():
@@ -2673,6 +2722,9 @@ class Sprite:
         self.ocean_tw = 0
         self.ocean_th = 0
         self.ocean_window = None
+        # Clean backdrop lives in ocean_window. Sprites are stamped only
+        # into play_window, which is the buffer that gets pushed.
+        self.play_window = None
         self.ocean_stamps = []
         self._parallax = False
         self._ocean_push = True
@@ -2707,6 +2759,14 @@ class Sprite:
         self._stamp_new = []
         self._flat_off = -1
         self._pf_valid = False
+        self._play_valid = False
+        self._placed = []
+        self._planned = []
+        self._bd_mode = 0
+        self._bd_clips = []
+        self._part_hud = 0
+        self._part_sonic = 0
+        self._part_rings = 0
         self._tim_n = 0
         self._tim_compose = 0
         self._tim_stamp = 0
@@ -2714,7 +2774,13 @@ class Sprite:
         self._tim_fill = 0
         self._tim_flush = 0
         self._tim_hold = 0
+        self._tim_hud = 0
+        self._tim_sonic = 0
+        self._tim_rings = 0
+        self._tim_shift = 0
+        self._tim_full = 0
         self._tim_t0 = 0
+        self._tim_gc_at = 0
         self._sync_ground()
 
     def _sync_ground(self):
@@ -2725,6 +2791,7 @@ class Sprite:
             self.ground_y = self._surface
             self.ocean_rgb565 = None
             self.ocean_window = None
+            self.play_window = None
             self.ocean_stamps = []
             self._parallax = False
             self._ocean_push = True
@@ -2748,10 +2815,13 @@ class Sprite:
         ):
             return
         self._pf_valid = False
+        self._play_valid = False
         self._sprites_on = False
         self._sig_ok = False
+        del self._placed[:]
         self.ocean_rgb565 = None
         self.ocean_window = None
+        self.play_window = None
         self.ocean_stamps = []
         self._parallax = False
         self.ocean_tw = 0
@@ -2796,8 +2866,26 @@ class Sprite:
         self.ocean_window = window
         self.ocean_stamps = stamps
         self._parallax = parallax
+        play = None
+        try:
+            play = bytearray(len(window))
+        except MemoryError:
+            print("playfield alloc failed")
+        self.play_window = play
+        self._play_valid = False
+        del self._placed[:]
         self._bind_parallax_state()
-        print("ocean rgb565", len(buf), "window", len(window))
+        # Viper self-tests belong to cache prepare. The first timed frame
+        # must not pay for them inside compose or stamp.
+        try:
+            _ensure_scenery()
+        except Exception as e:
+            print("scenery check failed:", e)
+        try:
+            _ensure_stamp()
+        except Exception as e:
+            print("stamp check failed:", e)
+        print("ocean rgb565", len(buf), "window", len(window), "play", 0 if play is None else len(play))
 
     def _bind_parallax_state(self):
         """Offset trackers for the retained window. Not a per-frame rebuild."""
@@ -2812,6 +2900,10 @@ class Sprite:
         self._stamp_new = [0] * n
         self._flat_off = -1
         self._pf_valid = False
+        self._play_valid = False
+        del self._placed[:]
+        del self._bd_clips[:]
+        self._bd_mode = 0
         self._sprites_on = False
         self._sig_ok = False
 
@@ -2829,6 +2921,8 @@ class Sprite:
         self._sig_ok = False
         self._retain = False
         self._pf_valid = False
+        self._play_valid = False
+        del self._placed[:]
 
     def _prepare_sprites(self, force=False):
         """Bake Sonic, HUD, and field rings once per pack load. Not per frame."""
@@ -2863,6 +2957,13 @@ class Sprite:
         self._sprite_bake = True
         kind = _ensure_stamp()
         print("sprite cache", len(arena), "frames", len(info), kind)
+        if self.play_window is not None:
+            # Clean backdrop + playfield replaces the underlay save/restore.
+            self._under_buf = None
+            self._under_used = 0
+            del self._under_spans[:]
+            self._retain = True
+            return
         self._alloc_underlay(pack)
 
     def _alloc_underlay(self, pack):
@@ -3111,13 +3212,16 @@ class Sprite:
             blit_frame(lcd, pack, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, pal_c, 0, GAUGE_Y, True)
 
     def _can_retain(self):
-        return (
+        if not (
             self._retain
-            and self._under_buf is not None
             and self._sprite_bake
             and self.ocean_rgb565 is not None
             and self.ocean_window is not None
-        )
+        ):
+            return False
+        if self.play_window is not None:
+            return True
+        return self._under_buf is not None
 
     def _disable_retain(self):
         """Stay on the full V11 compose. The picture does not change."""
@@ -3414,11 +3518,20 @@ class Sprite:
             if (i & 3) == 0:
                 _service()
 
+    def _clear_band_motion(self):
+        """Backdrop did not move. Sprite repair must not reuse an old delta."""
+        self._band_mode[0] = 0
+        self._band_mode[1] = 0
+        self._band_mode[2] = 0
+        self._band_delta[0] = 0
+        self._band_delta[1] = 0
+        self._band_delta[2] = 0
+
     def _update_flat(self, scroll):
         off = _norm_off(scroll, self.ocean_tw)
         if self._pf_valid and off == self._flat_off:
             return False
-        if self._pf_valid and self._sprites_on:
+        if self.play_window is None and self._pf_valid and self._sprites_on:
             self._restore_underlays()
         copy_ocean_window(
             self.ocean_rgb565,
@@ -3436,38 +3549,58 @@ class Sprite:
         return True
 
     def _update_backdrop(self, scroll):
-        """Bring ocean_window back to a clean V11 backdrop for this scroll.
+        """Bring ocean_window back to a clean backdrop for this scroll.
 
-        Returns True when any band or scenery stamp was rewritten.
+        Sprites are not stored here when play_window exists, so a shift
+        does not restore underlays first. Returns True when any band or
+        scenery stamp was rewritten. _bd_mode is 0 (held), 1 (shifted),
+        or 2 (full compose). _bd_clips are the screen rects patched after
+        a shift; a full compose leaves that list empty.
         """
+        self._bd_mode = 0
+        del self._bd_clips[:]
         if not self._parallax:
-            return self._update_flat(scroll)
+            changed = self._update_flat(scroll)
+            if changed:
+                self._bd_mode = 2
+            else:
+                self._clear_band_motion()
+            return changed
         self._load_new_offs(scroll)
         if self._pf_valid and self._offs_unchanged():
+            self._clear_band_motion()
             return False
-        if self._pf_valid and self._sprites_on:
+        if self.play_window is None and self._pf_valid and self._sprites_on:
             self._restore_underlays()
         if not self._pf_valid:
             self._compose_full(scroll)
+            self._bd_mode = 2
             return True
         _service()
         self._apply_band_scroll()
         clips = self._collect_dirty_clips()
         if not clips:
             self._commit_offs()
-            self._sprites_on = False
-            self._under_used = 0
-            del self._under_spans[:]
+            if self.play_window is None:
+                self._sprites_on = False
+                self._under_used = 0
+                del self._under_spans[:]
+            self._bd_mode = 1
             return True
         if self._clips_cover_all(clips):
             self._compose_full(scroll)
+            self._bd_mode = 2
             return True
         self._patch_dirty(clips, scroll)
         self._commit_offs()
         self._pf_valid = True
-        self._sprites_on = False
-        self._under_used = 0
-        del self._under_spans[:]
+        if self.play_window is None:
+            self._sprites_on = False
+            self._under_used = 0
+            del self._under_spans[:]
+        self._bd_mode = 1
+        for clip in clips:
+            self._bd_clips.append(clip)
         return True
 
     def _sprite_unchanged(self, amount):
@@ -3594,9 +3727,317 @@ class Sprite:
             self._save_underlay(x0, y0, fr.w, fr.h, vw, vh)
         stamp_baked(window, vw, vh, rgb, mask, fr.w, fr.h, x0, y0)
 
-    def _stamp_playfield_sprites(self, amount, save_under=False):
+    def _plan_places(self, amount):
+        """Screen rects in stamp order. Top-left is after the frame origin.
+
+        Order matches _stamp_playfield_sprites: rings, sparkles, Sonic,
+        HUD bar, HUD ring. extra is the tint for Sonic and 0 otherwise.
+        """
+        out = self._planned
+        del out[:]
         pack = self.pack
-        window = self.ocean_window
+        if pack is None:
+            return out
+        off = int(self.scroll)
+        ring_frames = pack.cycles.get("rings")
+        if ring_frames:
+            fr = ring_frames[self.ring_i % len(ring_frames)]
+            period = RING_PERIOD
+            idx = 0
+            for wx in FIELD_RING_X:
+                x = (wx - off) % period
+                if x > W + 40:
+                    x -= period
+                if -40 < x < W + 40:
+                    x0 = int(x - fr.origin_x)
+                    y0 = int(FIELD_RING_Y - fr.origin_y)
+                    out.append(("r%d" % idx, x0, y0, fr.w, fr.h, fr, 0, "rings"))
+                idx += 1
+        spark_frames = pack.cycles.get("rings_sparkle")
+        if spark_frames:
+            si = 0
+            for item in self.sparkles:
+                x, y, i, _acc = item
+                if i < len(spark_frames):
+                    fr = spark_frames[i]
+                    x0 = int(int(x) - fr.origin_x)
+                    y0 = int(int(y) - fr.origin_y)
+                    out.append(("k%d" % si, x0, y0, fr.w, fr.h, fr, 0, "rings"))
+                si += 1
+        frames = self._cycle_frames(self.anim_tag)
+        if frames:
+            fr = frames[self.anim_i % len(frames)]
+            x0 = int(SONIC_FEET_DEST_X - fr.origin_x)
+            y0 = int(SONIC_FEET_DEST_Y - fr.origin_y)
+            out.append(("sonic", x0, y0, fr.w, fr.h, fr, amount, "sonic"))
+        bar = pack.by_name.get("hud_bar")
+        if bar is not None:
+            out.append((
+                "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
+            ))
+        ring = pack.by_name.get("hud_ring")
+        if ring is not None:
+            out.append((
+                "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
+            ))
+        return out
+
+    def _places_same(self, places):
+        old = self._placed
+        n = len(places)
+        if len(old) != n:
+            return False
+        i = 0
+        while i < n:
+            a = old[i]
+            b = places[i]
+            if (
+                a[0] != b[0]
+                or a[1] != b[1]
+                or a[2] != b[2]
+                or a[3] != b[3]
+                or a[4] != b[4]
+                or a[5].name != b[5].name
+                or a[6] != b[6]
+            ):
+                return False
+            i += 1
+        return True
+
+    def _hits(self, rect, rects):
+        for other in rects:
+            if _rect_intersect(rect, other) is not None:
+                return True
+        return False
+
+    def _place_carried(self, old, new, clips):
+        """True when the band shift already left this sprite on its new pixels."""
+        if old[3] != new[3] or old[4] != new[4]:
+            return False
+        if old[5].name != new[5].name or old[6] != new[6]:
+            return False
+        if old[2] != new[2]:
+            return False
+        d = old[1] - new[1]
+        y0 = new[2]
+        y1 = y0 + new[4]
+        if y1 <= y0:
+            return False
+        saw = False
+        for by0, by1, idx in self._band_spans():
+            if y1 <= by0 or y0 >= by1:
+                continue
+            saw = True
+            if d == 0:
+                if self._band_mode[idx] != 0:
+                    return False
+            elif self._band_mode[idx] != 1 or self._band_delta[idx] != d:
+                return False
+        if not saw:
+            return False
+        if self._hits((new[1], new[2], new[3], new[4]), clips):
+            return False
+        return True
+
+    def _post_shift_rects(self, place):
+        """Where this sprite's pixels sit after the playfield band shift."""
+        x = place[1]
+        y = place[2]
+        w = place[3]
+        h = place[4]
+        vh = self.ocean_th
+        found = []
+        y_end = y + h
+        for by0, by1, idx in self._band_spans():
+            iy0 = y if y > by0 else by0
+            iy1 = y_end if y_end < by1 else by1
+            if iy0 < 0:
+                iy0 = 0
+            if iy1 > vh:
+                iy1 = vh
+            if iy1 <= iy0 or w <= 0:
+                continue
+            d = self._band_delta[idx] if self._band_mode[idx] == 1 else 0
+            found.append((x - d, iy0, w, iy1 - iy0))
+        return found
+
+    def _copy_rect(self, src, dst, rect):
+        box = _clip_box(rect[0], rect[1], rect[2], rect[3], W, self.ocean_th)
+        if box is None:
+            return
+        x, y, w, h = box
+        if w <= 0 or h <= 0:
+            return
+        vw = W
+        nbytes = w * 2
+        row = 0
+        while row < h:
+            o = ((y + row) * vw + x) * 2
+            dst[o:o + nbytes] = src[o:o + nbytes]
+            row += 1
+            if (row & 7) == 0:
+                _service()
+
+    def _copy_full_play(self):
+        src = self.ocean_window
+        dst = self.play_window
+        n = len(src)
+        if dst is None or len(dst) != n:
+            raise MemoryError("playfield")
+        step = 4096
+        i = 0
+        while i < n:
+            j = i + step
+            if j > n:
+                j = n
+            dst[i:j] = src[i:j]
+            i = j
+            _service()
+
+    def _shift_play_band(self, y0, y1, delta):
+        """Same slide as the clean window. New columns come from that window."""
+        if delta == 0 or y1 <= y0:
+            return
+        window = self.play_window
+        clean = self.ocean_window
+        vw = W
+        scratch = _ROW_SCRATCH
+        y = y0
+        if delta > 0:
+            if delta >= vw:
+                return
+            keep = vw - delta
+            n = keep * 2
+            src = delta * 2
+            ncol = delta * 2
+            while y < y1:
+                if ((y - y0) & 7) == 0:
+                    _service()
+                row = y * vw * 2
+                scratch[0:n] = window[row + src:row + src + n]
+                window[row:row + n] = scratch[0:n]
+                di = row + n
+                window[di:di + ncol] = clean[di:di + ncol]
+                y += 1
+            return
+        e = 0 - delta
+        if e >= vw:
+            return
+        keep = vw - e
+        n = keep * 2
+        dst = e * 2
+        ncol = e * 2
+        while y < y1:
+            if ((y - y0) & 7) == 0:
+                _service()
+            row = y * vw * 2
+            scratch[0:n] = window[row:row + n]
+            window[row + dst:row + dst + n] = scratch[0:n]
+            window[row:row + ncol] = clean[row:row + ncol]
+            y += 1
+
+    def _shift_play_bands(self):
+        th = self.ocean_th
+        for y0, y1, idx in self._band_spans():
+            if self._band_mode[idx] != 1:
+                continue
+            if y0 < 0:
+                y0 = 0
+            if y1 > th:
+                y1 = th
+            if y1 <= y0:
+                continue
+            self._shift_play_band(y0, y1, self._band_delta[idx])
+
+    def _note_stamp_part(self, kind, dt):
+        if dt < 0:
+            dt = 0
+        if kind == "hud":
+            self._part_hud += dt
+        elif kind == "sonic":
+            self._part_sonic += dt
+        else:
+            self._part_rings += dt
+
+    def _stamp_places(self, places, window, which):
+        """Stamp every place, or only keys listed in which. which None stamps all."""
+        vw = W
+        vh = self._playfield_vh()
+        for p in places:
+            if which is not None and p[0] not in which:
+                continue
+            t0 = _mono_us()
+            self._stamp_frame(window, vw, vh, p[5], p[1], p[2], False, p[6], False)
+            self._note_stamp_part(p[7], _us_diff(_mono_us(), t0))
+            _service()
+
+    def _sync_playfield(self, amount):
+        """Copy the clean backdrop into play_window and restamp dirty sprites.
+
+        ocean_window has just been updated and holds no sprites. A held
+        backdrop with the same sprites leaves the playfield untouched.
+        """
+        self._part_hud = 0
+        self._part_sonic = 0
+        self._part_rings = 0
+        places = self._plan_places(amount)
+        mode = self._bd_mode
+        if (not self._play_valid) or mode == 2:
+            self._copy_full_play()
+            self._stamp_places(places, self.play_window, None)
+            self._placed = places[:]
+            self._play_valid = True
+            return
+        if mode == 0 and self._places_same(places):
+            return
+        if mode == 1:
+            self._shift_play_bands()
+            for clip in self._bd_clips:
+                self._copy_rect(self.ocean_window, self.play_window, clip)
+        repairs = []
+        marked = []
+        old_map = {}
+        for old in self._placed:
+            old_map[old[0]] = old
+        clips = self._bd_clips
+        seen = {}
+        for p in places:
+            seen[p[0]] = p
+            old = old_map.get(p[0])
+            if old is not None and self._place_carried(old, p, clips):
+                continue
+            marked.append(p[0])
+            repairs.append((p[1], p[2], p[3], p[4]))
+            if old is not None:
+                for rect in self._post_shift_rects(old):
+                    repairs.append(rect)
+        for key in old_map:
+            if key not in seen:
+                for rect in self._post_shift_rects(old_map[key]):
+                    repairs.append(rect)
+        grew = True
+        while grew:
+            grew = False
+            for p in places:
+                key = p[0]
+                if key in marked:
+                    continue
+                rect = (p[1], p[2], p[3], p[4])
+                if self._hits(rect, repairs):
+                    marked.append(key)
+                    repairs.append(rect)
+                    grew = True
+        for rect in repairs:
+            self._copy_rect(self.ocean_window, self.play_window, rect)
+        if marked:
+            self._stamp_places(places, self.play_window, marked)
+        self._placed = places[:]
+        self._play_valid = True
+
+    def _stamp_playfield_sprites(self, amount, save_under=False, window=None):
+        pack = self.pack
+        if window is None:
+            window = self.ocean_window
         vw = W
         vh = self._playfield_vh()
         off = int(self.scroll)
@@ -3660,19 +4101,8 @@ class Sprite:
         self._tim_fill += fill_us
         self._tim_flush += flush_us
 
-    def report_timing(self, now):
-        """One serial line per 2 seconds. Does not rebuild caches.
-
-        total stays compose+stamp+push so it compares with V12. fill and
-        flush are the panel clear and the second canvas push.
-        """
-        n = self._tim_n
-        if n <= 0 or self._tim_t0 == 0:
-            return
-        elapsed = _ms_diff(now, self._tim_t0)
-        if elapsed < 2000:
-            return
-        gc_us = 0
+    def _timing_gc(self):
+        """One collect. Not a multi-second sweep, and not once per frame."""
         try:
             import gc
             g0 = _mono_us()
@@ -3680,15 +4110,40 @@ class Sprite:
             gc_us = _us_diff(_mono_us(), g0)
             if gc_us < 0:
                 gc_us = 0
+            return gc_us
         except Exception:
-            gc_us = 0
+            return 0
+
+    def report_timing(self, now):
+        """One serial line per 2 seconds. Does not rebuild caches.
+
+        The V14 fields stay in front so old logs still compare. hud, sonic,
+        and rings are the stamp split (they sit inside stamp, along with
+        the playfield shift and the backdrop copies). shift and full count
+        backdrop updates. A USB CDC that has not drained the previous line
+        skips the print; the counters stay, and gc still runs on this cadence.
+        """
+        n = self._tim_n
+        if n <= 0 or self._tim_t0 == 0:
+            return
+        elapsed = _ms_diff(now, self._tim_t0)
+        if elapsed < 2000:
+            return
+        if not _stdout_can_write():
+            if self._tim_gc_at == 0 or _ms_diff(now, self._tim_gc_at) >= 2000:
+                self._timing_gc()
+                self._tim_gc_at = now
+                _service()
+            return
+        gc_us = self._timing_gc()
+        self._tim_gc_at = now
         _service()
         total_us = self._tim_compose + self._tim_stamp + self._tim_push
         fps_tenths = 0
         if elapsed > 0:
             fps_tenths = (n * 10000) // elapsed
         print(
-            "timing n=%d compose %s stamp %s push %s fill %s flush %s gc %s total %s fps %s hold %d"
+            "timing n=%d compose %s stamp %s push %s fill %s flush %s gc %s total %s fps %s hold %d hud %s sonic %s rings %s shift %d full %d"
             % (
                 n,
                 _fmt_tenths(_avg_tenths_ms(self._tim_compose, n)),
@@ -3700,6 +4155,11 @@ class Sprite:
                 _fmt_tenths(_avg_tenths_ms(total_us, n)),
                 _fmt_tenths(fps_tenths),
                 self._tim_hold,
+                _fmt_tenths(_avg_tenths_ms(self._tim_hud, n)),
+                _fmt_tenths(_avg_tenths_ms(self._tim_sonic, n)),
+                _fmt_tenths(_avg_tenths_ms(self._tim_rings, n)),
+                self._tim_shift,
+                self._tim_full,
             )
         )
         self._tim_n = 0
@@ -3709,6 +4169,11 @@ class Sprite:
         self._tim_fill = 0
         self._tim_flush = 0
         self._tim_hold = 0
+        self._tim_hud = 0
+        self._tim_sonic = 0
+        self._tim_rings = 0
+        self._tim_shift = 0
+        self._tim_full = 0
         self._tim_t0 = now
 
     def _draw_sheet_scene(self, lcd, speed, clt, now):
@@ -3732,6 +4197,7 @@ class Sprite:
         stamp_us = 0
         push_us = 0
         held = 0
+        push_buf = self.ocean_window
         t_enter = _mono_us()
         ocean_ready = (
             self.ocean_rgb565 is not None
@@ -3740,19 +4206,36 @@ class Sprite:
         )
         if ocean_ready and self._can_retain():
             try:
-                changed = self._update_backdrop(self.scroll)
+                self._part_hud = 0
+                self._part_sonic = 0
+                self._part_rings = 0
+                self._update_backdrop(self.scroll)
                 t1 = _mono_us()
-                self._update_sprites(amount)
+                if self.play_window is not None:
+                    self._sync_playfield(amount)
+                    push_buf = self.play_window
+                else:
+                    self._update_sprites(amount)
                 t2 = _mono_us()
                 compose_us = _us_diff(t1, t_enter)
                 stamp_us = _us_diff(t2, t1)
-                held = 0 if changed else 1
+                held = 1 if self._bd_mode == 0 else 0
+                if self._bd_mode == 1:
+                    self._tim_shift += 1
+                elif self._bd_mode == 2:
+                    self._tim_full += 1
+                self._tim_hud += self._part_hud
+                self._tim_sonic += self._part_sonic
+                self._tim_rings += self._part_rings
                 window_ready = True
                 stamped = True
                 used_retain = True
             except MemoryError:
+                self.play_window = None
+                self._play_valid = False
                 self._disable_retain()
                 used_retain = False
+                push_buf = self.ocean_window
                 t_enter = _mono_us()
             except Exception as e:
                 # Torn window: do not push it. fillRect takes over, and the
@@ -3793,7 +4276,9 @@ class Sprite:
             compose_us = _us_diff(_mono_us(), t0)
             window_ready = True
             self._pf_valid = False
+            self._play_valid = False
             self._sprites_on = False
+            push_buf = self.ocean_window
         if window_ready and self._sprite_bake and not stamped:
             try:
                 t0 = _mono_us()
@@ -3808,7 +4293,7 @@ class Sprite:
                 print("sprite stamp failed:", e)
         if window_ready:
             t0 = _mono_us()
-            ok = push_rgb565_window(lcd, self.ocean_window, W, self.ocean_th)
+            ok = push_rgb565_window(lcd, push_buf, W, self.ocean_th)
             push_us = _us_diff(_mono_us(), t0)
             if not ok:
                 self._ocean_push = False

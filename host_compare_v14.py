@@ -154,8 +154,8 @@ def mismatches(a, b, vw):
 
 def main():
     fw = _load_fw()
-    assert fw.APP_VERSION == 14, fw.APP_VERSION
-    assert fw.APP_VERSION_NAME == "2026.11.21-v14"
+    assert fw.APP_VERSION == 15, fw.APP_VERSION
+    assert fw.APP_VERSION_NAME == "2026.11.21-v15"
     assert fw.FACE_ENABLED is False
     assert fw.REFRESH_MS == 50
     assert fw.DBL_TAP_MS == 450
