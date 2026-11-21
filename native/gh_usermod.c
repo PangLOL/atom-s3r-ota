@@ -175,6 +175,7 @@ static mp_obj_t gh_digits(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_digits_obj, 6, 6, gh_digits);
 
 static mp_obj_t gh_refresh_ok(void) {
+    mp_printf(&mp_plat_print, "top ok\n");
     mp_printf(&mp_plat_print, "refresh ok\n");
     return mp_const_none;
 }
