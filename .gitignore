@@ -2,3 +2,9 @@ secrets.py
 __pycache__/
 *.pyc
 .DS_Store
+native/libgh_blit.so
+native/build/
+native/build-xtensawin/
+native/build-x64/
+native/gh_render.mpy
+native/*.o
