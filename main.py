@@ -98,6 +98,19 @@ REFRESH_MS = 50
 # The loop does not wait out that budget. 16 ms is a 60 fps ceiling so a
 # native frame can run at 30-60 fps. It is not a 12-15 fps motion cap.
 FRAME_MIN_MS = 16
+# A full 128x103 RGB565 push is about 26 KB. 800 ms is well past a slow
+# SPI transfer and still shorter than the 30 s watchdog. The driver call
+# itself has no timeout; this bound is the one the handoff waits on.
+PUSH_TIMEOUT_MS = 800
+# Atom S3R 0.85" ST7735: SCK GPIO15, MOSI GPIO21, DC GPIO42, CS GPIO14,
+# RST GPIO48. The ST7735 TE pin is not wired on this board, and there is
+# no BUSY pin. CS low is the driver selecting the panel. These registers
+# are read only; the pin mux is left with the LCD driver.
+_LCD_CS = 14
+_LCD_DC = 42
+_LCD_SCK = 15
+_GPIO_IN = 0x6000403C
+_GPIO_IN1 = 0x60004040
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 APP_VERSION = 16
@@ -792,15 +805,149 @@ def blit_ocean_window(lcd, tile, tw, th, scroll, window, vw=W):
 
 
 
-def push_rgb565_window(lcd, window, vw, th):
-    """Hand the precomposed RGB565 buffer to the panel.
+def _gpio_level(pin):
+    """Read a GPIO without constructing machine.Pin, which would remux it."""
+    try:
+        import machine
+        mem = getattr(machine, "mem32", None)
+        if mem is None:
+            return -1
+        if pin < 32:
+            return (mem[_GPIO_IN] >> pin) & 1
+        return (mem[_GPIO_IN1] >> (pin - 32)) & 1
+    except Exception:
+        return -1
 
-    One pushImage of the bytearray is the fast path. Memoryview strips were
-    a second Python call per 16 rows, and a driver that rejects a view never
-    got as far as refresh_ok even when fillRect could still paint the frame.
-    A rejected full buffer falls back to exact-sized bytearray strips, then
-    writePixels. The face button is polled once around the transfer; the
-    main loop polls it every iteration as well.
+
+def _bus_levels():
+    return (_gpio_level(_LCD_CS), _gpio_level(_LCD_DC), _gpio_level(_LCD_SCK))
+
+
+# CS is sampled from a periodic timer so a driver call that holds the GIL
+# still leaves a trace. The timer is armed only around the transfer.
+_BUS = {"lo": 0, "timer": None}
+
+
+def _cs_tick(_t):
+    try:
+        if _gpio_level(_LCD_CS) == 0:
+            _BUS["lo"] = 1
+    except Exception:
+        pass
+
+
+def _bus_arm():
+    before = _bus_levels()
+    _BUS["lo"] = 1 if before[0] == 0 else 0
+    if _BUS["timer"] is False:
+        return before
+    try:
+        import machine
+        tim = _BUS["timer"]
+        if tim is None:
+            try:
+                tim = machine.Timer(0)
+            except Exception:
+                tim = machine.Timer(1)
+            _BUS["timer"] = tim
+        tim.init(mode=machine.Timer.PERIODIC, period=1, callback=_cs_tick)
+    except Exception:
+        _BUS["timer"] = False
+    return before
+
+
+def _bus_done(before):
+    if _gpio_level(_LCD_CS) == 0:
+        _BUS["lo"] = 1
+    tim = _BUS["timer"]
+    if tim not in (None, False):
+        try:
+            tim.deinit()
+        except Exception:
+            pass
+    after = _bus_levels()
+    print(
+        "bus cs %d/%d dc %d/%d sck %d/%d lo %d"
+        % (before[0], after[0], before[1], after[1], before[2], after[2], _BUS["lo"])
+    )
+
+
+def _exc_name(err):
+    name = type(err).__name__
+    text = str(err)
+    if text:
+        if len(text) > 32:
+            text = text[:32]
+        return name + ":" + text
+    return name
+
+
+def _call_panel(fn):
+    """Run one driver call on this thread. Record how long it took.
+
+    The call is not preempted: a C transfer that never returns cannot be
+    cut short from Python. PUSH_TIMEOUT_MS is the point at which a finished
+    call is reported as slow, and the budget the next method is still
+    allowed to use. CS is GPIO14, active low.
+    """
+    before = _bus_arm()
+    try:
+        t0 = time.ticks_ms()
+    except Exception:
+        t0 = None
+    err = None
+    try:
+        fn()
+    except Exception as e:
+        err = e
+    ms = 0
+    if t0 is not None:
+        try:
+            ms = time.ticks_diff(time.ticks_ms(), t0)
+        except Exception:
+            ms = 0
+        if ms < 0:
+            ms = 0
+    return err, ms, before
+
+
+_STRIP = None
+
+
+def _strip_buf(n):
+    global _STRIP
+    if _STRIP is None or len(_STRIP) < n:
+        _STRIP = bytearray(n)
+    return _STRIP
+
+
+def _push_strips(lcd, window, vw, th, how):
+    """16-row copies out of a buffer the blit is no longer writing."""
+    step = 16
+    raw = _strip_buf(step * vw * 2)
+    y = 0
+    while y < th:
+        h = th - y
+        if h > step:
+            h = step
+        n = h * vw * 2
+        off = y * vw * 2
+        raw[:n] = window[off:off + n]
+        if how == "image":
+            lcd.pushImage(0, y, vw, h, memoryview(raw)[:n])
+        else:
+            # drawRawBuf's len is a pixel count, not a byte count.
+            lcd.drawRawBuf(raw, 0, y, vw, h, vw * h, True)
+        y += h
+
+
+def push_rgb565_window(lcd, window, vw, th):
+    """Hand a finished RGB565 buffer to the panel.
+
+    The caller copies into this buffer only after compose, stamp, fx and
+    digits have returned. pushImage is the older binding. Current UiFlow2
+    exports drawRawBuf instead, and that len argument is the number of
+    pixels. present-ok is not printed here.
     """
     if vw <= 0 or th <= 0:
         return False
@@ -808,38 +955,48 @@ def push_rgb565_window(lcd, window, vw, th):
         _note_c("push_in")
     except Exception:
         pass
+    pixels = vw * th
+    fails = []
+    methods = []
     if hasattr(lcd, "pushImage"):
-        try:
-            lcd.pushImage(0, 0, vw, th, window)
-            _service()
-            return True
-        except Exception:
-            pass
-        try:
-            y = 0
-            step = 16
-            while y < th:
-                h = th - y
-                if h > step:
-                    h = step
-                off = y * vw * 2
-                n = h * vw * 2
-                strip = bytearray(window[off:off + n])
-                lcd.pushImage(0, y, vw, h, strip)
-                y += h
-            _service()
-            return True
-        except Exception:
-            pass
+        methods.append(("image", lambda: lcd.pushImage(0, 0, vw, th, window)))
+    if hasattr(lcd, "drawRawBuf"):
+        # swap=True: the buffer is host-endian RGB565. writePixels then
+        # converts it to the panel's byte order. len is a pixel count.
+        methods.append(("raw", lambda: lcd.drawRawBuf(window, 0, 0, vw, th, pixels, True)))
+    if hasattr(lcd, "pushImage"):
+        methods.append(("strip", lambda: _push_strips(lcd, window, vw, th, "image")))
+    if hasattr(lcd, "drawRawBuf"):
+        methods.append(("rawstrip", lambda: _push_strips(lcd, window, vw, th, "raw")))
     if hasattr(lcd, "writePixels"):
-        try:
+        def _pix():
             if hasattr(lcd, "setAddrWindow"):
                 lcd.setAddrWindow(0, 0, vw - 1, th - 1)
             lcd.writePixels(window)
+        methods.append(("pix", _pix))
+    if not methods:
+        before = _bus_levels()
+        _bus_done(before)
+        print("push-fail none")
+        return False
+    for label, fn in methods:
+        err, ms, before = _call_panel(fn)
+        if err is None:
             _service()
+            _bus_done(before)
+            print("push-ms %d %s" % (ms, label))
+            if ms >= PUSH_TIMEOUT_MS:
+                print("push-slow %d" % ms)
             return True
-        except Exception:
-            pass
+        fails.append(label + ":" + _exc_name(err))
+        _bus_done(before)
+        if ms >= PUSH_TIMEOUT_MS:
+            print("push-slow %d" % ms)
+            # The driver already used the long budget. Do not start another
+            # transfer in the same frame.
+            break
+    if fails:
+        print("push-fail " + " ".join(fails))
     return False
 
 
@@ -2957,6 +3114,7 @@ class Sprite:
         # Clean backdrop lives in ocean_window. Sprites are stamped only
         # into play_window, which is the buffer that gets pushed.
         self.play_window = None
+        self.present_buf = None
         self.ocean_stamps = []
         self._parallax = False
         self._ocean_push = True
@@ -3042,6 +3200,7 @@ class Sprite:
             self.ocean_rgb565 = None
             self.ocean_window = None
             self.play_window = None
+            self.present_buf = None
             self.ocean_stamps = []
             self._parallax = False
             self._ocean_push = True
@@ -3072,6 +3231,7 @@ class Sprite:
         self.ocean_rgb565 = None
         self.ocean_window = None
         self.play_window = None
+        self.present_buf = None
         self.ocean_stamps = []
         self._parallax = False
         self.ocean_tw = 0
@@ -3122,6 +3282,14 @@ class Sprite:
         except MemoryError:
             print("playfield alloc failed")
         self.play_window = play
+        self.present_buf = None
+        if play is not None:
+            try:
+                self.present_buf = bytearray(len(play))
+                print("present buf %d" % len(self.present_buf))
+            except MemoryError:
+                print("present buf alloc failed")
+                self.present_buf = None
         self._play_valid = False
         del self._placed[:]
         self._bind_parallax_state()
@@ -4635,6 +4803,16 @@ class Sprite:
             compose_us = 0
         return compose_us, stamp_us, hud_us, sonic_us, rings_us
 
+    def _present_copy(self, src):
+        """Copy a finished playfield into the buffer the panel will read."""
+        dst = self.present_buf
+        if src is None:
+            return src
+        if dst is None or len(dst) != len(src):
+            return src
+        dst[:] = src
+        return dst
+
     def _draw_native_frame(self, lcd, amount):
         """Compose, stamp, and push through C. False falls back to Python."""
         if (
@@ -4664,7 +4842,10 @@ class Sprite:
             self._part_sonic = sonic_us
             self._part_rings = rings_us
         t0 = _mono_us()
-        ok = push_rgb565_window(lcd, self.play_window, W, self.ocean_th)
+        # Blit has returned. Copy into a buffer the next paint cannot touch,
+        # then start the panel transfer.
+        hand = self._present_copy(self.play_window)
+        ok = push_rgb565_window(lcd, hand, W, self.ocean_th)
         push_us = _us_diff(_mono_us(), t0)
         if push_us < 0:
             push_us = 0
@@ -4807,7 +4988,8 @@ class Sprite:
                 print("sprite stamp failed:", e)
         if window_ready:
             t0 = _mono_us()
-            ok = push_rgb565_window(lcd, push_buf, W, self.ocean_th)
+            hand = self._present_copy(push_buf)
+            ok = push_rgb565_window(lcd, hand, W, self.ocean_th)
             push_us = _us_diff(_mono_us(), t0)
             if not ok:
                 self._ocean_push = False

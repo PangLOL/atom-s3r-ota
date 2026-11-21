@@ -58,16 +58,20 @@ matching firmware, copy these next to each other and reboot:
 runs instead. A self-test during cache build compares C against the
 Python blit and drops the module on a miss (`native self-test failed`).
 
-The C code fills the existing 128×103 playfield. The UiFlow2 `Lcd`
-driver still clocks that buffer out through `pushImage`, in strips, so
-the face button stays live during the transfer. A loadable module
-cannot reliably take over the ST7735 pins from that driver. Gauges
-(y 103–127) and the fault dot stay in Python.
+The C code fills the existing 128×103 playfield. After that blit
+returns, Python copies the playfield into a second buffer and hands
+that copy to the UiFlow2 driver. `pushImage` is tried first. Current
+UiFlow2 does not export it; `drawRawBuf` does, and its length is a
+pixel count. Chip-select (GPIO14, active low) is sampled around the
+transfer. The ST7735 TE pin is not wired on the Atom S3R, and there is
+no BUSY pin. A loadable module cannot reliably take over the panel
+pins from that driver. Gauges (y 103–127) and the fault dot stay in
+Python.
 
 No wide Green Hill ribbon is allocated. Boot still uses the inpainted
-ocean tile (79104 bytes), the clean window and the playfield (26368
-bytes each), and the sprite cache (about 129 KB). The native module is
-about 6 KB of code once loaded.
+ocean tile (79104 bytes), the clean window, the playfield, and the
+present buffer (26368 bytes each), and the sprite cache (about 129 KB).
+The native module is about 6 KB of code once loaded.
 
 Every two seconds the serial line still looks like:
 
