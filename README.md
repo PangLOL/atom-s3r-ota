@@ -62,11 +62,40 @@ The C code fills the existing 128×103 playfield. After that blit
 returns, Python copies the playfield into a second buffer and hands
 that copy to the UiFlow2 driver. `pushImage` is tried first. Current
 UiFlow2 does not export it; `drawRawBuf` does, and its length is a
-pixel count. Chip-select (GPIO14, active low) is sampled around the
-transfer. The ST7735 TE pin is not wired on the Atom S3R, and there is
-no BUSY pin. A loadable module cannot reliably take over the panel
-pins from that driver. Gauges (y 103–127) and the fault dot stay in
-Python.
+pixel count. The ST7735 TE pin is not wired on the Atom S3R, and there
+is no BUSY pin. Chip-select is GPIO14, active low. A loadable module
+cannot reliably take over the panel pins from that driver. Gauges
+(y 103–127) and the fault dot stay in Python.
+
+The panel call holds the VM, so a 1 ms `machine.Timer` callback cannot
+see CS while the bytes are moving. The handoff instead arms the GPIO
+edge-status latch (not `machine.Pin`, and not the IO mux) for CS and
+DC around that call. SCK's latch is armed without the CPU interrupt
+bit, because any-edge on the clock would flood an existing GPIO ISR.
+Each native frame also prints where the microseconds went. `yield 0`
+means the native blit and `drawRawBuf` do not release the GIL, so a
+Python poll cannot run inside them.
+
+```text
+gap us since 1400000 gauge 8000 loop 20000 gc 0 adv 500 paint 3000 other 1368500 gcmem -128 yield 0
+bus cs 1/1 dc 1/1 sck 0/0 lo 0 edge cs 1 dc 1 sck 0
+push-ms 78 raw
+stage us compose 400 stamp 900 fx 200 digits 150 between 300 copy 250 pre 400 raw 78000 post 900000 held 0
+```
+
+`gap` is the time from the previous `present-ok` to this `push-in`.
+`since -1` is the first frame. `other` is the part of that gap that is
+not gauges, the main loop, `gc.collect`, `advance`, or this frame's
+paint: serial blocking and VM pauses. `gcmem` is the change in
+`gc.mem_free`. `bus` levels are before/after on GPIO input registers.
+`lo` is 1 only if a Python sample saw CS low, which does not happen
+while the driver holds the VM. `edge` is the hardware latch: 1 if an
+edge was recorded, `na` if the registers could not be armed. `stage`
+splits this frame. `stamp` there is the sprite stamps only. `pre` is
+the handoff before the driver call (gap print, `push-in`, arming the
+latch). `raw` is the driver call. `post` is the button poll and the
+`bus` / `push-ms` prints. The two-second `timing` line is unchanged,
+and its `stamp` still includes boost and the ring digits.
 
 No wide Green Hill ribbon is allocated. Boot still uses the inpainted
 ocean tile (79104 bytes), the clean window, the playfield, and the

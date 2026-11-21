@@ -805,11 +805,18 @@ def blit_ocean_window(lcd, tile, tw, th, scroll, window, vw=W):
 
 
 
+def _gpio_mem():
+    try:
+        import machine
+        return getattr(machine, "mem32", None)
+    except Exception:
+        return None
+
+
 def _gpio_level(pin):
     """Read a GPIO without constructing machine.Pin, which would remux it."""
     try:
-        import machine
-        mem = getattr(machine, "mem32", None)
+        mem = _gpio_mem()
         if mem is None:
             return -1
         if pin < 32:
@@ -823,52 +830,136 @@ def _bus_levels():
     return (_gpio_level(_LCD_CS), _gpio_level(_LCD_DC), _gpio_level(_LCD_SCK))
 
 
-# CS is sampled from a periodic timer so a driver call that holds the GIL
-# still leaves a trace. The timer is armed only around the transfer.
-_BUS = {"lo": 0, "timer": None}
+# ESP32-S3 GPIO pin-config and edge-status registers. These are not the
+# IO mux. Writing them does not take SCK/MOSI/DC/CS/RST away from the LCD.
+# INT_TYPE is bits 9:7. INT_ENA is bits 17:13. Any-edge is type 3.
+# STATUS latches an edge while the detector is enabled, including across a
+# driver call that never returns to Python. A 1 ms machine.Timer callback
+# does not: it runs only when the VM is free, so it samples idle levels.
+_GPIO_PIN0 = 0x60004074
+_GPIO_STATUS = 0x60004044
+_GPIO_STATUS_W1TC = 0x6000404C
+_GPIO_STATUS1 = 0x60004050
+_GPIO_STATUS1_W1TC = 0x60004058
+_INT_TYPE_MASK = 0x380
+_INT_TYPE_LSB = 7
+_INT_ENA_MASK = 0x3E000
+_INT_ENA_LSB = 13
+_INT_ANYEDGE = 3
+
+# edges: CS, DC, SCK. -1 means the latch could not be armed.
+# saved: (pin, original PIN register word) for the pins armed right now.
+_BUS = {"edges": (-1, -1, -1), "saved": None}
 
 
-def _cs_tick(_t):
-    try:
-        if _gpio_level(_LCD_CS) == 0:
-            _BUS["lo"] = 1
-    except Exception:
-        pass
+def _status_clear(mem, pin):
+    if pin < 32:
+        mem[_GPIO_STATUS_W1TC] = 1 << pin
+    else:
+        mem[_GPIO_STATUS1_W1TC] = 1 << (pin - 32)
 
 
-def _bus_arm():
-    before = _bus_levels()
-    _BUS["lo"] = 1 if before[0] == 0 else 0
-    if _BUS["timer"] is False:
-        return before
-    try:
-        import machine
-        tim = _BUS["timer"]
-        if tim is None:
-            try:
-                tim = machine.Timer(0)
-            except Exception:
-                tim = machine.Timer(1)
-            _BUS["timer"] = tim
-        tim.init(mode=machine.Timer.PERIODIC, period=1, callback=_cs_tick)
-    except Exception:
-        _BUS["timer"] = False
-    return before
+def _status_bit(mem, pin):
+    if pin < 32:
+        return (mem[_GPIO_STATUS] >> pin) & 1
+    return (mem[_GPIO_STATUS1] >> (pin - 32)) & 1
 
 
-def _bus_done(before):
-    if _gpio_level(_LCD_CS) == 0:
-        _BUS["lo"] = 1
-    tim = _BUS["timer"]
-    if tim not in (None, False):
+def _edge_arm_one(mem, pin, enable_cpu):
+    """Any-edge detector. Returns the previous PIN register word.
+
+    enable_cpu turns on the CPU0 enable bit when it was clear, which is
+    what makes the status latch record the edge. SCK does not get that
+    bit: any-edge on the clock would flood an already-installed GPIO ISR.
+    The IO mux function is left untouched.
+    """
+    reg = _GPIO_PIN0 + (pin * 4)
+    cur = mem[reg] & 0xFFFFFFFF
+    nxt = (cur & ~_INT_TYPE_MASK) | ((_INT_ANYEDGE << _INT_TYPE_LSB) & _INT_TYPE_MASK)
+    if enable_cpu and (cur & _INT_ENA_MASK) == 0:
+        nxt = (nxt & ~_INT_ENA_MASK) | (1 << _INT_ENA_LSB)
+    if nxt != cur:
+        mem[reg] = nxt
+    _status_clear(mem, pin)
+    return cur
+
+
+def _edge_restore(mem, saved):
+    if mem is None or not saved:
+        return
+    for pin, word in saved:
         try:
-            tim.deinit()
+            mem[_GPIO_PIN0 + (pin * 4)] = word
+            _status_clear(mem, pin)
         except Exception:
             pass
+
+
+def _edge_prepare(mem):
+    """Arm CS and DC with the latch enabled, and SCK without the CPU bit."""
+    saved = []
+    try:
+        for pin, ena in ((_LCD_CS, True), (_LCD_DC, True), (_LCD_SCK, False)):
+            saved.append((pin, _edge_arm_one(mem, pin, ena)))
+        _BUS["saved"] = saved
+        return True
+    except Exception:
+        _edge_restore(mem, saved)
+        _BUS["saved"] = None
+        return False
+
+
+def _edge_finish(mem):
+    saved = _BUS["saved"]
+    if mem is None or not saved:
+        _BUS["edges"] = (-1, -1, -1)
+        _BUS["saved"] = None
+        return
+    try:
+        _BUS["edges"] = (
+            _status_bit(mem, _LCD_CS),
+            _status_bit(mem, _LCD_DC),
+            _status_bit(mem, _LCD_SCK),
+        )
+    except Exception:
+        _BUS["edges"] = (-1, -1, -1)
+    _edge_restore(mem, saved)
+    _BUS["saved"] = None
+
+
+def bus_sample_saw_low(samples):
+    """1 if any VM-visible CS sample was low. The old timer only had these."""
+    for level in samples:
+        if level == 0:
+            return 1
+    return 0
+
+
+def bus_edge_seen(levels):
+    """1 if the waveform changed while armed. This is what the latch stores."""
+    prev = None
+    for level in levels:
+        if prev is not None and level != prev:
+            return 1
+        prev = level
+    return 0
+
+
+def _edge_text(value):
+    if value < 0:
+        return "na"
+    return "%d" % value
+
+
+def _bus_print(before, lo):
     after = _bus_levels()
+    edges = _BUS["edges"]
     print(
-        "bus cs %d/%d dc %d/%d sck %d/%d lo %d"
-        % (before[0], after[0], before[1], after[1], before[2], after[2], _BUS["lo"])
+        "bus cs %d/%d dc %d/%d sck %d/%d lo %d edge cs %s dc %s sck %s"
+        % (
+            before[0], after[0], before[1], after[1], before[2], after[2], lo,
+            _edge_text(edges[0]), _edge_text(edges[1]), _edge_text(edges[2]),
+        )
     )
 
 
@@ -888,27 +979,40 @@ def _call_panel(fn):
     The call is not preempted: a C transfer that never returns cannot be
     cut short from Python. PUSH_TIMEOUT_MS is the point at which a finished
     call is reported as slow, and the budget the next method is still
-    allowed to use. CS is GPIO14, active low.
+    allowed to use. The edge latch is armed only around fn itself.
     """
-    before = _bus_arm()
+    before = _bus_levels()
+    mem = _gpio_mem()
+    if mem is not None:
+        _edge_prepare(mem)
+    else:
+        _BUS["edges"] = (-1, -1, -1)
     try:
-        t0 = time.ticks_ms()
+        t_ms = time.ticks_ms()
     except Exception:
-        t0 = None
+        t_ms = None
+    t_us = _mono_us()
     err = None
     try:
         fn()
     except Exception as e:
         err = e
+    raw_us = _us_diff(_mono_us(), t_us)
+    if raw_us < 0:
+        raw_us = 0
     ms = 0
-    if t0 is not None:
+    if t_ms is not None:
         try:
-            ms = time.ticks_diff(time.ticks_ms(), t0)
+            ms = time.ticks_diff(time.ticks_ms(), t_ms)
         except Exception:
             ms = 0
         if ms < 0:
             ms = 0
-    return err, ms, before
+    if mem is not None:
+        _edge_finish(mem)
+    after_cs = _gpio_level(_LCD_CS)
+    lo = 1 if (before[0] == 0 or after_cs == 0) else 0
+    return err, ms, raw_us, before, lo
 
 
 _STRIP = None
@@ -941,6 +1045,85 @@ def _push_strips(lcd, window, vw, th, how):
         y += h
 
 
+# Native blit and drawRawBuf both run on this thread and do not release the
+# GIL. yield on the gap line is this fact, not a pin measurement.
+_NATIVE_YIELDS = 0
+_FLOW = {
+    "present": 0,
+    "gauge": 0,
+    "loop": 0,
+    "gc": 0,
+    "adv": 0,
+    "paint": 0,
+    "mem": -1,
+    "gap_printed": 0,
+}
+_PUSH_PARTS = {"pre": 0, "raw": 0, "post": 0, "how": ""}
+
+
+def _flow_add(key, us):
+    if us < 0:
+        us = 0
+    _FLOW[key] = _FLOW[key] + us
+
+
+def _mem_free():
+    try:
+        import gc
+        return gc.mem_free()
+    except Exception:
+        return -1
+
+
+def _print_gap():
+    """Time since the previous present-ok, printed once before push-in.
+
+    since  total microseconds from present-ok to this push
+    gauge  fillRect gauges after that present
+    loop   main-loop time outside Dashboard.tick
+    gc     gc.collect on the two-second timing cadence
+    adv    sprite.advance before this frame's paint
+    paint  compose + stamp + fx + digits + between + copy of this frame
+    other  since minus those pieces (serial blocking and VM pauses)
+    gcmem  change in gc.mem_free since present-ok (negative means allocated)
+    yield  0: the native path does not release the GIL
+    since is -1 until the first present-ok.
+    """
+    if _FLOW["gap_printed"]:
+        return
+    _FLOW["gap_printed"] = 1
+    since = -1
+    if _FLOW["present"]:
+        since = _us_diff(_mono_us(), _FLOW["present"])
+        if since < 0:
+            since = 0
+    gauge = _FLOW["gauge"]
+    loop = _FLOW["loop"]
+    gc_us = _FLOW["gc"]
+    adv = _FLOW["adv"]
+    paint = _FLOW["paint"]
+    other = -1
+    if since >= 0:
+        other = since - gauge - loop - gc_us - adv - paint
+        if other < 0:
+            other = 0
+    mem = _mem_free()
+    prev = _FLOW["mem"]
+    if mem < 0 or prev < 0:
+        gcmem = -1
+    else:
+        gcmem = mem - prev
+    print(
+        "gap us since %d gauge %d loop %d gc %d adv %d paint %d other %d gcmem %d yield %d"
+        % (since, gauge, loop, gc_us, adv, paint, other, gcmem, _NATIVE_YIELDS)
+    )
+    _FLOW["gauge"] = 0
+    _FLOW["loop"] = 0
+    _FLOW["gc"] = 0
+    _FLOW["adv"] = 0
+    _FLOW["paint"] = 0
+
+
 def push_rgb565_window(lcd, window, vw, th):
     """Hand a finished RGB565 buffer to the panel.
 
@@ -951,6 +1134,8 @@ def push_rgb565_window(lcd, window, vw, th):
     """
     if vw <= 0 or th <= 0:
         return False
+    t_enter = _mono_us()
+    _print_gap()
     try:
         _note_c("push_in")
     except Exception:
@@ -974,22 +1159,48 @@ def push_rgb565_window(lcd, window, vw, th):
                 lcd.setAddrWindow(0, 0, vw - 1, th - 1)
             lcd.writePixels(window)
         methods.append(("pix", _pix))
+    parts = _PUSH_PARTS
+    parts["pre"] = 0
+    parts["raw"] = 0
+    parts["post"] = 0
+    parts["how"] = ""
     if not methods:
         before = _bus_levels()
-        _bus_done(before)
+        _BUS["edges"] = (-1, -1, -1)
+        _bus_print(before, 1 if before[0] == 0 else 0)
         print("push-fail none")
+        parts["pre"] = _us_diff(_mono_us(), t_enter)
         return False
     for label, fn in methods:
-        err, ms, before = _call_panel(fn)
+        err, ms, raw_us, before, lo = _call_panel(fn)
+        t_mid = _mono_us()
+        pre = _us_diff(t_mid, t_enter) - raw_us
+        if pre < 0:
+            pre = 0
         if err is None:
             _service()
-            _bus_done(before)
+            _bus_print(before, lo)
             print("push-ms %d %s" % (ms, label))
             if ms >= PUSH_TIMEOUT_MS:
                 print("push-slow %d" % ms)
+            post = _us_diff(_mono_us(), t_mid)
+            if post < 0:
+                post = 0
+            parts["pre"] = pre
+            parts["raw"] = raw_us
+            parts["post"] = post
+            parts["how"] = label
             return True
         fails.append(label + ":" + _exc_name(err))
-        _bus_done(before)
+        _bus_print(before, lo)
+        post = _us_diff(_mono_us(), t_mid)
+        if post < 0:
+            post = 0
+        parts["pre"] = parts["pre"] + pre
+        parts["raw"] = parts["raw"] + raw_us
+        parts["post"] = parts["post"] + post
+        parts["how"] = label
+        t_enter = _mono_us()
         if ms >= PUSH_TIMEOUT_MS:
             print("push-slow %d" % ms)
             # The driver already used the long budget. Do not start another
@@ -2268,11 +2479,21 @@ def _note_c(name):
 
 
 def _note_presented():
-    """present-ok then refresh ok, after pushImage has accepted the buffer."""
+    """present-ok then refresh ok, after the panel call has returned."""
     global _presented_n, _presented_total
     _presented_n += 1
     _presented_total += 1
     _note_c("refresh_ok")
+    # The gap clock starts after those prints, so their serial stall shows
+    # up in the next frame's `other`, not inside raw.
+    _FLOW["present"] = _mono_us()
+    _FLOW["mem"] = _mem_free()
+    _FLOW["gap_printed"] = 0
+    _FLOW["gauge"] = 0
+    _FLOW["loop"] = 0
+    _FLOW["gc"] = 0
+    _FLOW["adv"] = 0
+    _FLOW["paint"] = 0
 
 
 _presented_n = 0
@@ -4541,6 +4762,7 @@ class Sprite:
             gc_us = _us_diff(_mono_us(), g0)
             if gc_us < 0:
                 gc_us = 0
+            _flow_add("gc", gc_us)
             return gc_us
         except Exception:
             return 0
@@ -4777,22 +4999,28 @@ class Sprite:
                 sonic_us += dt
             else:
                 rings_us += dt
+        fx_us = 0
+        dig_us = 0
         if with_fx:
             boost = self.boost
-            ts = _mono_us()
+            t_fx = _mono_us()
             gh.fx(
                 window, vw, vh,
                 boost.aura_i, boost.sw_i, boost.bar_i,
                 AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
             )
-            ts = _mono_us()
+            fx_us = _us_diff(_mono_us(), t_fx)
+            if fx_us < 0:
+                fx_us = 0
+            t_dig = _mono_us()
             gh.digits(window, vw, vh, HUD_BAR_POS[0], HUD_BAR_POS[1], int(self.rings) % 1000)
-            dig_us = _us_diff(_mono_us(), ts)
+            dig_us = _us_diff(_mono_us(), t_dig)
             if dig_us < 0:
                 dig_us = 0
             hud_us += dig_us
             # Boost sits in the stamp total. Digits are the only part of that
-            # overlay counted in hud.
+            # overlay counted in hud. The two-second line still uses that
+            # combined stamp. The per-frame stage line splits fx and digits.
             stamp_us = _us_diff(_mono_us(), t1)
             if stamp_us < 0:
                 stamp_us = 0
@@ -4801,7 +5029,7 @@ class Sprite:
         compose_us = _us_diff(t1, t0)
         if compose_us < 0:
             compose_us = 0
-        return compose_us, stamp_us, hud_us, sonic_us, rings_us
+        return compose_us, stamp_us, hud_us, sonic_us, rings_us, fx_us, dig_us
 
     def _present_copy(self, src):
         """Copy a finished playfield into the buffer the panel will read."""
@@ -4822,18 +5050,30 @@ class Sprite:
             or not self._sprite_bake
         ):
             return False
+        _FLOW["gap_printed"] = 0
         off_c, off_w, off_g = self._fill_native_offs(self.scroll)
         held = 0
         compose_us = 0
         stamp_us = 0
+        sprite_us = 0
+        fx_us = 0
+        dig_us = 0
+        between_us = 0
         self._part_hud = 0
         self._part_sonic = 0
         self._part_rings = 0
+        t_paint = _mono_us()
         if self._native_same(off_c, off_w, off_g, amount):
             held = 1
         else:
-            compose_us, stamp_us, hud_us, sonic_us, rings_us = self._paint_native(amount, True)
+            compose_us, stamp_us, hud_us, sonic_us, rings_us, fx_us, dig_us = self._paint_native(amount, True)
             self._remember_native(off_c, off_w, off_g, amount)
+            sprite_us = hud_us + sonic_us + rings_us - dig_us
+            if sprite_us < 0:
+                sprite_us = 0
+            between_us = _us_diff(_mono_us(), t_paint) - compose_us - sprite_us - fx_us - dig_us
+            if between_us < 0:
+                between_us = 0
             self._tim_full += 1
             self._tim_hud += hud_us
             self._tim_sonic += sonic_us
@@ -4841,14 +5081,27 @@ class Sprite:
             self._part_hud = hud_us
             self._part_sonic = sonic_us
             self._part_rings = rings_us
-        t0 = _mono_us()
+        t_copy = _mono_us()
         # Blit has returned. Copy into a buffer the next paint cannot touch,
         # then start the panel transfer.
         hand = self._present_copy(self.play_window)
+        copy_us = _us_diff(_mono_us(), t_copy)
+        if copy_us < 0:
+            copy_us = 0
+        _FLOW["paint"] = compose_us + sprite_us + fx_us + dig_us + between_us + copy_us
+        t0 = _mono_us()
         ok = push_rgb565_window(lcd, hand, W, self.ocean_th)
         push_us = _us_diff(_mono_us(), t0)
         if push_us < 0:
             push_us = 0
+        parts = _PUSH_PARTS
+        print(
+            "stage us compose %d stamp %d fx %d digits %d between %d copy %d pre %d raw %d post %d held %d"
+            % (
+                compose_us, sprite_us, fx_us, dig_us, between_us, copy_us,
+                parts["pre"], parts["raw"], parts["post"], held,
+            )
+        )
         if not ok:
             self._ocean_push = False
             self._native_ready = False
@@ -5351,7 +5604,9 @@ class Dashboard:
             dt = REFRESH_MS
         self._last_ms = now
         speed = values.get("spd") or 0.0
+        t_adv = _mono_us()
         self.sprite.advance(speed, dt)
+        _flow_add("adv", _us_diff(_mono_us(), t_adv))
 
         # pushImage already covers y 0-102. Gauges repaint y 103-127.
         # Skipping fillScreen and the canvas push avoids a second full-panel
@@ -5373,11 +5628,13 @@ class Dashboard:
         self._poll_button(now)
         prev = self.lcd
         self.lcd = surface
+        t_gauge = _mono_us()
         try:
             self._draw_gauges(values)
             self._draw_fault(fault)
         finally:
             self.lcd = prev
+            _flow_add("gauge", _us_diff(_mono_us(), t_gauge))
         if (not direct) and self._use_push:
             _service()
             t0 = _mono_us()
@@ -5486,6 +5743,7 @@ def main():
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
     last_rx_ms = 0
     last_draw_ms = 0
+    loop_mark = _mono_us()
 
     bus = None
     try:
@@ -5539,8 +5797,10 @@ def main():
                     ui.sprite._sync_ground()
 
         if time.ticks_diff(now, last_draw_ms) >= FRAME_MIN_MS:
+            _flow_add("loop", _us_diff(_mono_us(), loop_mark))
             ui.tick(values, fault, now)
             last_draw_ms = now
+            loop_mark = _mono_us()
 
 
 if __name__ == "__main__":
