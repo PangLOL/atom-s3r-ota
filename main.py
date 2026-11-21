@@ -99,6 +99,9 @@ REFRESH_MS = 50
 # does not wait out REFRESH_MS. 16 ms is a 60 fps ceiling so a native
 # frame can run at 30-60 fps. It is not a 12-15 fps motion cap.
 FRAME_MIN_MS = 16
+# Present on the ring quantum so each paint advances the rings by one
+# step. 16 ms would alias against this 33 ms cycle (fast, then slow).
+# The loop waits out the remainder instead of drawing again early.
 # Full gc.collect on the two-second timing line was the idle and cruise
 # hitch. The same rule applies at rest and in motion: collect only when
 # the heap is actually low.
@@ -132,6 +135,9 @@ WDT_TIMEOUT_MS = 30000
 # Caps a hung version.json / main.py / pixidx GET. The poll interval stays
 # in ota_client (90s). Button and the WDT are serviced while the GET runs.
 OTA_HTTP_TIMEOUT_MS = 3000
+# How often this loop calls ota_client.poll. The client still decides the
+# 90s fetch. Calling it on every frame was on the present path.
+OTA_POLL_MS = 1000
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
@@ -1629,18 +1635,26 @@ def _stdout_can_write():
     return True
 
 
-def _service():
-    """Poll the face button and feed the watchdog. Safe from compose and I/O."""
-    hook = _BTN_HOOK
-    if hook is not None:
-        try:
-            hook()
-        except Exception:
-            pass
+def _feed_wdt():
     wdt = _WDT
     if wdt is not None:
         try:
             wdt.feed()
+        except Exception:
+            pass
+
+
+def _service():
+    """Feed the watchdog, and poll the face button if it is due.
+
+    ButtonWatch ignores calls closer than FRAME_MIN_MS, so a paint can
+    still call this without stacking M5.update on the frame.
+    """
+    _feed_wdt()
+    hook = _BTN_HOOK
+    if hook is not None:
+        try:
+            hook()
         except Exception:
             pass
 
@@ -1949,6 +1963,21 @@ def _us_diff(later, earlier):
     if fn is not None:
         return fn(later, earlier)
     return later - earlier
+
+
+def draw_due(now, next_draw):
+    """True when the next present is due. None starts immediately."""
+    if next_draw is None:
+        return True
+    return time.ticks_diff(now, next_draw) >= 0
+
+
+def next_draw_deadline(now):
+    """The following present, one ring quantum after this sample."""
+    try:
+        return time.ticks_add(now, RING_FPS_MS)
+    except Exception:
+        return now + RING_FPS_MS
 
 
 def anim_dt(dt):
@@ -2601,6 +2630,9 @@ def _report_presented(now):
         _presented_t0 = now
         return
     if _ms_diff(now, _presented_t0) < 1000:
+        return
+    # A full USB CDC must not stall the present. Retry on a later pass.
+    if not _stdout_can_write():
         return
     print("frames %d total %d" % (_presented_n, _presented_total))
     _presented_n = 0
@@ -5678,18 +5710,25 @@ def make_canvas(lcd):
 class ButtonWatch:
     """Poll the face button on every call. One press starts the bench sweep.
 
-    M5.update() is done here so a mid-draw poll still sees a fresh click,
-    and wasClicked is always read in the same call that updates it.
+    M5.update() runs at most once per FRAME_MIN_MS. wasClicked is read in
+    that same call. Extra polls during a paint only feed the watchdog.
     BtnA, Btn, and BtnPWR only. This board has no touch screen.
     """
 
     def __init__(self, btn, on_press=None):
         self.btn = btn
         self.on_press = on_press
+        self._last_poll = None
 
     def poll(self, now=None):
         if now is None:
             now = time.ticks_ms()
+        last = self._last_poll
+        if last is not None:
+            gap = time.ticks_diff(now, last)
+            if 0 <= gap < FRAME_MIN_MS:
+                return False
+        self._last_poll = now
         M5.update()
         btn = self.btn
         if btn is None:
@@ -5910,7 +5949,8 @@ def main():
 
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
     last_rx_ms = 0
-    last_draw_ms = 0
+    next_draw = None
+    last_ota_ms = 0
     loop_mark = _mono_us()
 
     bus = None
@@ -5920,10 +5960,18 @@ def main():
         bus = None
 
     while True:
-        _service()
+        _feed_wdt()
         now = time.ticks_ms()
+        if not draw_due(now, next_draw):
+            try:
+                time.sleep_ms(1)
+            except Exception:
+                try:
+                    time.sleep(0.001)
+                except Exception:
+                    pass
+            continue
         _report_presented(now)
-        # Poll every iteration, not only when a frame has finished.
         button.poll(now)
 
         if sweep.active:
@@ -5937,13 +5985,15 @@ def main():
                     last_rx_ms = now
             fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
 
-        if ota_client is not None:
+        if ota_client is not None and (
+            last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
+        ):
+            last_ota_ms = now
             _service()
             try:
                 ota_client.poll(now)
             except Exception:
                 pass
-            _service()
 
         if ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
             # Keep retrying while the current pack is missing or was rejected
@@ -5964,11 +6014,10 @@ def main():
                     ui.sprite.pack = fetched
                     ui.sprite._sync_ground()
 
-        if time.ticks_diff(now, last_draw_ms) >= FRAME_MIN_MS:
-            _flow_add("loop", _us_diff(_mono_us(), loop_mark))
-            ui.tick(values, fault, now)
-            last_draw_ms = now
-            loop_mark = _mono_us()
+        _flow_add("loop", _us_diff(_mono_us(), loop_mark))
+        ui.tick(values, fault, now)
+        next_draw = next_draw_deadline(now)
+        loop_mark = _mono_us()
 
 
 if __name__ == "__main__":

@@ -96,6 +96,32 @@ def main():
     fw.stamp_disk565(clean, vw, vh, fw.DOT_X, fw.DOT_Y, fw.DOT_R, fw.COL_ERR)
     restored = bytearray(sky)
     assert restored == sky
+    assert fw.draw_due(1000, None) is True
+    assert fw.next_draw_deadline(1000) == 1000 + fw.RING_FPS_MS
+    deadline = fw.next_draw_deadline(1000)
+    assert fw.draw_due(deadline - 1, deadline) is False
+    assert fw.draw_due(deadline, deadline) is True
+    # A paced step is one ring quantum and is under the 50 ms motion cap.
+    assert fw.anim_dt(fw.RING_FPS_MS) == fw.RING_FPS_MS
+    accum = 0
+    for _ in range(8):
+        accum += fw.RING_FPS_MS
+        steps = 0
+        while accum >= fw.RING_FPS_MS:
+            accum -= fw.RING_FPS_MS
+            steps += 1
+        assert steps == 1 and accum == 0
+    # The old ~48 ms frame aliases: leftover grows into a double step.
+    accum = 0
+    counts = []
+    for _ in range(3):
+        accum += 48
+        steps = 0
+        while accum >= fw.RING_FPS_MS:
+            accum -= fw.RING_FPS_MS
+            steps += 1
+        counts.append(steps)
+    assert counts == [1, 1, 2], counts
     assert fw.anim_dt(40) == 40
     assert fw.anim_dt(50) == 50
     assert fw.anim_dt(134) == fw.REFRESH_MS
