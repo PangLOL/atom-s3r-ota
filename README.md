@@ -26,48 +26,92 @@ firmware fetches it over Wi-Fi after boot.
 
 `.nojekyll` keeps GitHub Pages from running Jekyll.
 
-## Version 15 is not published
+## Version 16 is not published
 
 Live GitHub Pages still serve version **12**. This branch is
-**2026.11.21-v15** (version **15**). It is based on the V14 packed-path
-work (PR #10) plus the V15 compositor, and it targets `main` so one pull
-request can carry both. V13 (PR #9) is not included. It is not an OTA
-update until it is merged and the owner publishes it. Do not flash it,
-do not merge it, and do not publish GitHub Pages unless you mean to.
+**2026.11.21-v16** (version **16**). It carries the unmerged V14 packed
+path and the V15 compositor, and adds a native C frame. It targets
+`main`. Do not merge it, do not flash it, and do not publish GitHub
+Pages unless you mean to. V13 (PR #9) is not included.
 
-Version 15 keeps the V14 packed ocean and scenery stamps. `pixidx.bin`
-is the same file. The ocean window stays free of sprites. A band that
-moves by less than a screen is shifted there, and scenery that did not
-ride along is patched, matching a full compose. A second 128-wide
-playfield is the buffer that is pushed. It is shifted the same way, then
-only sprites that are no longer correct are copied from the clean
-backdrop and stamped again: the HUD bar and ring icon while the sky
-under them is still, Sonic when his frame, tint, or the backdrop under
-him changes, and rings and sparkles in their own rects.
+The per-frame blit now runs in C: backdrop scroll, scenery stamps, Sonic,
+field rings, sparkles, the boost aura / shockwave / sound barrier, and
+the HUD ring digits. Python still owns CAN, the face button (BtnA / Btn
+/ BtnPWR), the double-tap bench sweep, animation and scroll state, the
+OTA client, the watchdog, and the timing line. There is no 12–15 fps
+cap. `REFRESH_MS` stays 50 and is still the cap for a bad `dt`. The draw
+loop waits only `FRAME_MIN_MS` (16), so a fast frame can run at up to
+60 fps.
 
-The viper scenery and sprite self-tests run while the caches are built,
-not inside the first timed frame. When the playfield image is pushed,
-the full-screen clear and the second canvas flush are still skipped.
-Gauges still repaint y 103–127. The face button is polled through
-compose, blits, flushes, and the OTA check. The OTA client is unchanged
-aside from a timeout on its HTTP fetch. A machine watchdog is armed
-after the boot allocations.
+`main.py` loads `gh_render` from the same directory. The shipped file is
+a MicroPython native module for **xtensawin**, **.mpy v6.3**, built
+against **MicroPython 1.27.0** (the base of UiFlow2 2.5.5). On a
+matching firmware, copy these next to each other and reboot:
 
-Every two seconds the serial line looks like:
+- `main.py`
+- `gh_render.mpy`
+- `pixidx.bin` (only if it is not already the V12–V15 file)
+
+`ota_client.py` is unchanged, so a main.py-only OTA does not install
+`gh_render.mpy`. If the module is missing or the firmware rejects the
+.mpy, the serial line says `native render off` and the V15 Python path
+runs instead. A self-test during cache build compares C against the
+Python blit and drops the module on a miss (`native self-test failed`).
+
+The C code fills the existing 128×103 playfield. The UiFlow2 `Lcd`
+driver still clocks that buffer out through `pushImage`, in strips, so
+the face button stays live during the transfer. A loadable module
+cannot reliably take over the ST7735 pins from that driver. Gauges
+(y 103–127) and the fault dot stay in Python.
+
+No wide Green Hill ribbon is allocated. Boot still uses the inpainted
+ocean tile (79104 bytes), the clean window and the playfield (26368
+bytes each), and the sprite cache (about 129 KB). The native module is
+about 6 KB of code once loaded.
+
+Every two seconds the serial line still looks like:
 
 ```text
-timing n=40 compose 1.2 stamp 0.8 push 3.5 fill 0.0 flush 0.0 gc 0.3 total 5.5 fps 20.0 hold 28 hud 0.0 sonic 0.4 rings 0.3 shift 38 full 1
+timing n=40 compose 1.2 stamp 0.8 push 3.5 fill 0.0 flush 0.0 gc 0.3 total 5.5 fps 20.0 hold 28 hud 0.0 sonic 0.4 rings 0.3 shift 0 full 12
 ```
 
-The fields through `hold` are the V14 line (`total` is still compose +
-stamp + push). `hud`, `sonic`, and `rings` split the stamp time. `shift`
-and `full` count backdrop updates in that window. If the USB CDC has not
-drained, the print is skipped and those counters stay, so a host that is
-not reading cannot stall the loop. `gc` is still one `gc.collect()` on
-that cadence, including while a print is waiting. Printing the line does
-not rebuild the ocean or the sprite cache.
+`total` is still compose + stamp + push. `hud`, `sonic`, and `rings`
+split the stamp. If the USB CDC has not drained, the print is skipped
+and those counters stay. `gc` is still one `gc.collect()` on that
+cadence. While native rendering is on, `shift` stays 0: a frame that
+changed is rebuilt in C rather than band-shifted. `full` counts those
+rebuilds. `hold` counts frames whose scroll offsets, sprites, boost
+frame, and ring count did not change. `hud` includes the ring digits.
+Boost time sits in `stamp`.
+
+Build the module from `native/` with `xtensa-esp32-elf-gcc` on `PATH`
+and a MicroPython v1.27.0 tree (Espressif xtensa-esp-elf 14.2.0 provides
+that compiler):
+
+```text
+make -f $MPY_DIR/py/dynruntime.mk MPY_DIR=$MPY_DIR \
+  MOD=gh_render SRC="gh_mod.c gh_blit.c" ARCH=xtensawin
+cp gh_render.mpy ..
+```
+
+`ARCH=x64` builds a module the unix port can import. The same
+`gh_blit.c` is what `host_compare_v16.py` links for the pixel compare.
+That script does not run on the device. LCD push, PSRAM, and SPI are
+unchecked here.
+
+If a firmware will not import native .mpy files, the same C can be
+built in as a user module. That requires flashing a firmware image:
+
+```text
+make USER_C_MODULES=/path/to/atom-s3r-ota/native
+```
+
+Host check, from this repo:
+
+```text
+python3 host_compare_v16.py
+```
 
 `pixidx.bin` is unchanged
 (`dda4ea1e1f3249adc8bccb8fc9fe07bb446fb569d5abb884bd1bf83cfe4ba47e`,
-107656 bytes). The device only replaces `main.py`. Device secrets are
-never stored here.
+107656 bytes). Device secrets are never stored here.

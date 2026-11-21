@@ -154,8 +154,8 @@ def _timing_line(fw, sprite):
 
 def main():
     fw = v14._load_fw()
-    assert fw.APP_VERSION == 15
-    assert fw.APP_VERSION_NAME == "2026.11.21-v15"
+    assert fw.APP_VERSION == 16
+    assert fw.APP_VERSION_NAME == "2026.11.21-v16"
     assert fw.FACE_ENABLED is False
     assert fw.REFRESH_MS == 50
     raw = open(os.path.join(ROOT, "pixidx.bin"), "rb").read()

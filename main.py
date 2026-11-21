@@ -94,11 +94,15 @@ CLT_MIN, CLT_MAX = -40, 125
 
 WATCHDOG_MS = 2000
 REFRESH_MS = 50
+# REFRESH_MS stays the stall cap (dt > 500 ms) and the old 20 fps budget.
+# The loop does not wait out that budget. 16 ms is a 60 fps ceiling so a
+# native frame can run at 30-60 fps. It is not a 12-15 fps motion cap.
+FRAME_MIN_MS = 16
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 15
-APP_VERSION_NAME = "2026.11.21-v15"
+APP_VERSION = 16
+APP_VERSION_NAME = "2026.11.21-v16"
 # Long enough that a main.py / pixidx write is not reset, short enough that
 # a stuck idle loop comes back without a power cycle. Not a routine reboot.
 WDT_TIMEOUT_MS = 30000
@@ -1916,31 +1920,158 @@ def stamp_baked(window, vw, vh, rgb, mask, sw, sh, dest_x, dest_y):
         stamp_sprite_rgb565(window, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
 
 
-def tint_sonic_scratch(pack, frame, arena, scratch_off, amount):
-    """Recolor one Sonic frame into the arena scratch. Base cache stays put.
+# Native C hot path. None on a host, or when gh_render.mpy will not import.
+# The Python compose stays as the fallback and as the pixel reference.
+_GH = None
+_GH_KIND = "py"
 
-    Non-blue indices keep the packed RGB565 (the same value fillRect would
-    round-trip). Blue indices use the breathing mix, then 565.
+
+def _load_native():
+    global _GH, _GH_KIND
+    try:
+        import gh_render as mod
+    except Exception:
+        _GH = None
+        _GH_KIND = "py"
+        return
+    _GH = mod
+    _GH_KIND = "native"
+
+
+def _native_self_test():
+    """Tiny compose, stamp, tint expand, and digit against the Python loops.
+
+    A miss drops the module. This runs while the caches are built, not
+    inside a timed frame.
     """
-    w = frame.w
-    h = frame.h
+    gh = _GH
+    if gh is None:
+        return False
+    try:
+        sw = 8
+        sh = 2
+        rgb = bytearray(sw * sh * 2)
+        mask = bytearray((sw * sh + 7) // 8)
+        i = 0
+        while i < sw * sh:
+            if (i & 1) != 0:
+                mask[i >> 3] = mask[i >> 3] | (1 << (i & 7))
+                rgb[i * 2] = (0xF0 + i) & 0xFF
+                rgb[i * 2 + 1] = (0x80 + i * 3) & 0xFF
+            i += 1
+        vw = 6
+        vh = 4
+        for dest_x, dest_y in ((0, 0), (-2, -1), (4, 1), (9, 0)):
+            a = bytearray(vw * vh * 2)
+            b = bytearray(vw * vh * 2)
+            j = 0
+            while j < len(a):
+                a[j] = 0x11
+                b[j] = 0x11
+                j += 1
+            gh.stamp(a, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
+            stamp_sprite_rgb565(b, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
+            if a != b:
+                return False
+        # Wider than the 128-wide window so a wrapped row stays inside the tile.
+        tw = 160
+        th = 8
+        tile = bytearray(tw * th * 2)
+        j = 0
+        while j < len(tile):
+            tile[j] = (j * 3) & 0xFF
+            tile[j + 1] = (j * 5) & 0xFF
+            j += 2
+        sw = 10
+        sh = 4
+        sbuf = bytearray(sw * sh * 2)
+        mask = bytearray((sw * sh + 7) // 8)
+        i = 0
+        while i < sw * sh:
+            if (i % 3) != 0:
+                mask[i >> 3] = mask[i >> 3] | (1 << (i & 7))
+                sbuf[i * 2] = (0xA0 + i) & 0xFF
+                sbuf[i * 2 + 1] = (0x10 + i * 5) & 0xFF
+            i += 1
+        stamp = (1.0, 20, 1, sw, sh, sbuf, mask)
+        # compose() always writes a 128-wide window, same as the panel.
+        window_w = 128
+        py = bytearray(window_w * th * 2)
+        nat = bytearray(window_w * th * 2)
+        off_c, off_w, off_g = 100, 140, 150
+        _copy_rows(tile, tw, 0, 3, off_c, py, window_w, 0)
+        _copy_rows(tile, tw, 3, 5, off_w, py, window_w, 3)
+        _copy_rows(tile, tw, 5, th, off_g, py, window_w, 5)
+        _blit_stamp_py(py, window_w, tw, stamp, off_g)
+        gh.compose(tile, tw, th, off_c, off_w, off_g, 3, 5, [stamp], [off_g], nat)
+        if py != nat:
+            return False
+        src = bytearray(b"\x10\x20\x01\x00")
+        pairs = bytearray(b"\x00\x00\x11\x22\x33\x44")
+        dst = bytearray(4 * 2)
+        ref = bytearray(4 * 2)
+        gh.expand(src, 2, 4, 4, 1, pairs, 3, dst)
+        # 4bpp row: pixels 1, 0, 2, 0 from bytes 0x10, 0x20? 
+        # x0 nibble high of byte0 = 1, x1 low = 0, x2 high of byte1 = 2, x3 low = 0.
+        ref[0] = 0x11
+        ref[1] = 0x22
+        ref[4] = 0x33
+        ref[5] = 0x44
+        if dst != ref:
+            return False
+        digit = bytearray(48 * 16 * 2)
+        gh.digits(digit, 48, 16, 0, 2, 7)
+        if digit == bytearray(len(digit)):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _drop_native():
+    global _GH, _GH_KIND
+    _GH = None
+    _GH_KIND = "py"
+
+
+_load_native()
+
+
+def _tint_pair_bytes(pack, frame, amount):
+    """LE RGB565 pairs for one frame. Index 0 stays transparent (0, 0).
+
+    Non-blue indices keep the packed RGB565. Blue indices use the breathing
+    mix, then the same 565 rounding as the ocean bake.
+    """
     pal_id = frame.pal_id
     if pal_id < 0 or pal_id >= len(pack.palettes):
         pal_id = 0
     pal888 = pack.palettes[pal_id]
     pal565 = pack.palettes_565[pal_id]
     tinted = tint_blue_palette(pal888, amount)
-    pairs = []
     ncolors = len(pal565)
-    for i in range(ncolors):
+    out = bytearray(ncolors * 2)
+    i = 0
+    while i < ncolors:
         if i == 0:
-            pairs.append((0, 0))
+            i += 1
             continue
         if tinted[i] == pal888[i]:
             v = pal565[i]
         else:
             v = _rgb888_to_565(tinted[i])
-        pairs.append((v & 0xFF, (v >> 8) & 0xFF))
+        out[i * 2] = v & 0xFF
+        out[i * 2 + 1] = (v >> 8) & 0xFF
+        i += 1
+    return out
+
+
+def tint_sonic_scratch(pack, frame, arena, scratch_off, amount):
+    """Recolor one Sonic frame into the arena scratch. Base cache stays put."""
+    w = frame.w
+    h = frame.h
+    pairs = _tint_pair_bytes(pack, frame, amount)
+    ncolors = len(pairs) // 2
     scratch = memoryview(arena)[scratch_off:scratch_off + (w * h * 2)]
     data = pack.data
     base = pack.pix_off + frame.data_offset
@@ -1959,9 +2090,8 @@ def tint_sonic_scratch(pack, frame, arena, scratch_off, amount):
                 scratch[di] = 0
                 scratch[di + 1] = 0
             else:
-                lo, hi = pairs[idx]
-                scratch[di] = lo
-                scratch[di + 1] = hi
+                scratch[di] = pairs[idx * 2]
+                scratch[di + 1] = pairs[idx * 2 + 1]
             di += 2
     return scratch
 
@@ -2781,6 +2911,24 @@ class Sprite:
         self._tim_full = 0
         self._tim_t0 = 0
         self._tim_gc_at = 0
+        self._fx_in_buffer = False
+        self._native_ready = False
+        self._nat_c = -1
+        self._nat_w = -1
+        self._nat_g = -1
+        self._nat_flat = -1
+        self._nat_parallax = False
+        self._nat_stamp = []
+        self._nat_tag = None
+        self._nat_anim = -1
+        self._nat_ring_i = -1
+        self._nat_amount = None
+        self._nat_rings = -1
+        self._nat_aura = -999
+        self._nat_sw = -999
+        self._nat_bar = -999
+        self._nat_spark = []
+        self._off_buf = []
         self._sync_ground()
 
     def _sync_ground(self):
@@ -2922,6 +3070,7 @@ class Sprite:
         self._retain = False
         self._pf_valid = False
         self._play_valid = False
+        self._native_ready = False
         del self._placed[:]
 
     def _prepare_sprites(self, force=False):
@@ -2957,6 +3106,15 @@ class Sprite:
         self._sprite_bake = True
         kind = _ensure_stamp()
         print("sprite cache", len(arena), "frames", len(info), kind)
+        if _GH is not None:
+            if _native_self_test():
+                build = getattr(_GH, "BUILD", "on")
+                print("native render", build)
+            else:
+                print("native self-test failed")
+                _drop_native()
+        else:
+            print("native render off")
         if self.play_window is not None:
             # Clean backdrop + playfield replaces the underlay save/restore.
             self._under_buf = None
@@ -3121,6 +3279,9 @@ class Sprite:
     def _draw_ring_hud(self, lcd):
         # Compact original ring + digits. Kept in the playfield, not in the gauges.
         # Offset from the CAN-fault dot in the upper-left corner.
+        # The native frame already stamped the bar, the ring, and the digits.
+        if self._fx_in_buffer:
+            return
         pack = self.pack
         if pack is not None:
             bx, by = HUD_BAR_POS
@@ -4176,6 +4337,233 @@ class Sprite:
         self._tim_full = 0
         self._tim_t0 = now
 
+    def _frame_index(self, fr):
+        pack = self.pack
+        w = fr.w
+        h = fr.h
+        bpp4 = pack.bpp == 4
+        row_bytes = ((w + 1) // 2) if bpp4 else w
+        base = pack.pix_off + fr.data_offset
+        src = memoryview(pack.data)[base:base + row_bytes * h]
+        return src, row_bytes, 4 if bpp4 else 8
+
+    def _native_views(self, fr, amount):
+        """Baked RGB565 and mask. A hot tint is expanded in C from the pairs."""
+        at = self._bake_at.get(fr.name)
+        if at is None:
+            raise KeyError(fr.name)
+        rgb_off, mask_off = at
+        n = fr.w * fr.h
+        mask = memoryview(self._arena)[mask_off:mask_off + ((n + 7) // 8)]
+        if amount > 0:
+            pairs = _tint_pair_bytes(self.pack, fr, amount)
+            scratch = memoryview(self._arena)[self._scratch_off:self._scratch_off + (n * 2)]
+            src, stride, bpp = self._frame_index(fr)
+            _GH.expand(src, stride, bpp, fr.w, fr.h, pairs, len(pairs) // 2, scratch)
+            return scratch, mask
+        rgb = memoryview(self._arena)[rgb_off:rgb_off + (n * 2)]
+        return rgb, mask
+
+    def _fill_native_offs(self, scroll):
+        """Write stamp offsets into _off_buf. Returns cloud, water, ground."""
+        tw = self.ocean_tw
+        offs = self._off_buf
+        del offs[:]
+        if not self._parallax:
+            return _norm_off(scroll, tw), 0, 0
+        off_c = _norm_off(scroll * PARALLAX_CLOUDS, tw)
+        off_w = _norm_off(scroll * PARALLAX_WATER, tw)
+        off_g = _norm_off(scroll * PARALLAX_GROUND, tw)
+        stamps = self.ocean_stamps
+        i = 0
+        n = len(stamps) if stamps else 0
+        while i < n:
+            offs.append(_norm_off(scroll * stamps[i][0], tw))
+            i += 1
+        return off_c, off_w, off_g
+
+    def _native_same(self, off_c, off_w, off_g, amount):
+        if not self._native_ready:
+            return False
+        if self._parallax:
+            if not self._nat_parallax:
+                return False
+            if self._nat_c != off_c or self._nat_w != off_w or self._nat_g != off_g:
+                return False
+            prev = self._nat_stamp
+            cur = self._off_buf
+            if len(prev) != len(cur):
+                return False
+            i = 0
+            while i < len(cur):
+                if prev[i] != cur[i]:
+                    return False
+                i += 1
+        else:
+            if self._nat_parallax or self._nat_flat != off_c:
+                return False
+        if self._nat_tag != self.anim_tag or self._nat_anim != self.anim_i:
+            return False
+        if self._nat_ring_i != self.ring_i or self._nat_amount != amount:
+            return False
+        if self._nat_rings != self.rings:
+            return False
+        boost = self.boost
+        if (
+            self._nat_aura != boost.aura_i
+            or self._nat_sw != boost.sw_i
+            or self._nat_bar != boost.bar_i
+        ):
+            return False
+        sp = self.sparkles
+        prev_s = self._nat_spark
+        if len(sp) != len(prev_s):
+            return False
+        i = 0
+        while i < len(sp):
+            item = sp[i]
+            p = prev_s[i]
+            if item[0] != p[0] or item[1] != p[1] or item[2] != p[2]:
+                return False
+            i += 1
+        return True
+
+    def _remember_native(self, off_c, off_w, off_g, amount):
+        self._nat_parallax = bool(self._parallax)
+        self._nat_c = off_c
+        self._nat_w = off_w
+        self._nat_g = off_g
+        if self._parallax:
+            self._nat_stamp = self._off_buf[:]
+        else:
+            self._nat_flat = off_c
+            del self._nat_stamp[:]
+        self._nat_tag = self.anim_tag
+        self._nat_anim = self.anim_i
+        self._nat_ring_i = self.ring_i
+        self._nat_amount = amount
+        self._nat_rings = self.rings
+        boost = self.boost
+        self._nat_aura = boost.aura_i
+        self._nat_sw = boost.sw_i
+        self._nat_bar = boost.bar_i
+        prev = self._nat_spark
+        del prev[:]
+        for item in self.sparkles:
+            prev.append((item[0], item[1], item[2]))
+        self._native_ready = True
+
+    def _paint_native(self, amount, with_fx):
+        """Fill play_window. Returns compose, stamp, hud, sonic, rings microseconds.
+
+        with_fx draws boost and the ring digits into the same buffer. The
+        playfield underneath matches a full V15 compose plus stamp.
+        """
+        gh = _GH
+        window = self.play_window
+        vw = W
+        th = self.ocean_th
+        vh = self._playfield_vh()
+        tw = self.ocean_tw
+        tile = self.ocean_rgb565
+        off_c, off_w, off_g = self._fill_native_offs(self.scroll)
+        t0 = _mono_us()
+        if self._parallax:
+            gh.compose(
+                tile, tw, th, off_c, off_w, off_g, HORIZON_Y, GRASS_Y,
+                self.ocean_stamps, self._off_buf, window,
+            )
+        else:
+            gh.copy(tile, tw, th, off_c, window, vw)
+        t1 = _mono_us()
+        _service()
+        places = self._plan_places(amount)
+        hud_us = 0
+        sonic_us = 0
+        rings_us = 0
+        for p in places:
+            ts = _mono_us()
+            rgb, mask = self._native_views(p[5], p[6])
+            gh.stamp(window, vw, vh, rgb, mask, p[5].w, p[5].h, p[1], p[2])
+            dt = _us_diff(_mono_us(), ts)
+            if dt < 0:
+                dt = 0
+            if p[7] == "hud":
+                hud_us += dt
+            elif p[7] == "sonic":
+                sonic_us += dt
+            else:
+                rings_us += dt
+        if with_fx:
+            boost = self.boost
+            ts = _mono_us()
+            gh.fx(
+                window, vw, vh,
+                boost.aura_i, boost.sw_i, boost.bar_i,
+                AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
+            )
+            ts = _mono_us()
+            gh.digits(window, vw, vh, HUD_BAR_POS[0], HUD_BAR_POS[1], int(self.rings) % 1000)
+            dig_us = _us_diff(_mono_us(), ts)
+            if dig_us < 0:
+                dig_us = 0
+            hud_us += dig_us
+            # Boost sits in the stamp total. Digits are the only part of that
+            # overlay counted in hud.
+            stamp_us = _us_diff(_mono_us(), t1)
+            if stamp_us < 0:
+                stamp_us = 0
+        else:
+            stamp_us = hud_us + sonic_us + rings_us
+        compose_us = _us_diff(t1, t0)
+        if compose_us < 0:
+            compose_us = 0
+        return compose_us, stamp_us, hud_us, sonic_us, rings_us
+
+    def _draw_native_frame(self, lcd, amount):
+        """Compose, stamp, and push through C. False falls back to Python."""
+        if (
+            _GH is None
+            or self.play_window is None
+            or self.ocean_rgb565 is None
+            or not self._sprite_bake
+        ):
+            return False
+        off_c, off_w, off_g = self._fill_native_offs(self.scroll)
+        held = 0
+        compose_us = 0
+        stamp_us = 0
+        self._part_hud = 0
+        self._part_sonic = 0
+        self._part_rings = 0
+        if self._native_same(off_c, off_w, off_g, amount):
+            held = 1
+        else:
+            compose_us, stamp_us, hud_us, sonic_us, rings_us = self._paint_native(amount, True)
+            self._remember_native(off_c, off_w, off_g, amount)
+            self._tim_full += 1
+            self._tim_hud += hud_us
+            self._tim_sonic += sonic_us
+            self._tim_rings += rings_us
+            self._part_hud = hud_us
+            self._part_sonic = sonic_us
+            self._part_rings = rings_us
+        t0 = _mono_us()
+        ok = push_rgb565_window(lcd, self.play_window, W, self.ocean_th)
+        push_us = _us_diff(_mono_us(), t0)
+        if push_us < 0:
+            push_us = 0
+        if not ok:
+            self._ocean_push = False
+            self._native_ready = False
+            self._fx_in_buffer = False
+            self._playfield_stamped = False
+            return False
+        self._fx_in_buffer = True
+        self._playfield_stamped = True
+        self._note_timing(compose_us, stamp_us, push_us, held)
+        return True
+
     def _draw_sheet_scene(self, lcd, speed, clt, now):
         pack = self.pack
         pal_s = pack.pal(1)
@@ -4184,6 +4572,16 @@ class Sprite:
         amount = sonic_tint_amount(clt, now)
         if amount > 0:
             pal_c = tint_blue_palette(pal_c, amount)
+        self._fx_in_buffer = False
+        if _GH is not None and self.play_window is not None and self._sprite_bake:
+            try:
+                if self._draw_native_frame(lcd, amount):
+                    return
+            except Exception as e:
+                print("native frame failed:", e)
+                self._native_ready = False
+                self._fx_in_buffer = False
+                self._play_valid = False
         ocean = pack.by_name.get("ocean")
         off = int(self.scroll)
         self._playfield_stamped = False
@@ -4847,7 +5245,7 @@ def main():
                     ui.sprite.pack = fetched
                     ui.sprite._sync_ground()
 
-        if time.ticks_diff(now, last_draw_ms) >= REFRESH_MS:
+        if time.ticks_diff(now, last_draw_ms) >= FRAME_MIN_MS:
             ui.tick(values, fault, now)
             last_draw_ms = now
 
