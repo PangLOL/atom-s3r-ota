@@ -1983,8 +1983,10 @@ def next_draw_deadline(now):
 def pace_after(started, finished, quantum=None):
     """Deadline for the next present after work that began at started.
 
-    The quantum includes the paint. If the paint already used it, return
-    None so the loop draws again immediately instead of queueing a catch-up.
+    The quantum includes the paint. The deadline is `finished + leftover`,
+    not `finished + quantum` and not `started + quantum` sampled before
+    the paint. If the paint already used the quantum, return None so the
+    loop draws again immediately instead of queueing a catch-up.
     """
     if quantum is None:
         quantum = RING_FPS_MS
@@ -1996,6 +1998,17 @@ def pace_after(started, finished, quantum=None):
         return time.ticks_add(finished, remain)
     except Exception:
         return finished + remain
+
+
+def pace_remain(started, finished, quantum=None):
+    """Milliseconds to sleep after `finished`. 0 when the frame was late."""
+    deadline = pace_after(started, finished, quantum)
+    if deadline is None:
+        return 0
+    remain = time.ticks_diff(deadline, finished)
+    if remain < 0:
+        return 0
+    return remain
 
 
 def live_can(bus, last_rx_ms, now):
@@ -6007,13 +6020,18 @@ def main():
         _feed_wdt()
         now = time.ticks_ms()
         if not draw_due(now, next_draw):
-            try:
-                time.sleep_ms(1)
-            except Exception:
+            # One sleep for the whole remainder. A 1 ms loop pays a Python
+            # round-trip per millisecond and, on a 10 ms RTOS tick, turns
+            # an 18 ms leftover into about another full 33 ms.
+            remain = time.ticks_diff(next_draw, now)
+            if remain > 0:
                 try:
-                    time.sleep(0.001)
+                    time.sleep_ms(remain)
                 except Exception:
-                    pass
+                    try:
+                        time.sleep(remain / 1000.0)
+                    except Exception:
+                        pass
             continue
         if present_t0 is None:
             present_t0 = now
