@@ -37,7 +37,7 @@ Pages unless you mean to. V13 (PR #9) is not included.
 The per-frame blit now runs in C: backdrop scroll, scenery stamps, Sonic,
 field rings, sparkles, the boost aura / shockwave / sound barrier, and
 the HUD ring digits. Python still owns CAN, the face button (BtnA / Btn
-/ BtnPWR), the double-tap bench sweep, animation and scroll state, the
+/ BtnPWR), the one-press bench sweep, animation and scroll state, the
 OTA client, the watchdog, and the timing line. There is no 12–15 fps
 cap. `REFRESH_MS` stays 50 and is still the cap for a bad `dt`. The draw
 loop waits only `FRAME_MIN_MS` (16), so a fast frame can run at up to

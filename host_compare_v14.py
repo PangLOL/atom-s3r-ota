@@ -158,7 +158,7 @@ def main():
     assert fw.APP_VERSION_NAME == "2026.11.21-v16"
     assert fw.FACE_ENABLED is False
     assert fw.REFRESH_MS == 50
-    assert fw.DBL_TAP_MS == 450
+    assert not hasattr(fw, "DBL_TAP_MS")
     assert fw.SONIC_W == 39 and fw.SONIC_H == 36
     assert fw.SONIC_X == 16 and fw.SONIC_Y == 55
     assert fw.SONIC_FEET_Y == 90

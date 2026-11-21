@@ -56,7 +56,7 @@ Decode (Honda Fit GE8):
     0x13A byte 1     raw counts         -> throttle     (0-255)
     0x324 byte 0     minus 40           -> coolant C    (-40-125)
 
-Screen-button double-tap starts a bench sweep: speed 0-100-80-0 with
+One press of the face button starts a bench sweep: speed 0-100-80-0 with
 matching RPM, throttle and coolant, so the run cycle and the 80 km/h
 infinity-leg sprite can be tested without a vehicle.
 
@@ -100,7 +100,6 @@ REFRESH_MS = 50
 FRAME_MIN_MS = 16
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
-DBL_TAP_MS = 450
 APP_VERSION = 16
 APP_VERSION_NAME = "2026.11.21-v16"
 # Long enough that a main.py / pixidx write is not reset, short enough that
@@ -2113,7 +2112,28 @@ def _note_c(name):
 
 def _note_presented():
     """present-ok then refresh ok, after pushImage has accepted the buffer."""
+    global _presented_n, _presented_total
+    _presented_n += 1
+    _presented_total += 1
     _note_c("refresh_ok")
+
+
+_presented_n = 0
+_presented_total = 0
+_presented_t0 = 0
+
+
+def _report_presented(now):
+    """One line per second: playfield frames the panel accepted in that second."""
+    global _presented_n, _presented_t0
+    if _presented_t0 == 0:
+        _presented_t0 = now
+        return
+    if _ms_diff(now, _presented_t0) < 1000:
+        return
+    print("frames %d total %d" % (_presented_n, _presented_total))
+    _presented_n = 0
+    _presented_t0 = now
 
 
 _load_native()
@@ -5082,17 +5102,16 @@ def make_canvas(lcd):
 
 
 class ButtonWatch:
-    """Poll the face button on every call. Double-press starts the bench sweep.
+    """Poll the face button on every call. One press starts the bench sweep.
 
     M5.update() is done here so a mid-draw poll still sees a fresh click,
     and wasClicked is always read in the same call that updates it.
+    BtnA, Btn, and BtnPWR only. This board has no touch screen.
     """
 
-    def __init__(self, btn, on_double=None):
+    def __init__(self, btn, on_press=None):
         self.btn = btn
-        self.on_double = on_double
-        self.last_click_ms = -1000
-        self.pending_click = False
+        self.on_press = on_press
 
     def poll(self, now=None):
         if now is None:
@@ -5101,29 +5120,22 @@ class ButtonWatch:
         btn = self.btn
         if btn is None:
             return False
-        tapped = False
-        if hasattr(btn, "wasDoubleClicked"):
-            try:
-                tapped = bool(btn.wasDoubleClicked())
-            except Exception:
-                tapped = False
-        if not tapped and hasattr(btn, "wasClicked"):
+        clicked = False
+        if hasattr(btn, "wasClicked"):
             try:
                 clicked = bool(btn.wasClicked())
             except Exception:
                 clicked = False
-            if clicked:
-                if self.pending_click and time.ticks_diff(now, self.last_click_ms) <= DBL_TAP_MS:
-                    tapped = True
-                    self.pending_click = False
-                else:
-                    self.pending_click = True
-                    self.last_click_ms = now
-        if self.pending_click and time.ticks_diff(now, self.last_click_ms) > DBL_TAP_MS:
-            self.pending_click = False
-        if tapped and self.on_double is not None:
-            self.on_double(now)
-        return tapped
+        if hasattr(btn, "wasDoubleClicked"):
+            try:
+                extra = bool(btn.wasDoubleClicked())
+            except Exception:
+                extra = False
+            if extra and not clicked:
+                clicked = True
+        if clicked and self.on_press is not None:
+            self.on_press(now)
+        return clicked
 
 
 class Dashboard:
@@ -5302,6 +5314,7 @@ def main():
     while True:
         _service()
         now = time.ticks_ms()
+        _report_presented(now)
         # Poll every iteration, not only when a frame has finished.
         button.poll(now)
 
