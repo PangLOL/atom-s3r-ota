@@ -2021,6 +2021,24 @@ _BRK_N = 0
 _BRK_WALL = 0
 _BRK_WALL_MAX = 0
 _BRK_T0 = 0
+# The timing line that already arrives intact on this USB CDC is 139
+# characters. A longer brk print was cut at the front and stalled a frame.
+_BRK_CDC = 139
+_BRK_PAGE = 0
+_BRK_ALT_I = 0
+# Page 0, in the order they are added. wall and left go first so a long
+# value cannot push them off the end.
+_BRK_PAGE0 = (
+    "wall", "left", "sleep", "m5", "serial", "compose",
+    "draw", "push", "copy", "over",
+)
+# Page 1 always carries the budget check, then the other buckets.
+_BRK_PAGE1 = ("wall", "left", "over", "copy")
+_BRK_REST = (
+    "tick", "svc", "gauge", "sonic", "hud", "rings", "plan", "adv",
+    "wdt", "frames", "cdc", "poll", "can", "sweep", "auto", "ota", "pix",
+    "fx", "dig", "fault", "fill", "flush", "gc", "timing", "pace",
+)
 
 
 def _brk_add(name, us):
@@ -2071,7 +2089,7 @@ def _brk_reset_sums():
 
 
 def _brk_reset_all():
-    global _BRK_NAME, _BRK_AT, _BRK_STN, _BRK_T0
+    global _BRK_NAME, _BRK_AT, _BRK_STN, _BRK_T0, _BRK_PAGE, _BRK_ALT_I
     _brk_reset_sums()
     for name in _BRK_FR:
         _BRK_FR[name] = 0
@@ -2083,6 +2101,8 @@ def _brk_reset_all():
     _BRK_NAME = None
     _BRK_AT = 0
     _BRK_T0 = 0
+    _BRK_PAGE = 0
+    _BRK_ALT_I = 0
 
 
 def _brk_commit(wall):
@@ -2127,7 +2147,7 @@ def _brk_field(name, total, n, peak):
 
 
 def _brk_line():
-    """`brk n=22 wall 46.1/48.0 sleep 0.0/0.1 ... left 27.0/31.0 over 0.0/0.0`.
+    """Full counter line. The USB print uses `_brk_cdc_line` instead.
 
     Each field is average/max milliseconds. `wall` is the loop period.
     `left` was not inside any named call. `over` means the named calls
@@ -2142,8 +2162,71 @@ def _brk_line():
     return " ".join(parts)
 
 
+def _brk_text(name, n):
+    if name == "wall":
+        return _brk_field("wall", _BRK_WALL, n, _BRK_WALL_MAX)
+    return _brk_field(name, _BRK_SUM.get(name, 0), n, _BRK_MAX.get(name, 0))
+
+
+def _brk_pack(names, n, limit):
+    """Join fields until one more would pass the CDC length."""
+    s = "brk n=%d" % n
+    for name in names:
+        nxt = s + " " + _brk_text(name, n)
+        if len(nxt) > limit:
+            break
+        s = nxt
+    return s
+
+
+def _brk_cdc_line():
+    """One short line. Pages alternate so an 80 s listen still ranks buckets.
+
+    Page 0: wall left sleep m5 serial compose draw push copy over
+    Page 1: wall left over copy, then the other non-zero buckets.
+    Both stay within the timing-line length. Zero buckets on page 1 are
+    left off. A full set of non-zero buckets continues on the next page 1.
+    """
+    global _BRK_PAGE, _BRK_ALT_I
+    n = _BRK_N
+    if n <= 0:
+        n = 1
+    if _BRK_PAGE == 0:
+        _BRK_PAGE = 1
+        return _brk_pack(_BRK_PAGE0, n, _BRK_CDC)
+    _BRK_PAGE = 0
+    s = _brk_pack(_BRK_PAGE1, n, _BRK_CDC)
+    rest = []
+    for name in _BRK_REST:
+        if _BRK_SUM.get(name, 0) > 0 or _BRK_MAX.get(name, 0) > 0:
+            rest.append(name)
+    if not rest:
+        _BRK_ALT_I = 0
+        return s
+    i = _BRK_ALT_I
+    if i >= len(rest):
+        i = 0
+    taken = 0
+    k = 0
+    while k < len(rest):
+        piece = _brk_text(rest[(i + k) % len(rest)], n)
+        nxt = s + " " + piece
+        if len(nxt) > _BRK_CDC:
+            break
+        s = nxt
+        taken += 1
+        k += 1
+    if taken == 0:
+        _BRK_ALT_I = (i + 1) % len(rest)
+    elif taken >= len(rest):
+        _BRK_ALT_I = 0
+    else:
+        _BRK_ALT_I = (i + taken) % len(rest)
+    return s
+
+
 def _brk_maybe_print(now):
-    """One line a second, and only when USB CDC can take it."""
+    """One short line a second, and only when USB CDC can take it."""
     global _BRK_T0
     if _BRK_T0 == 0:
         _BRK_T0 = now
@@ -2154,7 +2237,7 @@ def _brk_maybe_print(now):
         return
     if not _stdout_can_write():
         return
-    print(_brk_line())
+    print(_brk_cdc_line())
     _brk_reset_sums()
     _BRK_T0 = now
 
