@@ -31,7 +31,7 @@ def _load_fw():
 
 def oracle_blit(window, vw, tw, stamp, scroll):
     """V12 _blit_stamp, unchanged."""
-    factor, ox, oy, sw, sh, sbuf, mask = stamp
+    factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
     off = int(scroll * factor) % tw
     if off < 0:
         off += tw
@@ -65,7 +65,7 @@ def oracle_blit(window, vw, tw, stamp, scroll):
 
 def oracle_blit_clip(window, vw, tw, stamp, scroll, clip):
     """V12 _blit_stamp_clip."""
-    factor, ox, oy, sw, sh, sbuf, mask = stamp
+    factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
     cx, cy, cw, ch = clip
     if cw <= 0 or ch <= 0 or sw <= 0 or sh <= 0:
         return
@@ -169,7 +169,7 @@ def main():
     raw = open(os.path.join(ROOT, "pixidx.bin"), "rb").read()
     digest = hashlib.sha256(raw).hexdigest()
     assert digest == fw.PIXIDX_SHA256, digest
-    assert len(raw) == fw.PIXIDX_SIZE == 107656
+    assert len(raw) == fw.PIXIDX_SIZE
     pack = fw.PixIdx(raw)
     ocean = pack.by_name["ocean"]
     tile, tw, th = fw.prerender_ocean_rgb565(pack, ocean)

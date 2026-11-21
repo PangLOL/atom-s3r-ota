@@ -84,11 +84,31 @@ class Native(object):
         while i < len(stamps):
             st = stamps[i]
             off = offs[i] if i < len(offs) else 0
-            self._blit(window, vw, th, tw, st[5], st[6], st[3], st[4], st[1], st[2], off)
+            if len(st) >= 8 and st[7]:
+                self._spans(
+                    window, vw, th, tw, st[5], st[3], st[4], st[7], st[1], st[2], off
+                )
+            else:
+                self._blit(window, vw, th, tw, st[5], st[6], st[3], st[4], st[1], st[2], off)
             i += 1
 
     def copy(self, tile, tw, th, off, window, vw):
         self._rows(tile, tw, 0, th, off, window, vw, 0)
+
+    def stamp_runs(self, window, vw, vh, runs, nruns, pairs, ncolors, x, y):
+        cw = _cbuf(window, True)
+        cr = _cbuf(runs, False)
+        cp = _cbuf(pairs, False)
+        self.lib.gh_stamp_runs.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+        ]
+        self.lib.gh_stamp_runs.restype = None
+        self.lib.gh_stamp_runs(
+            cw, int(vw), int(vh), cr, int(nruns), cp, int(ncolors), int(x), int(y)
+        )
 
     def stamp(self, window, vw, vh, rgb, mask, sw, sh, x, y):
         cw = _cbuf(window, True)
@@ -120,6 +140,22 @@ class Native(object):
         ct = _cbuf(tile, False)
         co = _cbuf(out, True)
         self.lib.gh_copy_rows(ct, int(tw), int(y0), int(y1), int(off), co, int(vw), int(out_y))
+
+    def _spans(self, window, vw, vh, tw, sbuf, sw, sh, runs, ox, oy, off):
+        cw = _cbuf(window, True)
+        cs = _cbuf(sbuf, False)
+        cr = _cbuf(runs, False)
+        self.lib.gh_blit_span_runs.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+        self.lib.gh_blit_span_runs.restype = None
+        self.lib.gh_blit_span_runs(
+            cw, int(vw), int(vh), int(tw), cs, int(sw), int(sh),
+            cr, len(runs) // 4, int(ox), int(oy), int(off),
+        )
 
     def _blit(self, window, vw, vh, tw, sbuf, mask, sw, sh, ox, oy, off):
         cw = _cbuf(window, True)
@@ -607,7 +643,7 @@ def main():
     raw = open(os.path.join(ROOT, "pixidx.bin"), "rb").read()
     digest = hashlib.sha256(raw).hexdigest()
     assert digest == fw.PIXIDX_SHA256
-    assert len(raw) == fw.PIXIDX_SIZE == 107656
+    assert len(raw) == fw.PIXIDX_SIZE
     # int() of the aura scales is baked into the C tables.
     assert int(20 * 0.72) == 14 and int(13 * 0.72) == 9
     assert int(20 * 0.90) == 18 and int(13 * 0.90) == 11

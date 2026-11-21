@@ -407,8 +407,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "dda4ea1e1f3249adc8bccb8fc9fe07bb446fb569d5abb884bd1bf83cfe4ba47e"
-PIXIDX_SIZE = 107656
+PIXIDX_SHA256 = "f33a0418a01743d405be8cee372a3ad0b8c3d72efbc8e2f0f95720468cb2c1c0"
+PIXIDX_SIZE = 216653
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -547,8 +547,10 @@ class PixIdx:
             raise ValueError("bad PIX6 version")
         self.data = data
         self.bpp = 4 if (flags & 1) else 8
+        self.has_runs = (flags & 2) != 0
         self.colors = colors
         self.pix_off = pix_off
+        self.pix_size = _u32(data, 28)
         self.palettes = []
         self.palettes_565 = []
         for p in range(n_pal):
@@ -560,6 +562,16 @@ class PixIdx:
                 pal[i] = _rgb565_to_888(val)
             self.palettes.append(pal)
             self.palettes_565.append(pal565)
+        self.pair_bytes = []
+        for pal565 in self.palettes_565:
+            raw = bytearray(len(pal565) * 2)
+            i = 0
+            while i < len(pal565):
+                v = pal565[i]
+                raw[i * 2] = v & 0xFF
+                raw[i * 2 + 1] = (v >> 8) & 0xFF
+                i += 1
+            self.pair_bytes.append(raw)
         self.frames = []
         self.by_name = {}
         for n in range(n_frames):
@@ -577,8 +589,23 @@ class PixIdx:
             pal_id = data[eoff + 30]
             fr_flags = data[eoff + 31]
             fr = PixFrame(name, off, w, h, dur, ox, oy, pal_id, fr_flags)
+            fr.nruns = 0
+            fr.runs = b""
             self.frames.append(fr)
             self.by_name[name] = fr
+        if self.has_runs:
+            at = self.pix_off + self.pix_size
+            for fr in self.frames:
+                if at + 2 > len(data):
+                    break
+                nruns = _u16(data, at)
+                at += 2
+                nbytes = nruns * 5
+                if at + nbytes > len(data):
+                    break
+                fr.nruns = nruns
+                fr.runs = memoryview(data)[at:at + nbytes]
+                at += nbytes
         self.cycles = {}
         for fr in self.frames:
             name = fr.name
@@ -767,36 +794,44 @@ def blit_ocean_window(lcd, tile, tw, th, scroll, window, vw=W):
 
 
 def push_rgb565_window(lcd, window, vw, th):
-    """Push a precomposed RGB565 window as one image copy.
+    """Hand the precomposed RGB565 buffer to the panel.
 
-    Strips keep the face button live if the panel transfer is slow. A driver
-    that rejects a strip falls back to one full pushImage, same pixels.
+    One pushImage of the bytearray is the fast path. Memoryview strips were
+    a second Python call per 16 rows, and a driver that rejects a view never
+    got as far as refresh_ok even when fillRect could still paint the frame.
+    A rejected full buffer falls back to exact-sized bytearray strips, then
+    writePixels. The face button is polled once around the transfer; the
+    main loop polls it every iteration as well.
     """
     if vw <= 0 or th <= 0:
         return False
+    try:
+        _note_c("push_in")
+    except Exception:
+        pass
     if hasattr(lcd, "pushImage"):
         try:
-            # Views of the stable window, so a strip cannot race a reused scratch.
-            mv = memoryview(window)
-            step = 16
+            lcd.pushImage(0, 0, vw, th, window)
+            _service()
+            return True
+        except Exception:
+            pass
+        try:
             y = 0
+            step = 16
             while y < th:
                 h = th - y
                 if h > step:
                     h = step
                 off = y * vw * 2
                 n = h * vw * 2
-                lcd.pushImage(0, y, vw, h, mv[off:off + n])
+                strip = bytearray(window[off:off + n])
+                lcd.pushImage(0, y, vw, h, strip)
                 y += h
-                _service()
+            _service()
             return True
         except Exception:
-            try:
-                lcd.pushImage(0, 0, vw, th, window)
-                _service()
-                return True
-            except Exception:
-                pass
+            pass
     if hasattr(lcd, "writePixels"):
         try:
             if hasattr(lcd, "setAddrWindow"):
@@ -1073,8 +1108,40 @@ def _make_stamp(tile, tw, pts, factor):
             sbuf[di * 2] = val & 0xFF
             sbuf[di * 2 + 1] = (val >> 8) & 0xFF
             mask[di >> 3] |= 1 << (di & 7)
-        stamps.append((factor, x0, y0, sw, sh, sbuf, mask))
+        spans = _opaque_spans(mask, sw, sh)
+        stamps.append((factor, x0, y0, sw, sh, sbuf, mask, spans))
     return stamps
+
+
+def _opaque_spans(mask, sw, sh):
+    """Horizontal opaque runs. 4 bytes each: x u16 LE, y, len. Built once."""
+    out = bytearray()
+    y = 0
+    while y < sh:
+        row = y * sw
+        x = 0
+        while x < sw:
+            di = row + x
+            if (mask[di >> 3] & (1 << (di & 7))) == 0:
+                x += 1
+                continue
+            x1 = x + 1
+            limit = x + 255
+            if limit > sw:
+                limit = sw
+            while x1 < limit:
+                di2 = row + x1
+                if (mask[di2 >> 3] & (1 << (di2 & 7))) == 0:
+                    break
+                x1 += 1
+            ln = x1 - x
+            out.append(x & 0xFF)
+            out.append((x >> 8) & 0xFF)
+            out.append(y & 0xFF)
+            out.append(ln & 0xFF)
+            x = x1
+        y += 1
+    return out
 
 
 # Face-button hook and the idle watchdog. Both stay None until main() arms
@@ -1302,7 +1369,7 @@ def _install_ota_fetch_timeout(mod):
 
 def _blit_stamp_py(window, vw, tw, stamp, scroll):
     """V12 scenery blit. The viper path has to match these pixels."""
-    factor, ox, oy, sw, sh, sbuf, mask = stamp
+    factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
     off = int(scroll * factor) % tw
     if off < 0:
         off += tw
@@ -1346,7 +1413,7 @@ def _blit_stamp(window, vw, tw, stamp, scroll):
         kind = _ensure_scenery()
     if kind == "viper":
         try:
-            factor, ox, oy, sw, sh, sbuf, mask = stamp
+            factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
             off = _norm_off(scroll * factor, tw)
             _blit_stamp_viper(window, vw, tw, sbuf, mask, sw, sh, ox, oy, off)
             return
@@ -1648,7 +1715,7 @@ def _stamp_screen_rects(ox, oy, sw, sh, off, tw, vw, vh):
 
 def _blit_stamp_clip_py(window, vw, tw, stamp, scroll, clip):
     """Stamp pixels that land inside clip. Matches _blit_stamp_py inside that box."""
-    factor, ox, oy, sw, sh, sbuf, mask = stamp
+    factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
     cx, cy, cw, ch = clip
     if cw <= 0 or ch <= 0 or sw <= 0 or sh <= 0:
         return
@@ -1727,7 +1794,7 @@ def _blit_stamp_clip(window, vw, tw, stamp, scroll, clip):
         kind = _ensure_scenery()
     if kind == "viper":
         try:
-            factor, ox, oy, sw, sh, sbuf, mask = stamp
+            factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
             cx, cy, cw, ch = clip
             off = _norm_off(scroll * factor, tw)
             _blit_stamp_clip_viper(
@@ -2034,15 +2101,19 @@ def _drop_native():
     _GH_KIND = "py"
 
 
-def _note_presented():
-    """One C line after the playfield bytes have been accepted by the panel."""
+def _note_c(name):
     gh = _GH
     if gh is None:
         return
-    fn = getattr(gh, "refresh_ok", None)
+    fn = getattr(gh, name, None)
     if fn is None:
         return
     fn()
+
+
+def _note_presented():
+    """present-ok then refresh ok, after pushImage has accepted the buffer."""
+    _note_c("refresh_ok")
 
 
 _load_native()
@@ -4494,8 +4565,21 @@ class Sprite:
         rings_us = 0
         for p in places:
             ts = _mono_us()
-            rgb, mask = self._native_views(p[5], p[6])
-            gh.stamp(window, vw, vh, rgb, mask, p[5].w, p[5].h, p[1], p[2])
+            fr = p[5]
+            if fr.nruns and hasattr(gh, "stamp_runs"):
+                if p[6] > 0:
+                    pairs = _tint_pair_bytes(self.pack, fr, p[6])
+                else:
+                    pal_id = fr.pal_id
+                    if pal_id < 0 or pal_id >= len(self.pack.pair_bytes):
+                        pal_id = 0
+                    pairs = self.pack.pair_bytes[pal_id]
+                gh.stamp_runs(
+                    window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2, p[1], p[2]
+                )
+            else:
+                rgb, mask = self._native_views(fr, p[6])
+                gh.stamp(window, vw, vh, rgb, mask, fr.w, fr.h, p[1], p[2])
             dt = _us_diff(_mono_us(), ts)
             if dt < 0:
                 dt = 0

@@ -112,6 +112,9 @@ Host check, from this repo:
 python3 host_compare_v16.py
 ```
 
-`pixidx.bin` is unchanged
-(`dda4ea1e1f3249adc8bccb8fc9fe07bb446fb569d5abb884bd1bf83cfe4ba47e`,
-107656 bytes). Device secrets are never stored here.
+`pixidx.bin` keeps the same PIX6 pixels (including the HUD ring highlight).
+Flag bit 1 adds a horizontal-run table after the pixel blob so the C
+stamp path does not scan indices every frame. The file is 216653 bytes,
+sha256 `f33a0418a01743d405be8cee372a3ad0b8c3d72efbc8e2f0f95720468cb2c1c0`.
+`tools/pix6_runs.py` rebuilds that table and writes the saved hud_ring
+map back first. Device secrets are never stored here.

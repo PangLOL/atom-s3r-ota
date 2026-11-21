@@ -121,6 +121,15 @@ static mp_obj_t gh_compose(size_t n_args, const mp_obj_t *args) {
         if (i < noff) {
             off = arg_int(offs[i]);
         }
+        if (len >= 8) {
+            mp_buffer_info_t spans;
+            need_buf(item[7], &spans, 0);
+            if (spans.len >= 4) {
+                gh_blit_span_runs(win.buf, vw, th, tw, sbuf.buf, sw, sh,
+                                  spans.buf, (int)(spans.len / 4), ox, oy, off);
+                continue;
+            }
+        }
         gh_blit_stamp(win.buf, vw, th, tw, sbuf.buf, mask.buf, sw, sh, ox, oy, off);
     }
     if (th >= 64) {
@@ -176,6 +185,33 @@ static mp_obj_t gh_stamp(size_t n_args, const mp_obj_t *args) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_stamp_obj, 9, 9, gh_stamp);
+
+static mp_obj_t gh_stamp_runs_fn(size_t n_args, const mp_obj_t *args) {
+    mp_buffer_info_t win, runs, pairs;
+    int vw, vh, nruns, ncolors, x, y;
+    (void)n_args;
+    need_buf(args[0], &win, 1);
+    vw = arg_int(args[1]);
+    vh = arg_int(args[2]);
+    need_buf(args[3], &runs, 0);
+    nruns = arg_int(args[4]);
+    need_buf(args[5], &pairs, 0);
+    ncolors = arg_int(args[6]);
+    x = arg_int(args[7]);
+    y = arg_int(args[8]);
+    if (vw > 0 && vh > 0 && nruns > 0) {
+        need_len(&win, (size_t)vw * (size_t)vh * 2, "window");
+        gh_stamp_runs(win.buf, vw, vh, runs.buf, nruns, pairs.buf, ncolors, x, y);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_stamp_runs_obj, 9, 9, gh_stamp_runs_fn);
+
+static mp_obj_t gh_push_in(void) {
+    mp_printf(&mp_plat_print, "push-in\n");
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(gh_push_in_obj, gh_push_in);
 
 static mp_obj_t gh_expand(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t src, pairs, dst;
@@ -255,6 +291,8 @@ mp_obj_t mpy_init(mp_obj_fun_bc_t *self, size_t n_args, size_t n_kw, mp_obj_t *a
     mp_store_global(MP_QSTR_compose, MP_OBJ_FROM_PTR(&gh_compose_obj));
     mp_store_global(MP_QSTR_copy, MP_OBJ_FROM_PTR(&gh_copy_obj));
     mp_store_global(MP_QSTR_stamp, MP_OBJ_FROM_PTR(&gh_stamp_obj));
+    mp_store_global(MP_QSTR_stamp_runs, MP_OBJ_FROM_PTR(&gh_stamp_runs_obj));
+    mp_store_global(MP_QSTR_push_in, MP_OBJ_FROM_PTR(&gh_push_in_obj));
     mp_store_global(MP_QSTR_expand, MP_OBJ_FROM_PTR(&gh_expand_obj));
     mp_store_global(MP_QSTR_fx, MP_OBJ_FROM_PTR(&gh_fx_obj));
     mp_store_global(MP_QSTR_digits, MP_OBJ_FROM_PTR(&gh_digits_obj));

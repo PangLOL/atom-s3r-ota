@@ -28,6 +28,20 @@ void gh_stamp_sprite(uint8_t *window, int vw, int vh,
                      const uint8_t *rgb, const uint8_t *mask,
                      int sw, int sh, int dest_x, int dest_y);
 
+/* Indexed runs: 5 bytes each, x u16 LE, y u8, len u8, palette index u8.
+   pairs is LE RGB565, 2 bytes per index. */
+void gh_stamp_runs(uint8_t *window, int vw, int vh,
+                   const uint8_t *runs, int nruns,
+                   const uint8_t *pairs, int ncolors,
+                   int dest_x, int dest_y);
+
+/* Opaque spans in a scenery stamp: 4 bytes each, x u16 LE, y u8, len u8.
+   Colors are copied from sbuf. Same wrap candidates as gh_blit_stamp. */
+void gh_blit_span_runs(uint8_t *window, int vw, int vh, int tw,
+                       const uint8_t *sbuf, int sw, int sh,
+                       const uint8_t *runs, int nruns,
+                       int ox, int oy, int off);
+
 void gh_expand_indexed(const uint8_t *src, int stride, int bpp,
                        int w, int h,
                        const uint8_t *pairs, int ncolors,

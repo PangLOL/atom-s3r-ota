@@ -161,7 +161,7 @@ def main():
     raw = open(os.path.join(ROOT, "pixidx.bin"), "rb").read()
     digest = hashlib.sha256(raw).hexdigest()
     assert digest == fw.PIXIDX_SHA256
-    assert len(raw) == fw.PIXIDX_SIZE == 107656
+    assert len(raw) == fw.PIXIDX_SIZE
     pack = fw.PixIdx(raw)
     # Cache prepare runs the viper self-test. Kind is set before any frame.
     assert fw._SCENERY_KIND is None or fw._SCENERY_KIND in ("py", "viper")

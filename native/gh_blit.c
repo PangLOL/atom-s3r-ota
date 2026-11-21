@@ -532,6 +532,124 @@ void gh_stamp_sprite(uint8_t *window, int vw, int vh,
     }
 }
 
+static void fill_run565(uint8_t *window, int vw, int vh,
+                        int x, int y, int len,
+                        uint8_t lo, uint8_t hi) {
+    int i;
+    uint8_t *p;
+    if (len < 1 || y < 0 || y >= vh) {
+        return;
+    }
+    if (x < 0) {
+        len += x;
+        x = 0;
+    }
+    if (x >= vw || len < 1) {
+        return;
+    }
+    if (x + len > vw) {
+        len = vw - x;
+    }
+    if (len < 1) {
+        return;
+    }
+    p = window + ((y * vw + x) * 2);
+    for (i = 0; i < len; i++) {
+        p[0] = lo;
+        p[1] = hi;
+        p += 2;
+    }
+}
+
+void gh_stamp_runs(uint8_t *window, int vw, int vh,
+                   const uint8_t *runs, int nruns,
+                   const uint8_t *pairs, int ncolors,
+                   int dest_x, int dest_y) {
+    int i;
+    if (window == 0 || runs == 0 || pairs == 0 || nruns <= 0 || vw <= 0 || vh <= 0) {
+        return;
+    }
+    for (i = 0; i < nruns; i++) {
+        const uint8_t *rec = runs + (i * 5);
+        int rx = (int)rec[0] | ((int)rec[1] << 8);
+        int ry = (int)rec[2];
+        int len = (int)rec[3];
+        int idx = (int)rec[4];
+        uint8_t lo;
+        uint8_t hi;
+        if (len < 1 || idx <= 0 || idx >= ncolors) {
+            continue;
+        }
+        lo = pairs[idx * 2];
+        hi = pairs[idx * 2 + 1];
+        fill_run565(window, vw, vh, dest_x + rx, dest_y + ry, len, lo, hi);
+    }
+}
+
+void gh_blit_span_runs(uint8_t *window, int vw, int vh, int tw,
+                       const uint8_t *sbuf, int sw, int sh,
+                       const uint8_t *runs, int nruns,
+                       int ox, int oy, int off) {
+    int sx;
+    int k;
+    if (window == 0 || sbuf == 0 || runs == 0 || nruns <= 0 || sw <= 0 || sh <= 0 || vw <= 0 || tw <= 0) {
+        return;
+    }
+    sx = ox - off;
+    for (k = 0; k < 3; k++) {
+        int cand;
+        int i;
+        if (k == 0) {
+            cand = sx;
+        } else if (k == 1) {
+            cand = sx - tw;
+        } else {
+            cand = sx + tw;
+        }
+        if (cand + sw <= 0 || cand >= vw) {
+            continue;
+        }
+        for (i = 0; i < nruns; i++) {
+            const uint8_t *rec = runs + (i * 4);
+            int rx = (int)rec[0] | ((int)rec[1] << 8);
+            int ry = (int)rec[2];
+            int len = (int)rec[3];
+            int src_x;
+            int wy;
+            int wx;
+            const uint8_t *src;
+            if (len < 1 || ry < 0 || ry >= sh || rx < 0 || rx >= sw) {
+                continue;
+            }
+            if (rx + len > sw) {
+                len = sw - rx;
+            }
+            wy = oy + ry;
+            if (wy < 0 || wy >= vh) {
+                continue;
+            }
+            src_x = rx;
+            wx = cand + rx;
+            if (wx < 0) {
+                src_x -= wx;
+                len += wx;
+                wx = 0;
+            }
+            if (wx >= vw || len < 1) {
+                continue;
+            }
+            if (wx + len > vw) {
+                len = vw - wx;
+            }
+            if (len < 1) {
+                continue;
+            }
+            src = sbuf + ((ry * sw + src_x) * 2);
+            memcpy(window + ((wy * vw + wx) * 2), src, (size_t)len * 2);
+        }
+    }
+}
+
 void gh_expand_indexed(const uint8_t *src, int stride, int bpp,
                        int w, int h,
                        const uint8_t *pairs, int ncolors,
