@@ -98,7 +98,10 @@ run at idle or while moving unless the heap is under 64 KB, so `gc`
 stays 0.0 on the bench and on a drive when memory is healthy. Presents
 aim for the 33 ms ring step. The wait is one sleep_us of the
 microseconds left after the paint, so a 10 ms tick cannot round a
-12 ms paint into a 30 ms sleep. A late
+12 ms paint into a 30 ms sleep. Once a second, when USB CDC can take
+it, a `brk` line lists average/max milliseconds for each other call
+in the loop (`sleep`, `m5`, `sonic`, `push`, and the rest) plus `left`
+for time that no call named. A late
 frame slips that deadline instead of queueing
 another present. Rings and Sonic advance one frame per present;
 leftover time is not spent on a second step. Scroll still uses the

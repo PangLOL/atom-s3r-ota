@@ -1147,6 +1147,14 @@ def _print_gap():
 
 
 def push_rgb565_window(lcd, window, vw, th):
+    _brk_enter("push")
+    try:
+        return _push_rgb565_window(lcd, window, vw, th)
+    finally:
+        _brk_exit()
+
+
+def _push_rgb565_window(lcd, window, vw, th):
     """Hand a finished RGB565 buffer to the panel.
 
     The caller copies into this buffer only after compose, stamp, fx and
@@ -1604,6 +1612,15 @@ def _stdout_can_write():
     0 still prints. Counters stay put when this returns False.
     """
     global _STDOUT_POLL
+    _brk_enter("cdc")
+    try:
+        return _stdout_can_write_body()
+    finally:
+        _brk_exit()
+
+
+def _stdout_can_write_body():
+    global _STDOUT_POLL
     if _STDOUT_POLL == 2:
         return True
     try:
@@ -1636,12 +1653,16 @@ def _stdout_can_write():
 
 
 def _feed_wdt():
-    wdt = _WDT
-    if wdt is not None:
-        try:
-            wdt.feed()
-        except Exception:
-            pass
+    _brk_enter("wdt")
+    try:
+        wdt = _WDT
+        if wdt is not None:
+            try:
+                wdt.feed()
+            except Exception:
+                pass
+    finally:
+        _brk_exit()
 
 
 def _service():
@@ -1650,13 +1671,17 @@ def _service():
     ButtonWatch ignores calls closer than FRAME_MIN_MS, so a paint can
     still call this without stacking M5.update on the frame.
     """
-    _feed_wdt()
-    hook = _BTN_HOOK
-    if hook is not None:
-        try:
-            hook()
-        except Exception:
-            pass
+    _brk_enter("svc")
+    try:
+        _feed_wdt()
+        hook = _BTN_HOOK
+        if hook is not None:
+            try:
+                hook()
+            except Exception:
+                pass
+    finally:
+        _brk_exit()
 
 
 def _init_wdt():
@@ -1963,6 +1988,175 @@ def _us_diff(later, earlier):
     if fn is not None:
         return fn(later, earlier)
     return later - earlier
+
+
+# Once-a-second breakdown of the present loop. The `timing` line stays
+# compose+stamp+push. These buckets are the calls that line does not
+# cover, plus the paint pieces inside that total, so `left` is the part
+# of the frame period that no probe named. avg/max are milliseconds.
+# A full CDC skips the print and keeps the counters.
+_BRK_ORDER = (
+    "sleep", "wdt", "frames", "serial", "cdc", "m5", "poll",
+    "can", "sweep", "auto", "ota", "pix", "adv", "plan",
+    "compose", "sonic", "hud", "rings", "fx", "dig", "svc",
+    "copy", "fault", "push", "fill", "flush", "gauge", "gc", "timing",
+    "draw", "tick", "pace",
+)
+_BRK_SUM = {}
+_BRK_MAX = {}
+_BRK_FR = {}
+for _brk_name in _BRK_ORDER:
+    _BRK_SUM[_brk_name] = 0
+    _BRK_MAX[_brk_name] = 0
+    _BRK_FR[_brk_name] = 0
+_BRK_SUM["left"] = 0
+_BRK_SUM["over"] = 0
+_BRK_MAX["left"] = 0
+_BRK_MAX["over"] = 0
+_BRK_ST = [None] * 16
+_BRK_STN = 0
+_BRK_NAME = None
+_BRK_AT = 0
+_BRK_N = 0
+_BRK_WALL = 0
+_BRK_WALL_MAX = 0
+_BRK_T0 = 0
+
+
+def _brk_add(name, us):
+    if us < 0:
+        us = 0
+    if name not in _BRK_FR:
+        return
+    _BRK_FR[name] = _BRK_FR[name] + us
+
+
+def _brk_enter(name):
+    """Pause the open bucket and start `name`. Nested calls stay exclusive."""
+    global _BRK_NAME, _BRK_AT, _BRK_STN
+    now = _mono_us()
+    cur = _BRK_NAME
+    if cur is not None:
+        _brk_add(cur, _us_diff(now, _BRK_AT))
+        if _BRK_STN < len(_BRK_ST):
+            _BRK_ST[_BRK_STN] = cur
+            _BRK_STN += 1
+    _BRK_NAME = name
+    _BRK_AT = now
+
+
+def _brk_exit():
+    global _BRK_NAME, _BRK_AT, _BRK_STN
+    now = _mono_us()
+    cur = _BRK_NAME
+    if cur is not None:
+        _brk_add(cur, _us_diff(now, _BRK_AT))
+    if _BRK_STN > 0:
+        _BRK_STN -= 1
+        _BRK_NAME = _BRK_ST[_BRK_STN]
+        _BRK_ST[_BRK_STN] = None
+        _BRK_AT = now
+    else:
+        _BRK_NAME = None
+
+
+def _brk_reset_sums():
+    global _BRK_N, _BRK_WALL, _BRK_WALL_MAX
+    for name in _BRK_SUM:
+        _BRK_SUM[name] = 0
+        _BRK_MAX[name] = 0
+    _BRK_N = 0
+    _BRK_WALL = 0
+    _BRK_WALL_MAX = 0
+
+
+def _brk_reset_all():
+    global _BRK_NAME, _BRK_AT, _BRK_STN, _BRK_T0
+    _brk_reset_sums()
+    for name in _BRK_FR:
+        _BRK_FR[name] = 0
+    i = 0
+    while i < _BRK_STN:
+        _BRK_ST[i] = None
+        i += 1
+    _BRK_STN = 0
+    _BRK_NAME = None
+    _BRK_AT = 0
+    _BRK_T0 = 0
+
+
+def _brk_commit(wall):
+    """Close one frame. `left` is wall minus the named buckets."""
+    global _BRK_N, _BRK_WALL, _BRK_WALL_MAX
+    if wall < 0:
+        wall = 0
+    total = 0
+    for name in _BRK_ORDER:
+        us = _BRK_FR[name]
+        _BRK_FR[name] = 0
+        if us <= 0:
+            continue
+        total += us
+        _BRK_SUM[name] = _BRK_SUM[name] + us
+        if us > _BRK_MAX[name]:
+            _BRK_MAX[name] = us
+    left = wall - total
+    if left < 0:
+        over = -left
+        left = 0
+    else:
+        over = 0
+    _BRK_SUM["left"] = _BRK_SUM["left"] + left
+    _BRK_SUM["over"] = _BRK_SUM["over"] + over
+    if left > _BRK_MAX["left"]:
+        _BRK_MAX["left"] = left
+    if over > _BRK_MAX["over"]:
+        _BRK_MAX["over"] = over
+    if wall > _BRK_WALL_MAX:
+        _BRK_WALL_MAX = wall
+    _BRK_WALL += wall
+    _BRK_N += 1
+
+
+def _brk_field(name, total, n, peak):
+    return "%s %s/%s" % (
+        name,
+        _fmt_tenths(_avg_tenths_ms(total, n)),
+        _fmt_tenths(_avg_tenths_ms(peak, 1)),
+    )
+
+
+def _brk_line():
+    """`brk n=22 wall 46.1/48.0 sleep 0.0/0.1 ... left 27.0/31.0 over 0.0/0.0`.
+
+    Each field is average/max milliseconds. `wall` is the loop period.
+    `left` was not inside any named call. `over` means the named calls
+    summed past the period.
+    """
+    n = _BRK_N
+    parts = ["brk n=%d" % n, _brk_field("wall", _BRK_WALL, n, _BRK_WALL_MAX)]
+    for name in _BRK_ORDER:
+        parts.append(_brk_field(name, _BRK_SUM[name], n, _BRK_MAX[name]))
+    parts.append(_brk_field("left", _BRK_SUM["left"], n, _BRK_MAX["left"]))
+    parts.append(_brk_field("over", _BRK_SUM["over"], n, _BRK_MAX["over"]))
+    return " ".join(parts)
+
+
+def _brk_maybe_print(now):
+    """One line a second, and only when USB CDC can take it."""
+    global _BRK_T0
+    if _BRK_T0 == 0:
+        _BRK_T0 = now
+        return
+    if _ms_diff(now, _BRK_T0) < 1000:
+        return
+    if _BRK_N <= 0:
+        return
+    if not _stdout_can_write():
+        return
+    print(_brk_line())
+    _brk_reset_sums()
+    _BRK_T0 = now
 
 
 def draw_due(now, next_draw):
@@ -2717,17 +2911,25 @@ _presented_t0 = 0
 def _report_presented(now):
     """One line per second: playfield frames the panel accepted in that second."""
     global _presented_n, _presented_t0
-    if _presented_t0 == 0:
+    _brk_enter("frames")
+    try:
+        if _presented_t0 == 0:
+            _presented_t0 = now
+            return
+        if _ms_diff(now, _presented_t0) < 1000:
+            return
+        # A full USB CDC must not stall the present. Retry on a later pass.
+        if not _stdout_can_write():
+            return
+        _brk_enter("serial")
+        try:
+            print("frames %d total %d" % (_presented_n, _presented_total))
+        finally:
+            _brk_exit()
+        _presented_n = 0
         _presented_t0 = now
-        return
-    if _ms_diff(now, _presented_t0) < 1000:
-        return
-    # A full USB CDC must not stall the present. Retry on a later pass.
-    if not _stdout_can_write():
-        return
-    print("frames %d total %d" % (_presented_n, _presented_total))
-    _presented_n = 0
-    _presented_t0 = now
+    finally:
+        _brk_exit()
 
 
 _load_native()
@@ -4025,6 +4227,13 @@ class Sprite:
         exists, so a later held frame does not keep a stale mark. Stamping
         the live playfield itself forces the next frame to recompose.
         """
+        _brk_enter("fault")
+        try:
+            return self._stamp_fault_at(buf, fault)
+        finally:
+            _brk_exit()
+
+    def _stamp_fault_at(self, buf, fault):
         if buf is None:
             return buf
         if not fault:
@@ -4040,24 +4249,28 @@ class Sprite:
         return buf
 
     def draw(self, lcd, values, now=0, fault=False):
-        speed = values.get("spd") or 0.0
-        tps = values.get("tps") or 0.0
-        clt = values.get("clt") or 0.0
-        self._corner_pushed = False
-        self.body_col = sonic_body_color(clt, now)
-        if self.pack is not None:
-            # Ocean and sprite caches are prepared once at pack load
-            # (_sync_ground), not on every frame.
-            self._draw_sheet_scene(lcd, speed, clt, now, fault)
-        else:
-            self._playfield_stamped = False
-            self._draw_background(lcd)
-            tip_y = SONIC_MID_Y
-            self._draw_sonic(lcd, speed, tps, clt)
-            # Aura is layered on top of Sonic at the locked tip.
-            self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
-            self.boost.draw_front(lcd, SW_TIP_X, tip_y)
-        self._draw_ring_hud(lcd)
+        _brk_enter("draw")
+        try:
+            speed = values.get("spd") or 0.0
+            tps = values.get("tps") or 0.0
+            clt = values.get("clt") or 0.0
+            self._corner_pushed = False
+            self.body_col = sonic_body_color(clt, now)
+            if self.pack is not None:
+                # Ocean and sprite caches are prepared once at pack load
+                # (_sync_ground), not on every frame.
+                self._draw_sheet_scene(lcd, speed, clt, now, fault)
+            else:
+                self._playfield_stamped = False
+                self._draw_background(lcd)
+                tip_y = SONIC_MID_Y
+                self._draw_sonic(lcd, speed, tps, clt)
+                # Aura is layered on top of Sonic at the locked tip.
+                self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
+                self.boost.draw_front(lcd, SW_TIP_X, tip_y)
+            self._draw_ring_hud(lcd)
+        finally:
+            _brk_exit()
 
     def _field_ring_xs(self, off):
         period = RING_PERIOD
@@ -4606,6 +4819,13 @@ class Sprite:
         stamp_baked(window, vw, vh, rgb, mask, fr.w, fr.h, x0, y0)
 
     def _plan_places(self, amount):
+        _brk_enter("plan")
+        try:
+            return self._plan_places_at(amount)
+        finally:
+            _brk_exit()
+
+    def _plan_places_at(self, amount):
         """Screen rects in stamp order. Top-left is after the frame origin.
 
         Order matches _stamp_playfield_sprites: rings, sparkles, Sonic,
@@ -5023,7 +5243,11 @@ class Sprite:
             return
         gc_us = 0
         if self._collect_due(speed, now):
-            gc_us = self._timing_gc()
+            _brk_enter("gc")
+            try:
+                gc_us = self._timing_gc()
+            finally:
+                _brk_exit()
             self._tim_gc_at = now
             self._gc_pending = gc_us
             _service()
@@ -5037,7 +5261,9 @@ class Sprite:
         fps_tenths = 0
         if elapsed > 0:
             fps_tenths = (n * 10000) // elapsed
-        print(
+        _brk_enter("serial")
+        try:
+            print(
             "timing n=%d compose %s stamp %s push %s fill %s flush %s gc %s total %s fps %s hold %d hud %s sonic %s rings %s shift %d full %d"
             % (
                 n,
@@ -5056,7 +5282,9 @@ class Sprite:
                 self._tim_shift,
                 self._tim_full,
             )
-        )
+            )
+        finally:
+            _brk_exit()
         self._tim_n = 0
         self._tim_compose = 0
         self._tim_stamp = 0
@@ -5099,6 +5327,13 @@ class Sprite:
         return rgb, mask
 
     def _fill_native_offs(self, scroll):
+        _brk_enter("plan")
+        try:
+            return self._fill_native_offs_at(scroll)
+        finally:
+            _brk_exit()
+
+    def _fill_native_offs_at(self, scroll):
         """Write stamp offsets into _off_buf. Returns cloud, water, ground."""
         tw = self.ocean_tw
         offs = self._off_buf
@@ -5117,6 +5352,13 @@ class Sprite:
         return off_c, off_w, off_g
 
     def _native_same(self, off_c, off_w, off_g, amount):
+        _brk_enter("plan")
+        try:
+            return self._native_same_at(off_c, off_w, off_g, amount)
+        finally:
+            _brk_exit()
+
+    def _native_same_at(self, off_c, off_w, off_g, amount):
         if not self._native_ready:
             return False
         if self._parallax:
@@ -5202,13 +5444,17 @@ class Sprite:
         tile = self.ocean_rgb565
         off_c, off_w, off_g = self._fill_native_offs(self.scroll)
         t0 = _mono_us()
-        if self._parallax:
-            gh.compose(
-                tile, tw, th, off_c, off_w, off_g, HORIZON_Y, GRASS_Y,
-                self.ocean_stamps, self._off_buf, window,
-            )
-        else:
-            gh.copy(tile, tw, th, off_c, window, vw)
+        _brk_enter("compose")
+        try:
+            if self._parallax:
+                gh.compose(
+                    tile, tw, th, off_c, off_w, off_g, HORIZON_Y, GRASS_Y,
+                    self.ocean_stamps, self._off_buf, window,
+                )
+            else:
+                gh.copy(tile, tw, th, off_c, window, vw)
+        finally:
+            _brk_exit()
         t1 = _mono_us()
         _service()
         places = self._plan_places(amount)
@@ -5216,22 +5462,29 @@ class Sprite:
         sonic_us = 0
         rings_us = 0
         for p in places:
+            kind = p[7]
+            if kind != "sonic" and kind != "hud" and kind != "rings":
+                kind = "rings"
             ts = _mono_us()
-            fr = p[5]
-            if fr.nruns and hasattr(gh, "stamp_runs"):
-                if p[6] > 0:
-                    pairs = _tint_pair_bytes(self.pack, fr, p[6])
+            _brk_enter(kind)
+            try:
+                fr = p[5]
+                if fr.nruns and hasattr(gh, "stamp_runs"):
+                    if p[6] > 0:
+                        pairs = _tint_pair_bytes(self.pack, fr, p[6])
+                    else:
+                        pal_id = fr.pal_id
+                        if pal_id < 0 or pal_id >= len(self.pack.pair_bytes):
+                            pal_id = 0
+                        pairs = self.pack.pair_bytes[pal_id]
+                    gh.stamp_runs(
+                        window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2, p[1], p[2]
+                    )
                 else:
-                    pal_id = fr.pal_id
-                    if pal_id < 0 or pal_id >= len(self.pack.pair_bytes):
-                        pal_id = 0
-                    pairs = self.pack.pair_bytes[pal_id]
-                gh.stamp_runs(
-                    window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2, p[1], p[2]
-                )
-            else:
-                rgb, mask = self._native_views(fr, p[6])
-                gh.stamp(window, vw, vh, rgb, mask, fr.w, fr.h, p[1], p[2])
+                    rgb, mask = self._native_views(fr, p[6])
+                    gh.stamp(window, vw, vh, rgb, mask, fr.w, fr.h, p[1], p[2])
+            finally:
+                _brk_exit()
             dt = _us_diff(_mono_us(), ts)
             if dt < 0:
                 dt = 0
@@ -5246,16 +5499,24 @@ class Sprite:
         if with_fx:
             boost = self.boost
             t_fx = _mono_us()
-            gh.fx(
-                window, vw, vh,
-                boost.aura_i, boost.sw_i, boost.bar_i,
-                AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
-            )
+            _brk_enter("fx")
+            try:
+                gh.fx(
+                    window, vw, vh,
+                    boost.aura_i, boost.sw_i, boost.bar_i,
+                    AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
+                )
+            finally:
+                _brk_exit()
             fx_us = _us_diff(_mono_us(), t_fx)
             if fx_us < 0:
                 fx_us = 0
             t_dig = _mono_us()
-            gh.digits(window, vw, vh, HUD_BAR_POS[0], HUD_BAR_POS[1], int(self.rings) % 1000)
+            _brk_enter("dig")
+            try:
+                gh.digits(window, vw, vh, HUD_BAR_POS[0], HUD_BAR_POS[1], int(self.rings) % 1000)
+            finally:
+                _brk_exit()
             dig_us = _us_diff(_mono_us(), t_dig)
             if dig_us < 0:
                 dig_us = 0
@@ -5275,13 +5536,17 @@ class Sprite:
 
     def _present_copy(self, src):
         """Copy a finished playfield into the buffer the panel will read."""
-        dst = self.present_buf
-        if src is None:
-            return src
-        if dst is None or len(dst) != len(src):
-            return src
-        dst[:] = src
-        return dst
+        _brk_enter("copy")
+        try:
+            dst = self.present_buf
+            if src is None:
+                return src
+            if dst is None or len(dst) != len(src):
+                return src
+            dst[:] = src
+            return dst
+        finally:
+            _brk_exit()
 
     def _draw_native_frame(self, lcd, amount, fault=False):
         """Compose, stamp, and push through C. False falls back to Python."""
@@ -5797,34 +6062,42 @@ class ButtonWatch:
         self._last_poll = None
 
     def poll(self, now=None):
-        if now is None:
-            now = time.ticks_ms()
-        last = self._last_poll
-        if last is not None:
-            gap = time.ticks_diff(now, last)
-            if 0 <= gap < FRAME_MIN_MS:
+        _brk_enter("poll")
+        try:
+            if now is None:
+                now = time.ticks_ms()
+            last = self._last_poll
+            if last is not None:
+                gap = time.ticks_diff(now, last)
+                if 0 <= gap < FRAME_MIN_MS:
+                    return False
+            self._last_poll = now
+            _brk_enter("m5")
+            try:
+                M5.update()
+            finally:
+                _brk_exit()
+            btn = self.btn
+            if btn is None:
                 return False
-        self._last_poll = now
-        M5.update()
-        btn = self.btn
-        if btn is None:
-            return False
-        clicked = False
-        if hasattr(btn, "wasClicked"):
-            try:
-                clicked = bool(btn.wasClicked())
-            except Exception:
-                clicked = False
-        if hasattr(btn, "wasDoubleClicked"):
-            try:
-                extra = bool(btn.wasDoubleClicked())
-            except Exception:
-                extra = False
-            if extra and not clicked:
-                clicked = True
-        if clicked and self.on_press is not None:
-            self.on_press(now)
-        return clicked
+            clicked = False
+            if hasattr(btn, "wasClicked"):
+                try:
+                    clicked = bool(btn.wasClicked())
+                except Exception:
+                    clicked = False
+            if hasattr(btn, "wasDoubleClicked"):
+                try:
+                    extra = bool(btn.wasDoubleClicked())
+                except Exception:
+                    extra = False
+                if extra and not clicked:
+                    clicked = True
+            if clicked and self.on_press is not None:
+                self.on_press(now)
+            return clicked
+        finally:
+            _brk_exit()
 
 
 class Dashboard:
@@ -5853,12 +6126,23 @@ class Dashboard:
         )
 
     def tick(self, values, fault, now):
+        _brk_enter("tick")
+        try:
+            self._tick_body(values, fault, now)
+        finally:
+            _brk_exit()
+
+    def _tick_body(self, values, fault, now):
         self._poll_button(now)
         dt = anim_dt(time.ticks_diff(now, self._last_ms))
         self._last_ms = now
         speed = values.get("spd") or 0.0
         t_adv = _mono_us()
-        self.sprite.advance(speed, dt)
+        _brk_enter("adv")
+        try:
+            self.sprite.advance(speed, dt)
+        finally:
+            _brk_exit()
         _flow_add("adv", _us_diff(_mono_us(), t_adv))
 
         # pushImage already covers y 0-102. Gauges repaint y 103-127.
@@ -5871,7 +6155,11 @@ class Dashboard:
         if not direct:
             _service()
             t0 = _mono_us()
-            surface.fillScreen(COL_BG)
+            _brk_enter("fill")
+            try:
+                surface.fillScreen(COL_BG)
+            finally:
+                _brk_exit()
             fill_us = _us_diff(_mono_us(), t0)
             if fill_us < 0:
                 fill_us = 0
@@ -5885,6 +6173,7 @@ class Dashboard:
         prev = self.lcd
         self.lcd = surface
         t_gauge = _mono_us()
+        _brk_enter("gauge")
         try:
             self._draw_gauges(values)
             if not self.sprite._corner_pushed:
@@ -5894,13 +6183,18 @@ class Dashboard:
         finally:
             self.lcd = prev
             _flow_add("gauge", _us_diff(_mono_us(), t_gauge))
+            _brk_exit()
         if (not direct) and self._use_push:
             _service()
             t0 = _mono_us()
+            _brk_enter("flush")
             try:
-                surface.push(0, 0)
-            except Exception:
-                self._use_push = False
+                try:
+                    surface.push(0, 0)
+                except Exception:
+                    self._use_push = False
+            finally:
+                _brk_exit()
             flush_us = _us_diff(_mono_us(), t0)
             if flush_us < 0:
                 flush_us = 0
@@ -5908,7 +6202,11 @@ class Dashboard:
         if self.sprite._tim_n != noted:
             self.sprite.note_chrome(fill_us, flush_us)
         self._poll_button(now)
-        self.sprite.report_timing(now, speed)
+        _brk_enter("timing")
+        try:
+            self.sprite.report_timing(now, speed)
+        finally:
+            _brk_exit()
 
     def _draw_gauges(self, values):
         """Update the four bars in place.
@@ -6039,6 +6337,7 @@ def main():
         bus = None
 
     while True:
+        iter_us = _mono_us()
         _feed_wdt()
         if next_draw is not None:
             # Sleep the microsecond leftover once. Do not come back and
@@ -6046,7 +6345,11 @@ def main():
             remain = _us_diff(next_draw, _mono_us())
             if remain > 0:
                 _feed_wdt()
-                _sleep_us(remain)
+                _brk_enter("sleep")
+                try:
+                    _sleep_us(remain)
+                finally:
+                    _brk_exit()
         now = time.ticks_ms()
         if present_t0 is None:
             present_t0 = now
@@ -6055,65 +6358,99 @@ def main():
         button.poll(now)
 
         if sweep.active:
-            swept = sweep.step(now)
-            if swept is not None:
-                values.update(swept)
-            fault = False
+            _brk_enter("sweep")
+            try:
+                swept = sweep.step(now)
+                if swept is not None:
+                    values.update(swept)
+                fault = False
+            finally:
+                _brk_exit()
         else:
-            if bus is not None:
-                if pull_frames(bus, values):
-                    last_rx_ms = now
-            fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
+            _brk_enter("can")
+            try:
+                if bus is not None:
+                    if pull_frames(bus, values):
+                        last_rx_ms = now
+                fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
+            finally:
+                _brk_exit()
 
-        start_auto, boot_sweep_armed, sweep_idle_since = auto_sweep_due(
-            now,
-            present_t0,
-            sweep.active,
-            live_can(bus, last_rx_ms, now),
-            boot_sweep_armed,
-            sweep_idle_since,
-        )
-        if start_auto:
-            sweep.start(now)
-            swept = sweep.step(now)
-            if swept is not None:
-                values.update(swept)
-            fault = False
-            print("auto-sweep")
+        _brk_enter("auto")
+        try:
+            start_auto, boot_sweep_armed, sweep_idle_since = auto_sweep_due(
+                now,
+                present_t0,
+                sweep.active,
+                live_can(bus, last_rx_ms, now),
+                boot_sweep_armed,
+                sweep_idle_since,
+            )
+            if start_auto:
+                sweep.start(now)
+                swept = sweep.step(now)
+                if swept is not None:
+                    values.update(swept)
+                fault = False
+                _brk_enter("serial")
+                try:
+                    print("auto-sweep")
+                finally:
+                    _brk_exit()
+        finally:
+            _brk_exit()
 
         if ota_client is not None and (
             last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
         ):
-            last_ota_ms = now
-            _service()
+            _brk_enter("ota")
             try:
-                ota_client.poll(now)
-            except Exception:
-                pass
+                last_ota_ms = now
+                _service()
+                try:
+                    ota_client.poll(now)
+                except Exception:
+                    pass
+            finally:
+                _brk_exit()
 
         if ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
             # Keep retrying while the current pack is missing or was rejected
             # (a leftover V6 file must not block the download).
-            wifi_ok = False
-            if ota_client is not None and hasattr(ota_client, "wifi_connected"):
-                try:
-                    wifi_ok = bool(ota_client.wifi_connected())
-                except Exception:
-                    wifi_ok = False
-            if wifi_ok or ota_client is None:
-                _last_fetch_ms = now
-                try:
-                    fetched = try_fetch_pixidx()
-                except Exception:
-                    fetched = None
-                if fetched is not None:
-                    ui.sprite.pack = fetched
-                    ui.sprite._sync_ground()
+            _brk_enter("pix")
+            try:
+                wifi_ok = False
+                if ota_client is not None and hasattr(ota_client, "wifi_connected"):
+                    try:
+                        wifi_ok = bool(ota_client.wifi_connected())
+                    except Exception:
+                        wifi_ok = False
+                if wifi_ok or ota_client is None:
+                    _last_fetch_ms = now
+                    try:
+                        fetched = try_fetch_pixidx()
+                    except Exception:
+                        fetched = None
+                    if fetched is not None:
+                        ui.sprite.pack = fetched
+                        ui.sprite._sync_ground()
+            finally:
+                _brk_exit()
 
         _flow_add("loop", _us_diff(_mono_us(), loop_mark))
         ui.tick(values, fault, now)
-        next_draw = pace_after(frame_started, _mono_us())
+        _brk_enter("pace")
+        try:
+            next_draw = pace_after(frame_started, _mono_us())
+        finally:
+            _brk_exit()
         loop_mark = _mono_us()
+        _brk_enter("serial")
+        try:
+            _brk_maybe_print(now)
+        finally:
+            _brk_exit()
+        _brk_commit(_us_diff(_mono_us(), iter_us))
 
 
 if __name__ == "__main__":

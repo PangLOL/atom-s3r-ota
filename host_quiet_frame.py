@@ -237,6 +237,38 @@ def main():
         else:
             gc.mem_free = saved_free
 
+    fw._brk_reset_all()
+    fw._brk_add("m5", 12000)
+    fw._brk_add("push", 11000)
+    fw._brk_commit(46000)
+    assert fw._BRK_SUM["m5"] == 12000
+    assert fw._BRK_SUM["push"] == 11000
+    assert fw._BRK_SUM["left"] == 23000
+    assert fw._BRK_SUM["over"] == 0
+    line = fw._brk_line()
+    assert line.startswith("brk n=1 ")
+    assert " wall 46.0/46.0 " in line
+    assert " m5 12.0/12.0 " in line
+    assert " push 11.0/11.0 " in line
+    assert line.endswith("left 23.0/23.0 over 0.0/0.0")
+    fw._brk_reset_all()
+    fw._brk_add("compose", 4000)
+    fw._brk_add("sonic", 3000)
+    fw._brk_add("push", 7000)
+    fw._brk_commit(46000)
+    assert fw._BRK_SUM["left"] == 32000
+    fw._brk_reset_all()
+    fw._brk_add("push", 50000)
+    fw._brk_commit(46000)
+    assert fw._BRK_SUM["over"] == 4000
+    assert fw._BRK_SUM["left"] == 0
+    fw._brk_enter("tick")
+    fw._brk_enter("m5")
+    fw._brk_exit()
+    fw._brk_exit()
+    assert fw._BRK_NAME is None and fw._BRK_STN == 0
+    fw._brk_reset_all()
+
     print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped)
 
 
