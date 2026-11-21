@@ -107,14 +107,14 @@ def main():
     assert stepped == cruise * fw.REFRESH_MS * 0.012
     assert stepped < stalled
 
-    assert fw.collect_due(False, 2000000, 2000) is True
-    assert fw.collect_due(False, 2000000, 500) is False
-    assert fw.collect_due(True, 2000000, 20000) is False
-    assert fw.collect_due(True, 40 * 1024, 2000) is False
-    assert fw.collect_due(True, 40 * 1024, fw.GC_MOVE_MIN_MS) is True
-    assert fw.collect_due(True, fw.GC_CRITICAL_FREE - 1, 0) is True
-    assert fw.collect_due(True, -1, 20000) is False
-    assert fw.collect_due(False, -1, 2000) is True
+    # Healthy heap: no periodic collect at rest or in motion.
+    assert fw.collect_due(2000000, 2000) is False
+    assert fw.collect_due(2000000, 20000) is False
+    # Under 64 KB, wait out the 15 s gap. Under 24 KB, collect now.
+    assert fw.collect_due(40 * 1024, 2000) is False
+    assert fw.collect_due(40 * 1024, fw.GC_MOVE_MIN_MS) is True
+    assert fw.collect_due(fw.GC_CRITICAL_FREE - 1, 0) is True
+    assert fw.collect_due(-1, 20000) is False
 
     import gc
     calls = {"n": 0}
@@ -133,7 +133,24 @@ def main():
         sprite._tim_t0 = 1000
         sprite._tim_gc_at = 0
         sprite.report_timing(3500, 0.0)
+        assert calls["n"] == 0, calls
+        gc.mem_free = lambda: fw.GC_CRITICAL_FREE - 1
+        sprite._tim_n = 4
+        sprite._tim_t0 = 1000
+        sprite._tim_gc_at = 3500
+        sprite.report_timing(3600, 0.0)
         assert calls["n"] == 1, calls
+        gc.mem_free = lambda: 40 * 1024
+        sprite._tim_n = 4
+        sprite._tim_t0 = 1000
+        sprite._tim_gc_at = 3600
+        sprite.report_timing(4000, 0.0)
+        assert calls["n"] == 1, calls
+        sprite._tim_n = 4
+        sprite._tim_t0 = 1000
+        sprite._tim_gc_at = 0
+        sprite.report_timing(3500, 80.0)
+        assert calls["n"] == 2, calls
     finally:
         gc.collect = saved_collect
         if saved_free is None:

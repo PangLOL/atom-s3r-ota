@@ -2,8 +2,8 @@
   "version": 16,
   "name": "2026.11.21-v16",
   "url": "https://panglol.github.io/atom-s3r-ota/main.py",
-  "sha256": "26823857bca8dd781c1c85189dead10fe26327c15748e1fb1318111d1af617e1",
-  "size": 194551,
+  "sha256": "9b2968738f100bec9efe1d458cf9cf3109654fa1db896f6a48b5a840ed903791",
+  "size": 194438,
   "assets": [
     {
       "name": "pixidx.bin",

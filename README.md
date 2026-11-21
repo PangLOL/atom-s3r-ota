@@ -93,9 +93,9 @@ timing n=40 compose 1.2 stamp 0.8 push 3.5 fill 0.0 flush 0.0 gc 0.3 total 5.5 f
 
 `total` is still compose + stamp + push. `hud`, `sonic`, and `rings`
 split the stamp. If the USB CDC has not drained, the print is skipped
-and those counters stay. `gc` is the collect in that window. While
-speed is at least 1 km/h the two-second collect is skipped, so `gc`
-stays 0 on a cruise or a bench sweep unless the heap is low. A frame
+and those counters stay. `gc` is the collect in that window. The two-second collect does not
+run at idle or while moving unless the heap is under 64 KB, so `gc`
+stays 0.0 on the bench and on a drive when memory is healthy. A frame
 gap longer than 50 ms does not fast-forward the scroll. While native
 rendering is on, `shift` stays 0: a frame that
 changed is rebuilt in C rather than band-shifted. `full` counts those

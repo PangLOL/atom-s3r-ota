@@ -99,8 +99,9 @@ REFRESH_MS = 50
 # does not wait out REFRESH_MS. 16 ms is a 60 fps ceiling so a native
 # frame can run at 30-60 fps. It is not a 12-15 fps motion cap.
 FRAME_MIN_MS = 16
-# Full gc.collect while moving was the two-second hitch. Collect when
-# stopped, or while moving only if the heap is actually low.
+# Full gc.collect on the two-second timing line was the idle and cruise
+# hitch. The same rule applies at rest and in motion: collect only when
+# the heap is actually low.
 GC_LOW_FREE = 64 * 1024
 GC_CRITICAL_FREE = 24 * 1024
 GC_MOVE_MIN_MS = 15000
@@ -1961,23 +1962,20 @@ def anim_dt(dt):
     return dt
 
 
-def collect_due(moving, free, since_ms):
+def collect_due(free, since_ms):
     """Whether this window should run gc.collect.
 
-    moving: speed >= 1, the same cutoff advance() uses for idle.
     free: gc.mem_free(), or -1 if it could not be read.
     since_ms: time since the last collect. A large value if none yet.
-    Stopped scenery collects on the two-second cadence. A drive skips
-    that collect unless the heap is low, and a merely-low heap waits
-    GC_MOVE_MIN_MS so the hitch stays rare. Critical free collects now.
+    Speed does not matter. A healthy heap never collects on the timing
+    line, including at 0 km/h. Under GC_LOW_FREE, wait GC_MOVE_MIN_MS.
+    Under GC_CRITICAL_FREE, collect immediately. Unknown free skips.
     """
-    if free >= 0 and free < GC_CRITICAL_FREE:
-        return True
-    if since_ms < 2000:
+    if free < 0:
         return False
-    if not moving:
+    if free < GC_CRITICAL_FREE:
         return True
-    if free >= 0 and free < GC_LOW_FREE and since_ms >= GC_MOVE_MIN_MS:
+    if free < GC_LOW_FREE and since_ms >= GC_MOVE_MIN_MS:
         return True
     return False
 
@@ -4896,9 +4894,8 @@ class Sprite:
         return since
 
     def _collect_due(self, speed, now):
-        if speed is None:
-            speed = 0.0
-        return collect_due(speed >= 1.0, _mem_free(), self._collect_since(now))
+        # speed is unused. Idle and motion share collect_due.
+        return collect_due(_mem_free(), self._collect_since(now))
 
     def report_timing(self, now, speed=0.0):
         """One serial line per 2 seconds. Does not rebuild caches.
@@ -4908,7 +4905,7 @@ class Sprite:
         the playfield shift and the backdrop copies). shift and full count
         backdrop updates. A USB CDC that has not drained the previous line
         skips the print; the counters stay. gc is the collect in this
-        window, or 0 when the scenery is moving and the heap is not low.
+        window, or 0 when the heap is not low, including at 0 km/h.
         """
         n = self._tim_n
         if n <= 0 or self._tim_t0 == 0:
