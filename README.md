@@ -26,38 +26,46 @@ firmware fetches it over Wi-Fi after boot.
 
 `.nojekyll` keeps GitHub Pages from running Jekyll.
 
-## Version 12 is not published
+## Version 15 is not published
 
-This branch is **2026.11.21-v12** (version **12**). It is not the live
-GitHub Pages payload. Do not treat this branch as an OTA update until it
-is merged and the owner publishes it.
+Live GitHub Pages still serve version **12**. This branch is
+**2026.11.21-v15** (version **15**). It is based on the V14 packed-path
+work (PR #10) plus the V15 compositor, and it targets `main` so one pull
+request can carry both. V13 (PR #9) is not included. It is not an OTA
+update until it is merged and the owner publishes it. Do not flash it,
+do not merge it, and do not publish GitHub Pages unless you mean to.
 
-Version 12 keeps the V11 playfield. The 384×103 ocean and the sprite
-cache are still built once when the pack loads. Each frame still pushes
-one 128×103 image. A parallax band is recopied only when
-`int(scroll * factor)` changes. Scenery is restamped only inside the
-rectangles a shifted band or a moved stamp actually dirtied, so the
-pixels match a full V11 compose. Sprite frames that did not change stay
-where they are. A small underlay (9630 bytes) restores the backdrop
-under a sprite that did change: animation, spinning rings, sparkles, or
-the overheat tint. Parked, with nothing in the playfield moving, the
-parallax compose is skipped.
+Version 15 keeps the V14 packed ocean and scenery stamps. `pixidx.bin`
+is the same file. The ocean window stays free of sprites. A band that
+moves by less than a screen is shifted there, and scenery that did not
+ride along is patched, matching a full compose. A second 128-wide
+playfield is the buffer that is pushed. It is shifted the same way, then
+only sprites that are no longer correct are copied from the clean
+backdrop and stamped again: the HUD bar and ring icon while the sky
+under them is still, Sonic when his frame, tint, or the backdrop under
+him changes, and rings and sparkles in their own rects.
+
+The viper scenery and sprite self-tests run while the caches are built,
+not inside the first timed frame. When the playfield image is pushed,
+the full-screen clear and the second canvas flush are still skipped.
+Gauges still repaint y 103–127. The face button is polled through
+compose, blits, flushes, and the OTA check. The OTA client is unchanged
+aside from a timeout on its HTTP fetch. A machine watchdog is armed
+after the boot allocations.
 
 Every two seconds the serial line looks like:
 
 ```text
-timing n=40 compose 1.2 stamp 0.8 push 3.5 gc 0.3 total 5.5 fps 20.0 hold 28
+timing n=40 compose 1.2 stamp 0.8 push 3.5 fill 0.0 flush 0.0 gc 0.3 total 5.5 fps 20.0 hold 28 hud 0.0 sonic 0.4 rings 0.3 shift 38 full 1
 ```
 
-`compose`, `stamp`, `push`, and `total` are average milliseconds per
-frame. `gc` is one `gc.collect()` for that interval. `hold` is how many
-of those frames left the backdrop untouched. Printing the line does not
-rebuild the ocean or the sprite cache.
-
-If the underlay cannot be allocated, drawing stays on the V11 full
-compose. If a later stamp fails, the bake flag is cleared and drawing
-stays on the `fillRect` interpreter. Aura, shockwave, and the gauges are
-unchanged.
+The fields through `hold` are the V14 line (`total` is still compose +
+stamp + push). `hud`, `sonic`, and `rings` split the stamp time. `shift`
+and `full` count backdrop updates in that window. If the USB CDC has not
+drained, the print is skipped and those counters stay, so a host that is
+not reading cannot stall the loop. `gc` is still one `gc.collect()` on
+that cadence, including while a print is waiting. Printing the line does
+not rebuild the ocean or the sprite cache.
 
 `pixidx.bin` is unchanged
 (`dda4ea1e1f3249adc8bccb8fc9fe07bb446fb569d5abb884bd1bf83cfe4ba47e`,
