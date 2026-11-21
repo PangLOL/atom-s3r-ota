@@ -7,11 +7,11 @@
    gh_render.expand(src, stride, bpp, w, h, pairs, ncolors, dst)
    gh_render.fx(window, vw, vh, aura_i, sw_i, bar_i, aura_x, aura_y, sw_x)
    gh_render.digits(window, vw, vh, bx, by, rings)
-   gh_render.refresh_ok()  -> prints "present-ok" then "refresh ok" after a successful panel push
+   gh_render.refresh_ok()  -> present-ok / refresh ok only when gh_trace is set
 
-   A real playfield (height >= 64) also prints, in order:
-   top ok, compose-ok or copy-ok, stamp-ok, fx-ok, digits-ok.
-   The boot self-test uses a short tile and stays quiet.
+   Per-frame stage lines (top ok, compose-ok, copy-ok, stamp-ok, fx-ok,
+   digits-ok, push-in) are compiled in but stay silent. gh_trace is BSS
+   and remains 0. USB CDC was stalling the frame on those prints.
 */
 
 #include "py/dynruntime.h"
@@ -28,8 +28,11 @@ void *memset(void *s, int c, size_t n) {
 }
 
 /* Set by a real-playfield compose or copy. gh_fx prints stamp-ok once and clears it.
-   Global BSS: a native module cannot use a static BSS variable. */
+   Global BSS: a native module cannot use a static BSS variable.
+   gh_trace stays 0, so the per-frame stage lines stay off. USB CDC was
+   blocking the frame on those prints. */
 int gh_stamp_pending;
+int gh_trace;
 
 #if defined(__xtensa__)
 #define GH_BUILD "micropython-1.27.0-xtensawin-mpy6.3"
@@ -94,7 +97,9 @@ static mp_obj_t gh_compose(size_t n_args, const mp_obj_t *args) {
         grass = th;
     }
     if (th >= 64) {
-        mp_printf(&mp_plat_print, "top ok\n");
+        if (gh_trace) {
+            mp_printf(&mp_plat_print, "top ok\n");
+        }
         gh_stamp_pending = 1;
     }
     need_len(&tile, (size_t)tw * (size_t)th * 2, "tile");
@@ -132,7 +137,7 @@ static mp_obj_t gh_compose(size_t n_args, const mp_obj_t *args) {
         }
         gh_blit_stamp(win.buf, vw, th, tw, sbuf.buf, mask.buf, sw, sh, ox, oy, off);
     }
-    if (th >= 64) {
+    if (th >= 64 && gh_trace) {
         mp_printf(&mp_plat_print, "compose-ok\n");
     }
     return mp_const_none;
@@ -151,13 +156,15 @@ static mp_obj_t gh_copy(size_t n_args, const mp_obj_t *args) {
     vw = arg_int(args[5]);
     if (tw > 0 && th > 0 && vw > 0) {
         if (th >= 64) {
-            mp_printf(&mp_plat_print, "top ok\n");
+            if (gh_trace) {
+                mp_printf(&mp_plat_print, "top ok\n");
+            }
             gh_stamp_pending = 1;
         }
         need_len(&tile, (size_t)tw * (size_t)th * 2, "tile");
         need_len(&win, (size_t)vw * (size_t)th * 2, "window");
         gh_copy_rows(tile.buf, tw, 0, th, off, win.buf, vw, 0);
-        if (th >= 64) {
+        if (th >= 64 && gh_trace) {
             mp_printf(&mp_plat_print, "copy-ok\n");
         }
     }
@@ -208,7 +215,9 @@ static mp_obj_t gh_stamp_runs_fn(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_stamp_runs_obj, 9, 9, gh_stamp_runs_fn);
 
 static mp_obj_t gh_push_in(void) {
-    mp_printf(&mp_plat_print, "push-in\n");
+    if (gh_trace) {
+        mp_printf(&mp_plat_print, "push-in\n");
+    }
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(gh_push_in_obj, gh_push_in);
@@ -242,14 +251,16 @@ static mp_obj_t gh_fx_fn(size_t n_args, const mp_obj_t *args) {
     vh = arg_int(args[2]);
     if (vw > 0 && vh > 0) {
         if (vh >= 64 && gh_stamp_pending) {
-            mp_printf(&mp_plat_print, "stamp-ok\n");
+            if (gh_trace) {
+                mp_printf(&mp_plat_print, "stamp-ok\n");
+            }
             gh_stamp_pending = 0;
         }
         need_len(&win, (size_t)vw * (size_t)vh * 2, "window");
         gh_fx(win.buf, vw, vh,
               arg_int(args[3]), arg_int(args[4]), arg_int(args[5]),
               arg_int(args[6]), arg_int(args[7]), arg_int(args[8]));
-        if (vh >= 64) {
+        if (vh >= 64 && gh_trace) {
             mp_printf(&mp_plat_print, "fx-ok\n");
         }
     }
@@ -267,7 +278,7 @@ static mp_obj_t gh_digits(size_t n_args, const mp_obj_t *args) {
     if (vw > 0 && vh > 0) {
         need_len(&win, (size_t)vw * (size_t)vh * 2, "window");
         gh_draw_hud_digits(win.buf, vw, vh, arg_int(args[3]), arg_int(args[4]), arg_int(args[5]));
-        if (vh >= 64) {
+        if (vh >= 64 && gh_trace) {
             mp_printf(&mp_plat_print, "digits-ok\n");
         }
     }
@@ -277,8 +288,10 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_digits_obj, 6, 6, gh_digits);
 
 /* main.py calls this after pushImage accepts the playfield. */
 static mp_obj_t gh_refresh_ok(void) {
-    mp_printf(&mp_plat_print, "present-ok\n");
-    mp_printf(&mp_plat_print, "refresh ok\n");
+    if (gh_trace) {
+        mp_printf(&mp_plat_print, "present-ok\n");
+        mp_printf(&mp_plat_print, "refresh ok\n");
+    }
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(gh_refresh_ok_obj, gh_refresh_ok);

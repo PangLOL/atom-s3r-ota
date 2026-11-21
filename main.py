@@ -102,6 +102,10 @@ FRAME_MIN_MS = 16
 # SPI transfer and still shorter than the 30 s watchdog. The driver call
 # itself has no timeout; this bound is the one the handoff waits on.
 PUSH_TIMEOUT_MS = 800
+# CS/gap/stage lines. They blocked on USB for most of a frame. Off keeps
+# boot banners, errors, push-slow, push-fail, the 1 Hz frames line, and
+# the two-second timing line.
+FRAME_TRACE = False
 # Atom S3R 0.85" ST7735: SCK GPIO15, MOSI GPIO21, DC GPIO42, CS GPIO14,
 # RST GPIO48. The ST7735 TE pin is not wired on this board, and there is
 # no BUSY pin. CS low is the driver selecting the panel. These registers
@@ -981,12 +985,16 @@ def _call_panel(fn):
     call is reported as slow, and the budget the next method is still
     allowed to use. The edge latch is armed only around fn itself.
     """
-    before = _bus_levels()
-    mem = _gpio_mem()
-    if mem is not None:
-        _edge_prepare(mem)
-    else:
-        _BUS["edges"] = (-1, -1, -1)
+    before = (0, 0, 0)
+    lo = 0
+    mem = None
+    if FRAME_TRACE:
+        before = _bus_levels()
+        mem = _gpio_mem()
+        if mem is not None:
+            _edge_prepare(mem)
+        else:
+            _BUS["edges"] = (-1, -1, -1)
     try:
         t_ms = time.ticks_ms()
     except Exception:
@@ -1008,10 +1016,11 @@ def _call_panel(fn):
             ms = 0
         if ms < 0:
             ms = 0
-    if mem is not None:
-        _edge_finish(mem)
-    after_cs = _gpio_level(_LCD_CS)
-    lo = 1 if (before[0] == 0 or after_cs == 0) else 0
+    if FRAME_TRACE:
+        if mem is not None:
+            _edge_finish(mem)
+        after_cs = _gpio_level(_LCD_CS)
+        lo = 1 if (before[0] == 0 or after_cs == 0) else 0
     return err, ms, raw_us, before, lo
 
 
@@ -1135,11 +1144,12 @@ def push_rgb565_window(lcd, window, vw, th):
     if vw <= 0 or th <= 0:
         return False
     t_enter = _mono_us()
-    _print_gap()
-    try:
-        _note_c("push_in")
-    except Exception:
-        pass
+    if FRAME_TRACE:
+        _print_gap()
+        try:
+            _note_c("push_in")
+        except Exception:
+            pass
     pixels = vw * th
     fails = []
     methods = []
@@ -1165,9 +1175,10 @@ def push_rgb565_window(lcd, window, vw, th):
     parts["post"] = 0
     parts["how"] = ""
     if not methods:
-        before = _bus_levels()
-        _BUS["edges"] = (-1, -1, -1)
-        _bus_print(before, 1 if before[0] == 0 else 0)
+        if FRAME_TRACE:
+            before = _bus_levels()
+            _BUS["edges"] = (-1, -1, -1)
+            _bus_print(before, 1 if before[0] == 0 else 0)
         print("push-fail none")
         parts["pre"] = _us_diff(_mono_us(), t_enter)
         return False
@@ -1179,8 +1190,9 @@ def push_rgb565_window(lcd, window, vw, th):
             pre = 0
         if err is None:
             _service()
-            _bus_print(before, lo)
-            print("push-ms %d %s" % (ms, label))
+            if FRAME_TRACE:
+                _bus_print(before, lo)
+                print("push-ms %d %s" % (ms, label))
             if ms >= PUSH_TIMEOUT_MS:
                 print("push-slow %d" % ms)
             post = _us_diff(_mono_us(), t_mid)
@@ -1192,7 +1204,8 @@ def push_rgb565_window(lcd, window, vw, th):
             parts["how"] = label
             return True
         fails.append(label + ":" + _exc_name(err))
-        _bus_print(before, lo)
+        if FRAME_TRACE:
+            _bus_print(before, lo)
         post = _us_diff(_mono_us(), t_mid)
         if post < 0:
             post = 0
@@ -1220,6 +1233,49 @@ def _set_565(buf, tw, x, y, val):
     i = (y * tw + x) * 2
     buf[i] = val & 0xFF
     buf[i + 1] = (val >> 8) & 0xFF
+
+
+def stamp_disk565(buf, vw, vh, cx, cy, r, color):
+    """Filled disk in a little-endian RGB565 buffer. Clipped to the buffer.
+
+    Pixels with dx*dx + dy*dy <= r*r are covered. The playfield push then
+    carries the mark, so a later panel draw is not required.
+    """
+    if buf is None or vw <= 0 or vh <= 0 or r < 1:
+        return
+    c = _rgb888_to_565(color)
+    lo = c & 0xFF
+    hi = (c >> 8) & 0xFF
+    cx = int(cx)
+    cy = int(cy)
+    r = int(r)
+    rr = r * r
+    y0 = cy - r
+    y1 = cy + r
+    x0 = cx - r
+    x1 = cx + r
+    if y0 < 0:
+        y0 = 0
+    if y1 >= vh:
+        y1 = vh - 1
+    if x0 < 0:
+        x0 = 0
+    if x1 >= vw:
+        x1 = vw - 1
+    y = y0
+    while y <= y1:
+        dy = y - cy
+        dy2 = dy * dy
+        x = x0
+        row = (y * vw) * 2
+        while x <= x1:
+            dx = x - cx
+            if dx * dx + dy2 <= rr:
+                i = row + x * 2
+                buf[i] = lo
+                buf[i + 1] = hi
+            x += 1
+        y += 1
 
 
 def _is_backdrop_888(c):
@@ -2483,7 +2539,8 @@ def _note_presented():
     global _presented_n, _presented_total
     _presented_n += 1
     _presented_total += 1
-    _note_c("refresh_ok")
+    if FRAME_TRACE:
+        _note_c("refresh_ok")
     # The gap clock starts after those prints, so their serial stall shows
     # up in the next frame's `other`, not inside raw.
     _FLOW["present"] = _mono_us()
@@ -3393,6 +3450,8 @@ class Sprite:
         self._tim_t0 = 0
         self._tim_gc_at = 0
         self._fx_in_buffer = False
+        self._corner_pushed = False
+        self._dot_on_play = False
         self._native_ready = False
         self._nat_c = -1
         self._nat_w = -1
@@ -3814,15 +3873,37 @@ class Sprite:
         fill_ellipse(lcd, cx, cy, max(1, rx - 3), max(1, ry - 3), COL_WATER)
         lcd.fillRect(cx - 1, cy - ry + 1, 2, 1, COL_RING_HI)
 
-    def draw(self, lcd, values, now=0):
+    def _stamp_fault(self, buf, fault):
+        """Put the CAN-fault dot in the buffer that is about to be pushed.
+
+        The dot is not stored in play_window when a separate present buffer
+        exists, so a later held frame does not keep a stale mark. Stamping
+        the live playfield itself forces the next frame to recompose.
+        """
+        if buf is None:
+            return buf
+        if not fault:
+            if buf is self.play_window and self._dot_on_play:
+                self._native_ready = False
+                self._dot_on_play = False
+            return buf
+        vh = self.ocean_th if self.ocean_th else GAUGE_Y
+        stamp_disk565(buf, W, vh, DOT_X, DOT_Y, DOT_R, COL_ERR)
+        if buf is self.play_window:
+            self._dot_on_play = True
+            self._native_ready = False
+        return buf
+
+    def draw(self, lcd, values, now=0, fault=False):
         speed = values.get("spd") or 0.0
         tps = values.get("tps") or 0.0
         clt = values.get("clt") or 0.0
+        self._corner_pushed = False
         self.body_col = sonic_body_color(clt, now)
         if self.pack is not None:
             # Ocean and sprite caches are prepared once at pack load
             # (_sync_ground), not on every frame.
-            self._draw_sheet_scene(lcd, speed, clt, now)
+            self._draw_sheet_scene(lcd, speed, clt, now, fault)
         else:
             self._playfield_stamped = False
             self._draw_background(lcd)
@@ -5041,7 +5122,7 @@ class Sprite:
         dst[:] = src
         return dst
 
-    def _draw_native_frame(self, lcd, amount):
+    def _draw_native_frame(self, lcd, amount, fault=False):
         """Compose, stamp, and push through C. False falls back to Python."""
         if (
             _GH is None
@@ -5088,6 +5169,7 @@ class Sprite:
         copy_us = _us_diff(_mono_us(), t_copy)
         if copy_us < 0:
             copy_us = 0
+        self._stamp_fault(hand, fault)
         _FLOW["paint"] = compose_us + sprite_us + fx_us + dig_us + between_us + copy_us
         t0 = _mono_us()
         ok = push_rgb565_window(lcd, hand, W, self.ocean_th)
@@ -5095,26 +5177,28 @@ class Sprite:
         if push_us < 0:
             push_us = 0
         parts = _PUSH_PARTS
-        print(
-            "stage us compose %d stamp %d fx %d digits %d between %d copy %d pre %d raw %d post %d held %d"
-            % (
-                compose_us, sprite_us, fx_us, dig_us, between_us, copy_us,
-                parts["pre"], parts["raw"], parts["post"], held,
+        if FRAME_TRACE:
+            print(
+                "stage us compose %d stamp %d fx %d digits %d between %d copy %d pre %d raw %d post %d held %d"
+                % (
+                    compose_us, sprite_us, fx_us, dig_us, between_us, copy_us,
+                    parts["pre"], parts["raw"], parts["post"], held,
+                )
             )
-        )
         if not ok:
             self._ocean_push = False
             self._native_ready = False
             self._fx_in_buffer = False
             self._playfield_stamped = False
             return False
+        self._corner_pushed = True
         _note_presented()
         self._fx_in_buffer = True
         self._playfield_stamped = True
         self._note_timing(compose_us, stamp_us, push_us, held)
         return True
 
-    def _draw_sheet_scene(self, lcd, speed, clt, now):
+    def _draw_sheet_scene(self, lcd, speed, clt, now, fault=False):
         pack = self.pack
         pal_s = pack.pal(1)
         pal_c = pack.pal(0)
@@ -5125,7 +5209,7 @@ class Sprite:
         self._fx_in_buffer = False
         if _GH is not None and self.play_window is not None and self._sprite_bake:
             try:
-                if self._draw_native_frame(lcd, amount):
+                if self._draw_native_frame(lcd, amount, fault):
                     return
             except Exception as e:
                 print("native frame failed:", e)
@@ -5242,6 +5326,7 @@ class Sprite:
         if window_ready:
             t0 = _mono_us()
             hand = self._present_copy(push_buf)
+            self._stamp_fault(hand, fault)
             ok = push_rgb565_window(lcd, hand, W, self.ocean_th)
             push_us = _us_diff(_mono_us(), t0)
             if not ok:
@@ -5250,6 +5335,7 @@ class Sprite:
                 window_ready = False
                 stamped = False
             else:
+                self._corner_pushed = True
                 _note_presented()
                 if stamped:
                     self._playfield_stamped = True
@@ -5580,6 +5666,7 @@ class Dashboard:
         self.sprite = Sprite(pack)
         self.button = button
         self._last_fill = {g[0]: -1 for g in GAUGES}
+        self._gauge_bg = False
         self._fault_shown = None
         self._last_ms = time.ticks_ms()
 
@@ -5622,16 +5709,22 @@ class Dashboard:
             fill_us = _us_diff(_mono_us(), t0)
             if fill_us < 0:
                 fill_us = 0
+            self._gauge_bg = False
+            for key in self._last_fill:
+                self._last_fill[key] = -1
             _service()
         noted = self.sprite._tim_n
-        self.sprite.draw(surface, values, now)
+        self.sprite.draw(surface, values, now, fault)
         self._poll_button(now)
         prev = self.lcd
         self.lcd = surface
         t_gauge = _mono_us()
         try:
             self._draw_gauges(values)
-            self._draw_fault(fault)
+            if not self.sprite._corner_pushed:
+                self._draw_fault(fault)
+            else:
+                self._fault_shown = fault
         finally:
             self.lcd = prev
             _flow_add("gauge", _us_diff(_mono_us(), t_gauge))
@@ -5652,8 +5745,18 @@ class Dashboard:
         self.sprite.report_timing(now)
 
     def _draw_gauges(self, values):
+        """Update the four bars in place.
+
+        The near-black band is painted once. A later frame only repaints a
+        bar whose width or color changed. A shrink is the track color on
+        the uncovered span, not another full-band clear.
+        """
         lcd = self.lcd
-        lcd.fillRect(0, GAUGE_Y, W, GAUGE_H, 0x101012)
+        if not self._gauge_bg:
+            lcd.fillRect(0, GAUGE_Y, W, GAUGE_H, 0x101012)
+            self._gauge_bg = True
+            for key in self._last_fill:
+                self._last_fill[key] = -1
         for key, lo, hi, x, y, w, h, mode in GAUGES:
             raw = values.get(key)
             if raw is None:
@@ -5664,10 +5767,24 @@ class Dashboard:
                 span = hi - lo
                 frac = ((v - lo) / span) if span else 0.0
                 fill_w = int(frac * w)
-            lcd.fillRect(x, y, w, h, COL_TRACK)
-            if fill_w > 0:
-                color = COL_ORANGE if mode == "orange" else value_rgb(frac)
-                lcd.fillRect(x, y, fill_w, h, color)
+            color = COL_ORANGE if mode == "orange" else value_rgb(frac)
+            prev = self._last_fill[key]
+            if prev == -1:
+                lcd.fillRect(x, y, w, h, COL_TRACK)
+                if fill_w > 0:
+                    lcd.fillRect(x, y, fill_w, h, color)
+            else:
+                old_w = prev[0]
+                old_color = prev[1]
+                if old_w == fill_w and old_color == color:
+                    continue
+                if color != old_color and fill_w > 0:
+                    lcd.fillRect(x, y, fill_w, h, color)
+                if fill_w < old_w:
+                    lcd.fillRect(x + fill_w, y, old_w - fill_w, h, COL_TRACK)
+                elif fill_w > old_w:
+                    lcd.fillRect(x + old_w, y, fill_w - old_w, h, color)
+            self._last_fill[key] = (fill_w, color)
 
     def _draw_fault(self, fault):
         if fault:
