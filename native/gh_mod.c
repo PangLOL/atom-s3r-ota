@@ -7,6 +7,7 @@
    gh_render.expand(src, stride, bpp, w, h, pairs, ncolors, dst)
    gh_render.fx(window, vw, vh, aura_i, sw_i, bar_i, aura_x, aura_y, sw_x)
    gh_render.digits(window, vw, vh, bx, by, rings)
+   gh_render.refresh_ok()  -> prints "refresh ok" after a successful panel push
 */
 
 #include "py/dynruntime.h"
@@ -206,6 +207,13 @@ static mp_obj_t gh_digits(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_digits_obj, 6, 6, gh_digits);
 
+/* One line after the playfield has been pushed. main.py calls this; compose does not. */
+static mp_obj_t gh_refresh_ok(void) {
+    mp_printf(&mp_plat_print, "refresh ok\n");
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(gh_refresh_ok_obj, gh_refresh_ok);
+
 mp_obj_t mpy_init(mp_obj_fun_bc_t *self, size_t n_args, size_t n_kw, mp_obj_t *args) {
     (void)n_args;
     (void)n_kw;
@@ -217,6 +225,7 @@ mp_obj_t mpy_init(mp_obj_fun_bc_t *self, size_t n_args, size_t n_kw, mp_obj_t *a
     mp_store_global(MP_QSTR_expand, MP_OBJ_FROM_PTR(&gh_expand_obj));
     mp_store_global(MP_QSTR_fx, MP_OBJ_FROM_PTR(&gh_fx_obj));
     mp_store_global(MP_QSTR_digits, MP_OBJ_FROM_PTR(&gh_digits_obj));
+    mp_store_global(MP_QSTR_refresh_ok, MP_OBJ_FROM_PTR(&gh_refresh_ok_obj));
     mp_store_global(MP_QSTR_BUILD, mp_obj_new_str(GH_BUILD, sizeof(GH_BUILD) - 1));
     mp_store_global(MP_QSTR_ARCH, mp_obj_new_str(GH_ARCH, sizeof(GH_ARCH) - 1));
     MP_DYNRUNTIME_INIT_EXIT

@@ -2034,6 +2034,17 @@ def _drop_native():
     _GH_KIND = "py"
 
 
+def _note_presented():
+    """One C line after the playfield bytes have been accepted by the panel."""
+    gh = _GH
+    if gh is None:
+        return
+    fn = getattr(gh, "refresh_ok", None)
+    if fn is None:
+        return
+    fn()
+
+
 _load_native()
 
 
@@ -4559,6 +4570,7 @@ class Sprite:
             self._fx_in_buffer = False
             self._playfield_stamped = False
             return False
+        _note_presented()
         self._fx_in_buffer = True
         self._playfield_stamped = True
         self._note_timing(compose_us, stamp_us, push_us, held)
@@ -4698,8 +4710,10 @@ class Sprite:
                 self._drop_sprite_cache()
                 window_ready = False
                 stamped = False
-            elif stamped:
-                self._playfield_stamped = True
+            else:
+                _note_presented()
+                if stamped:
+                    self._playfield_stamped = True
         if ocean_ready:
             self._note_timing(compose_us, stamp_us, push_us, held)
         if not self._playfield_stamped:

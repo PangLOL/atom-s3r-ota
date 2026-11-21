@@ -174,6 +174,12 @@ static mp_obj_t gh_digits(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_digits_obj, 6, 6, gh_digits);
 
+static mp_obj_t gh_refresh_ok(void) {
+    mp_printf(&mp_plat_print, "refresh ok\n");
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(gh_refresh_ok_obj, gh_refresh_ok);
+
 static const mp_rom_map_elem_t gh_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_gh_render)},
     {MP_ROM_QSTR(MP_QSTR_compose), MP_ROM_PTR(&gh_compose_obj)},
@@ -182,6 +188,7 @@ static const mp_rom_map_elem_t gh_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_expand), MP_ROM_PTR(&gh_expand_obj)},
     {MP_ROM_QSTR(MP_QSTR_fx), MP_ROM_PTR(&gh_fx_obj)},
     {MP_ROM_QSTR(MP_QSTR_digits), MP_ROM_PTR(&gh_digits_obj)},
+    {MP_ROM_QSTR(MP_QSTR_refresh_ok), MP_ROM_PTR(&gh_refresh_ok_obj)},
     {MP_ROM_QSTR(MP_QSTR_BUILD), MP_ROM_QSTR(MP_QSTR_firmware)},
     {MP_ROM_QSTR(MP_QSTR_ARCH), MP_ROM_QSTR(MP_QSTR_usermod)},
 };
