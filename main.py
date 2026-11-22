@@ -1,28 +1,37 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
-V12: the V11 picture, with on-device timing and skipped redraws.
-Same pre-scaled PIX6 art (Sonic 39x36, playfield 128x103, rings 14x14).
-At pack load the 384x103 ocean tile is pre-rendered into an RGB565 buffer
-(~79 KB) and split into parallax layers: sky/clouds at 0.25, water and
-islands at 0.6, ground and near palms at 1.0. The packed art has no
-mountain band, so 0.4 is unused. Sonic cycles, the HUD ring and bar, field
-rings, and ring sparkles are baked once into RGB565 plus a 1-bit mask.
-Each frame still pushes one 128x103 playfield image. A band is recopied
-only when int(scroll * factor) changes. A scenery stamp is rebuilt only
-inside the rectangles a shifted band or a moved stamp actually dirtied,
-so the window stays pixel-identical to a full V11 compose. Unchanged
-sprite frames are left in place; a small underlay restores the backdrop
-under a sprite that did change (animation, spinning rings, sparkles, or
-the overheat tint). Parked, the parallax compose is skipped. Every two
-seconds a timing line prints average compose / sprite-stamp / push
-milliseconds, one GC sample, total, fps, and how many frames held the
-backdrop. That print does not rebuild the ocean or the sprite cache.
-If the underlay cannot be allocated, drawing stays on the V11 full
-compose. If a stamp fails later, the bake flag is cleared and drawing
-stays on the fillRect interpreter. This file is version 12; it is not
-the published Pages payload until the owner ships it.
-The face button is polled every main-loop iteration and during a draw, so a
-450 ms double-press can be caught even if a frame runs long.
+V15: the V14 packed picture, composited so a scroll does not restamp
+sprites that did not change. Same pre-scaled PIX6 art (Sonic 39x36,
+playfield 128x103, rings 14x14). pixidx.bin is unchanged. At pack load the
+384x103 ocean tile is pre-rendered into an RGB565 buffer and split into
+parallax layers: sky/clouds at 0.25, water and islands at 0.6, ground and
+near palms at 1.0. The packed art has no mountain band, so 0.4 is unused.
+Scenery stamps (loop island, palms, bushes) blit through the same kind of
+viper loop Sonic and the HUD already use. A viper self-test failure stays
+on the V12 Python blit, so the pixels do not change. That self-test runs
+while the caches are built, not inside the first timed frame.
+The ocean window stays clean: no sprites. When a band's scroll offset
+moves by less than a screen, that window is shifted and only the new
+columns plus scenery that did not ride along are patched. A second
+128-wide playfield is what gets pushed. It is shifted the same way, then
+only sprites whose pixels are no longer correct are copied back from the
+clean backdrop and stamped. The HUD bar and ring icon stay while the sky
+under them is still. Sonic is restamped when his frame, his tint, or the
+backdrop under him changes. Rings and sparkles update in their own rects.
+Unchanged offsets still skip the backdrop. The pixels match a full
+compose plus the same stamps.
+Each frame still pushes one 128x103 playfield image. When that push lands,
+the full-screen clear and the second canvas flush are skipped: gauges
+repaint y 103-127 themselves. The every-two-seconds line keeps the V14
+fields and adds hud, sonic, rings, shift, and full. total stays
+compose+stamp+push so it compares with V12 and V14. If the USB CDC cannot
+take the line, the print is skipped and the counters stay, so a host that
+is not reading cannot stall the loop. The face button (BtnA / Btn /
+BtnPWR only) is polled through compose, blits, flushes, and OTA checks.
+The OTA client stays, on its existing schedule; its HTTP fetch cannot
+block forever. A machine.WDT is armed after the first heavy alloc, fed
+from the loop, and not used as a routine reboot. This file is version 15.
+It is not the published Pages payload.
 Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
 barrier still use V2 primitives, layered on top of Sonic at tip (66, 72),
 alpha 178. FACE_ENABLED stays off.
@@ -47,7 +56,7 @@ Decode (Honda Fit GE8):
     0x13A byte 1     raw counts         -> throttle     (0-255)
     0x324 byte 0     minus 40           -> coolant C    (-40-125)
 
-Screen-button double-tap starts a bench sweep: speed 0-100-80-0 with
+One press of the face button starts a bench sweep: speed 0-100-80-0 with
 matching RPM, throttle and coolant, so the run cycle and the 80 km/h
 infinity-leg sprite can be tested without a vehicle.
 
@@ -85,11 +94,64 @@ CLT_MIN, CLT_MAX = -40, 125
 
 WATCHDOG_MS = 2000
 REFRESH_MS = 50
+# One motion step. A gap longer than this used to fast-forward the scroll
+# (the old clamp was 500 ms, so a 134 ms collect still jumped). The loop
+# does not wait out REFRESH_MS. 16 ms is a 60 fps ceiling so a native
+# frame can run at 30-60 fps. It is not a 12-15 fps motion cap.
+FRAME_MIN_MS = 16
+# Present on the ring quantum so each paint advances the rings by one
+# step. 16 ms would alias against this 33 ms cycle (fast, then slow).
+# The loop waits out the remainder instead of drawing again early.
+# The two-second timing line still collects only when the heap is low.
+# The same rule applies at rest and in motion.
+GC_LOW_FREE = 64 * 1024
+GC_CRITICAL_FREE = 24 * 1024
+GC_MOVE_MIN_MS = 15000
+# C gc_alloc collects by itself when bytes allocated since the last
+# collection reach gc.threshold. The stock 57,344-byte value fired about
+# twice a second inside a present (~137 ms, ~119 KB/s). One frame is only
+# a few KB, so 1.2 MB cannot be crossed during a present. Automatic
+# collection is also turned off; this value is the safety net if that
+# call is missing.
+GC_AUTO_BYTES = 1200 * 1024
+# Explicit collect after a finished present, once the heap has grown by
+# this much since the last collect. At ~119 KB/s that is about four
+# seconds, and it stays under GC_AUTO_BYTES for the next frame. Not every
+# frame: a full collect scans the PSRAM heap and costs ~137 ms.
+GC_BETWEEN_BYTES = 512 * 1024
+# How many completed presents between mem_alloc samples. The sample walks
+# the heap (~13 ms), so it is not done on every frame.
+GC_CHECK_FRAMES = 30
+# A full 128x103 RGB565 push is about 26 KB. 800 ms is well past a slow
+# SPI transfer and still shorter than the 30 s watchdog. The driver call
+# itself has no timeout; this bound is the one the handoff waits on.
+PUSH_TIMEOUT_MS = 800
+# CS/gap/stage lines. They blocked on USB for most of a frame. Off keeps
+# boot banners, errors, push-slow, push-fail, the 1 Hz frames line, and
+# the two-second timing line.
+FRAME_TRACE = False
+# Atom S3R 0.85" ST7735: SCK GPIO15, MOSI GPIO21, DC GPIO42, CS GPIO14,
+# RST GPIO48. The ST7735 TE pin is not wired on this board, and there is
+# no BUSY pin. CS low is the driver selecting the panel. These registers
+# are read only; the pin mux is left with the LCD driver.
+_LCD_CS = 14
+_LCD_DC = 42
+_LCD_SCK = 15
+_GPIO_IN = 0x6000403C
+_GPIO_IN1 = 0x60004040
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
-DBL_TAP_MS = 450
-APP_VERSION = 12
-APP_VERSION_NAME = "2026.11.21-v12"
+APP_VERSION = 16
+APP_VERSION_NAME = "2026.11.21-v16"
+# Long enough that a main.py / pixidx write is not reset, short enough that
+# a stuck idle loop comes back without a power cycle. Not a routine reboot.
+WDT_TIMEOUT_MS = 30000
+# Caps a hung version.json / main.py / pixidx GET. The poll interval stays
+# in ota_client (90s). Button and the WDT are serviced while the GET runs.
+OTA_HTTP_TIMEOUT_MS = 3000
+# How often this loop calls ota_client.poll. The client still decides the
+# 90s fetch. Calling it on every frame was on the present path.
+OTA_POLL_MS = 1000
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
@@ -388,8 +450,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "dda4ea1e1f3249adc8bccb8fc9fe07bb446fb569d5abb884bd1bf83cfe4ba47e"
-PIXIDX_SIZE = 107656
+PIXIDX_SHA256 = "f33a0418a01743d405be8cee372a3ad0b8c3d72efbc8e2f0f95720468cb2c1c0"
+PIXIDX_SIZE = 216653
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -528,8 +590,10 @@ class PixIdx:
             raise ValueError("bad PIX6 version")
         self.data = data
         self.bpp = 4 if (flags & 1) else 8
+        self.has_runs = (flags & 2) != 0
         self.colors = colors
         self.pix_off = pix_off
+        self.pix_size = _u32(data, 28)
         self.palettes = []
         self.palettes_565 = []
         for p in range(n_pal):
@@ -541,6 +605,16 @@ class PixIdx:
                 pal[i] = _rgb565_to_888(val)
             self.palettes.append(pal)
             self.palettes_565.append(pal565)
+        self.pair_bytes = []
+        for pal565 in self.palettes_565:
+            raw = bytearray(len(pal565) * 2)
+            i = 0
+            while i < len(pal565):
+                v = pal565[i]
+                raw[i * 2] = v & 0xFF
+                raw[i * 2 + 1] = (v >> 8) & 0xFF
+                i += 1
+            self.pair_bytes.append(raw)
         self.frames = []
         self.by_name = {}
         for n in range(n_frames):
@@ -558,8 +632,23 @@ class PixIdx:
             pal_id = data[eoff + 30]
             fr_flags = data[eoff + 31]
             fr = PixFrame(name, off, w, h, dur, ox, oy, pal_id, fr_flags)
+            fr.nruns = 0
+            fr.runs = b""
             self.frames.append(fr)
             self.by_name[name] = fr
+        if self.has_runs:
+            at = self.pix_off + self.pix_size
+            for fr in self.frames:
+                if at + 2 > len(data):
+                    break
+                nruns = _u16(data, at)
+                at += 2
+                nbytes = nruns * 5
+                if at + nbytes > len(data):
+                    break
+                fr.nruns = nruns
+                fr.runs = memoryview(data)[at:at + nbytes]
+                at += nbytes
         self.cycles = {}
         for fr in self.frames:
             name = fr.name
@@ -747,22 +836,426 @@ def blit_ocean_window(lcd, tile, tw, th, scroll, window, vw=W):
 
 
 
-def push_rgb565_window(lcd, window, vw, th):
-    """Push a precomposed RGB565 window as one image copy."""
-    if hasattr(lcd, "pushImage"):
+def _gpio_mem():
+    try:
+        import machine
+        return getattr(machine, "mem32", None)
+    except Exception:
+        return None
+
+
+def _gpio_level(pin):
+    """Read a GPIO without constructing machine.Pin, which would remux it."""
+    try:
+        mem = _gpio_mem()
+        if mem is None:
+            return -1
+        if pin < 32:
+            return (mem[_GPIO_IN] >> pin) & 1
+        return (mem[_GPIO_IN1] >> (pin - 32)) & 1
+    except Exception:
+        return -1
+
+
+def _bus_levels():
+    return (_gpio_level(_LCD_CS), _gpio_level(_LCD_DC), _gpio_level(_LCD_SCK))
+
+
+# ESP32-S3 GPIO pin-config and edge-status registers. These are not the
+# IO mux. Writing them does not take SCK/MOSI/DC/CS/RST away from the LCD.
+# INT_TYPE is bits 9:7. INT_ENA is bits 17:13. Any-edge is type 3.
+# STATUS latches an edge while the detector is enabled, including across a
+# driver call that never returns to Python. A 1 ms machine.Timer callback
+# does not: it runs only when the VM is free, so it samples idle levels.
+_GPIO_PIN0 = 0x60004074
+_GPIO_STATUS = 0x60004044
+_GPIO_STATUS_W1TC = 0x6000404C
+_GPIO_STATUS1 = 0x60004050
+_GPIO_STATUS1_W1TC = 0x60004058
+_INT_TYPE_MASK = 0x380
+_INT_TYPE_LSB = 7
+_INT_ENA_MASK = 0x3E000
+_INT_ENA_LSB = 13
+_INT_ANYEDGE = 3
+
+# edges: CS, DC, SCK. -1 means the latch could not be armed.
+# saved: (pin, original PIN register word) for the pins armed right now.
+_BUS = {"edges": (-1, -1, -1), "saved": None}
+
+
+def _status_clear(mem, pin):
+    if pin < 32:
+        mem[_GPIO_STATUS_W1TC] = 1 << pin
+    else:
+        mem[_GPIO_STATUS1_W1TC] = 1 << (pin - 32)
+
+
+def _status_bit(mem, pin):
+    if pin < 32:
+        return (mem[_GPIO_STATUS] >> pin) & 1
+    return (mem[_GPIO_STATUS1] >> (pin - 32)) & 1
+
+
+def _edge_arm_one(mem, pin, enable_cpu):
+    """Any-edge detector. Returns the previous PIN register word.
+
+    enable_cpu turns on the CPU0 enable bit when it was clear, which is
+    what makes the status latch record the edge. SCK does not get that
+    bit: any-edge on the clock would flood an already-installed GPIO ISR.
+    The IO mux function is left untouched.
+    """
+    reg = _GPIO_PIN0 + (pin * 4)
+    cur = mem[reg] & 0xFFFFFFFF
+    nxt = (cur & ~_INT_TYPE_MASK) | ((_INT_ANYEDGE << _INT_TYPE_LSB) & _INT_TYPE_MASK)
+    if enable_cpu and (cur & _INT_ENA_MASK) == 0:
+        nxt = (nxt & ~_INT_ENA_MASK) | (1 << _INT_ENA_LSB)
+    if nxt != cur:
+        mem[reg] = nxt
+    _status_clear(mem, pin)
+    return cur
+
+
+def _edge_restore(mem, saved):
+    if mem is None or not saved:
+        return
+    for pin, word in saved:
         try:
-            lcd.pushImage(0, 0, vw, th, window)
-            return True
+            mem[_GPIO_PIN0 + (pin * 4)] = word
+            _status_clear(mem, pin)
         except Exception:
             pass
-    if hasattr(lcd, "writePixels"):
+
+
+def _edge_prepare(mem):
+    """Arm CS and DC with the latch enabled, and SCK without the CPU bit."""
+    saved = []
+    try:
+        for pin, ena in ((_LCD_CS, True), (_LCD_DC, True), (_LCD_SCK, False)):
+            saved.append((pin, _edge_arm_one(mem, pin, ena)))
+        _BUS["saved"] = saved
+        return True
+    except Exception:
+        _edge_restore(mem, saved)
+        _BUS["saved"] = None
+        return False
+
+
+def _edge_finish(mem):
+    saved = _BUS["saved"]
+    if mem is None or not saved:
+        _BUS["edges"] = (-1, -1, -1)
+        _BUS["saved"] = None
+        return
+    try:
+        _BUS["edges"] = (
+            _status_bit(mem, _LCD_CS),
+            _status_bit(mem, _LCD_DC),
+            _status_bit(mem, _LCD_SCK),
+        )
+    except Exception:
+        _BUS["edges"] = (-1, -1, -1)
+    _edge_restore(mem, saved)
+    _BUS["saved"] = None
+
+
+def bus_sample_saw_low(samples):
+    """1 if any VM-visible CS sample was low. The old timer only had these."""
+    for level in samples:
+        if level == 0:
+            return 1
+    return 0
+
+
+def bus_edge_seen(levels):
+    """1 if the waveform changed while armed. This is what the latch stores."""
+    prev = None
+    for level in levels:
+        if prev is not None and level != prev:
+            return 1
+        prev = level
+    return 0
+
+
+def _edge_text(value):
+    if value < 0:
+        return "na"
+    return "%d" % value
+
+
+def _bus_print(before, lo):
+    after = _bus_levels()
+    edges = _BUS["edges"]
+    print(
+        "bus cs %d/%d dc %d/%d sck %d/%d lo %d edge cs %s dc %s sck %s"
+        % (
+            before[0], after[0], before[1], after[1], before[2], after[2], lo,
+            _edge_text(edges[0]), _edge_text(edges[1]), _edge_text(edges[2]),
+        )
+    )
+
+
+def _exc_name(err):
+    name = type(err).__name__
+    text = str(err)
+    if text:
+        if len(text) > 32:
+            text = text[:32]
+        return name + ":" + text
+    return name
+
+
+def _call_panel(fn):
+    """Run one driver call on this thread. Record how long it took.
+
+    The call is not preempted: a C transfer that never returns cannot be
+    cut short from Python. PUSH_TIMEOUT_MS is the point at which a finished
+    call is reported as slow, and the budget the next method is still
+    allowed to use. The edge latch is armed only around fn itself.
+    """
+    before = (0, 0, 0)
+    lo = 0
+    mem = None
+    if FRAME_TRACE:
+        before = _bus_levels()
+        mem = _gpio_mem()
+        if mem is not None:
+            _edge_prepare(mem)
+        else:
+            _BUS["edges"] = (-1, -1, -1)
+    try:
+        t_ms = time.ticks_ms()
+    except Exception:
+        t_ms = None
+    t_us = _mono_us()
+    err = None
+    try:
+        fn()
+    except Exception as e:
+        err = e
+    raw_us = _us_diff(_mono_us(), t_us)
+    if raw_us < 0:
+        raw_us = 0
+    ms = 0
+    if t_ms is not None:
         try:
+            ms = time.ticks_diff(time.ticks_ms(), t_ms)
+        except Exception:
+            ms = 0
+        if ms < 0:
+            ms = 0
+    if FRAME_TRACE:
+        if mem is not None:
+            _edge_finish(mem)
+        after_cs = _gpio_level(_LCD_CS)
+        lo = 1 if (before[0] == 0 or after_cs == 0) else 0
+    return err, ms, raw_us, before, lo
+
+
+_STRIP = None
+
+
+def _strip_buf(n):
+    global _STRIP
+    if _STRIP is None or len(_STRIP) < n:
+        _STRIP = bytearray(n)
+    return _STRIP
+
+
+def _push_strips(lcd, window, vw, th, how):
+    """16-row copies out of a buffer the blit is no longer writing."""
+    step = 16
+    raw = _strip_buf(step * vw * 2)
+    y = 0
+    while y < th:
+        h = th - y
+        if h > step:
+            h = step
+        n = h * vw * 2
+        off = y * vw * 2
+        raw[:n] = window[off:off + n]
+        if how == "image":
+            lcd.pushImage(0, y, vw, h, memoryview(raw)[:n])
+        else:
+            # drawRawBuf's len is a pixel count, not a byte count.
+            lcd.drawRawBuf(raw, 0, y, vw, h, vw * h, True)
+        y += h
+
+
+# Native blit and drawRawBuf both run on this thread and do not release the
+# GIL. yield on the gap line is this fact, not a pin measurement.
+_NATIVE_YIELDS = 0
+_FLOW = {
+    "present": 0,
+    "gauge": 0,
+    "loop": 0,
+    "gc": 0,
+    "adv": 0,
+    "paint": 0,
+    "mem": -1,
+    "gap_printed": 0,
+}
+_PUSH_PARTS = {"pre": 0, "raw": 0, "post": 0, "how": ""}
+
+
+def _flow_add(key, us):
+    if us < 0:
+        us = 0
+    _FLOW[key] = _FLOW[key] + us
+
+
+def _mem_free():
+    try:
+        import gc
+        return gc.mem_free()
+    except Exception:
+        return -1
+
+
+def _print_gap():
+    """Time since the previous present-ok, printed once before push-in.
+
+    since  total microseconds from present-ok to this push
+    gauge  fillRect gauges after that present
+    loop   main-loop time outside Dashboard.tick
+    gc     gc.collect on the two-second timing cadence
+    adv    sprite.advance before this frame's paint
+    paint  compose + stamp + fx + digits + between + copy of this frame
+    other  since minus those pieces (serial blocking and VM pauses)
+    gcmem  change in gc.mem_free since present-ok (negative means allocated)
+    yield  0: the native path does not release the GIL
+    since is -1 until the first present-ok.
+    """
+    if _FLOW["gap_printed"]:
+        return
+    _FLOW["gap_printed"] = 1
+    since = -1
+    if _FLOW["present"]:
+        since = _us_diff(_mono_us(), _FLOW["present"])
+        if since < 0:
+            since = 0
+    gauge = _FLOW["gauge"]
+    loop = _FLOW["loop"]
+    gc_us = _FLOW["gc"]
+    adv = _FLOW["adv"]
+    paint = _FLOW["paint"]
+    other = -1
+    if since >= 0:
+        other = since - gauge - loop - gc_us - adv - paint
+        if other < 0:
+            other = 0
+    mem = _mem_free()
+    prev = _FLOW["mem"]
+    if mem < 0 or prev < 0:
+        gcmem = -1
+    else:
+        gcmem = mem - prev
+    print(
+        "gap us since %d gauge %d loop %d gc %d adv %d paint %d other %d gcmem %d yield %d"
+        % (since, gauge, loop, gc_us, adv, paint, other, gcmem, _NATIVE_YIELDS)
+    )
+    _FLOW["gauge"] = 0
+    _FLOW["loop"] = 0
+    _FLOW["gc"] = 0
+    _FLOW["adv"] = 0
+    _FLOW["paint"] = 0
+
+
+def push_rgb565_window(lcd, window, vw, th):
+    _brk_enter("push")
+    try:
+        return _push_rgb565_window(lcd, window, vw, th)
+    finally:
+        _brk_exit()
+
+
+def _push_rgb565_window(lcd, window, vw, th):
+    """Hand a finished RGB565 buffer to the panel.
+
+    The caller copies into this buffer only after compose, stamp, fx and
+    digits have returned. pushImage is the older binding. Current UiFlow2
+    exports drawRawBuf instead, and that len argument is the number of
+    pixels. present-ok is not printed here.
+    """
+    if vw <= 0 or th <= 0:
+        return False
+    t_enter = _mono_us()
+    if FRAME_TRACE:
+        _print_gap()
+        try:
+            _note_c("push_in")
+        except Exception:
+            pass
+    pixels = vw * th
+    fails = []
+    methods = []
+    if hasattr(lcd, "pushImage"):
+        methods.append(("image", lambda: lcd.pushImage(0, 0, vw, th, window)))
+    if hasattr(lcd, "drawRawBuf"):
+        # swap=True: the buffer is host-endian RGB565. writePixels then
+        # converts it to the panel's byte order. len is a pixel count.
+        methods.append(("raw", lambda: lcd.drawRawBuf(window, 0, 0, vw, th, pixels, True)))
+    if hasattr(lcd, "pushImage"):
+        methods.append(("strip", lambda: _push_strips(lcd, window, vw, th, "image")))
+    if hasattr(lcd, "drawRawBuf"):
+        methods.append(("rawstrip", lambda: _push_strips(lcd, window, vw, th, "raw")))
+    if hasattr(lcd, "writePixels"):
+        def _pix():
             if hasattr(lcd, "setAddrWindow"):
                 lcd.setAddrWindow(0, 0, vw - 1, th - 1)
             lcd.writePixels(window)
+        methods.append(("pix", _pix))
+    parts = _PUSH_PARTS
+    parts["pre"] = 0
+    parts["raw"] = 0
+    parts["post"] = 0
+    parts["how"] = ""
+    if not methods:
+        if FRAME_TRACE:
+            before = _bus_levels()
+            _BUS["edges"] = (-1, -1, -1)
+            _bus_print(before, 1 if before[0] == 0 else 0)
+        print("push-fail none")
+        parts["pre"] = _us_diff(_mono_us(), t_enter)
+        return False
+    for label, fn in methods:
+        err, ms, raw_us, before, lo = _call_panel(fn)
+        t_mid = _mono_us()
+        pre = _us_diff(t_mid, t_enter) - raw_us
+        if pre < 0:
+            pre = 0
+        if err is None:
+            _service()
+            if FRAME_TRACE:
+                _bus_print(before, lo)
+                print("push-ms %d %s" % (ms, label))
+            if ms >= PUSH_TIMEOUT_MS:
+                print("push-slow %d" % ms)
+            post = _us_diff(_mono_us(), t_mid)
+            if post < 0:
+                post = 0
+            parts["pre"] = pre
+            parts["raw"] = raw_us
+            parts["post"] = post
+            parts["how"] = label
             return True
-        except Exception:
-            pass
+        fails.append(label + ":" + _exc_name(err))
+        if FRAME_TRACE:
+            _bus_print(before, lo)
+        post = _us_diff(_mono_us(), t_mid)
+        if post < 0:
+            post = 0
+        parts["pre"] = parts["pre"] + pre
+        parts["raw"] = parts["raw"] + raw_us
+        parts["post"] = parts["post"] + post
+        parts["how"] = label
+        t_enter = _mono_us()
+        if ms >= PUSH_TIMEOUT_MS:
+            print("push-slow %d" % ms)
+            # The driver already used the long budget. Do not start another
+            # transfer in the same frame.
+            break
+    if fails:
+        print("push-fail " + " ".join(fails))
     return False
 
 
@@ -775,6 +1268,49 @@ def _set_565(buf, tw, x, y, val):
     i = (y * tw + x) * 2
     buf[i] = val & 0xFF
     buf[i + 1] = (val >> 8) & 0xFF
+
+
+def stamp_disk565(buf, vw, vh, cx, cy, r, color):
+    """Filled disk in a little-endian RGB565 buffer. Clipped to the buffer.
+
+    Pixels with dx*dx + dy*dy <= r*r are covered. The playfield push then
+    carries the mark, so a later panel draw is not required.
+    """
+    if buf is None or vw <= 0 or vh <= 0 or r < 1:
+        return
+    c = _rgb888_to_565(color)
+    lo = c & 0xFF
+    hi = (c >> 8) & 0xFF
+    cx = int(cx)
+    cy = int(cy)
+    r = int(r)
+    rr = r * r
+    y0 = cy - r
+    y1 = cy + r
+    x0 = cx - r
+    x1 = cx + r
+    if y0 < 0:
+        y0 = 0
+    if y1 >= vh:
+        y1 = vh - 1
+    if x0 < 0:
+        x0 = 0
+    if x1 >= vw:
+        x1 = vw - 1
+    y = y0
+    while y <= y1:
+        dy = y - cy
+        dy2 = dy * dy
+        x = x0
+        row = (y * vw) * 2
+        while x <= x1:
+            dx = x - cx
+            if dx * dx + dy2 <= rr:
+                i = row + x * 2
+                buf[i] = lo
+                buf[i + 1] = hi
+            x += 1
+        y += 1
 
 
 def _is_backdrop_888(c):
@@ -1030,12 +1566,293 @@ def _make_stamp(tile, tw, pts, factor):
             sbuf[di * 2] = val & 0xFF
             sbuf[di * 2 + 1] = (val >> 8) & 0xFF
             mask[di >> 3] |= 1 << (di & 7)
-        stamps.append((factor, x0, y0, sw, sh, sbuf, mask))
+        spans = _opaque_spans(mask, sw, sh)
+        stamps.append((factor, x0, y0, sw, sh, sbuf, mask, spans))
     return stamps
 
 
-def _blit_stamp(window, vw, tw, stamp, scroll):
-    factor, ox, oy, sw, sh, sbuf, mask = stamp
+def _opaque_spans(mask, sw, sh):
+    """Horizontal opaque runs. 4 bytes each: x u16 LE, y, len. Built once."""
+    out = bytearray()
+    y = 0
+    while y < sh:
+        row = y * sw
+        x = 0
+        while x < sw:
+            di = row + x
+            if (mask[di >> 3] & (1 << (di & 7))) == 0:
+                x += 1
+                continue
+            x1 = x + 1
+            limit = x + 255
+            if limit > sw:
+                limit = sw
+            while x1 < limit:
+                di2 = row + x1
+                if (mask[di2 >> 3] & (1 << (di2 & 7))) == 0:
+                    break
+                x1 += 1
+            ln = x1 - x
+            out.append(x & 0xFF)
+            out.append((x >> 8) & 0xFF)
+            out.append(y & 0xFF)
+            out.append(ln & 0xFF)
+            x = x1
+        y += 1
+    return out
+
+
+# Face-button hook and the idle watchdog. Both stay None until main() arms
+# them, so a host pixel compare never touches the panel or the WDT.
+_BTN_HOOK = None
+_WDT = None
+_HTTP_STATE = {"busy": False, "done": False}
+_SOCKET_TIMEOUT_S = None
+_SOCKET_PATCHED = False
+_ROW_SCRATCH = bytearray(W * 2)
+_SCENERY_KIND = None
+_blit_stamp_viper = None
+_blit_stamp_clip_viper = None
+# 0 unknown, 1 poll has reported writable, 2 this port has no poll.
+_STDOUT_POLL = 0
+
+
+def _stdout_can_write():
+    """True when a short print should not block on a full USB CDC buffer.
+
+    MicroPython's stream poll is ioctl(3, 4): MP_STREAM_POLL / POLL_WR.
+    A missing ioctl keeps the V14 print. A zero result is trusted only
+    after one poll has come back writable, so a port that always returns
+    0 still prints. Counters stay put when this returns False.
+    """
+    global _STDOUT_POLL
+    _brk_enter("cdc")
+    try:
+        return _stdout_can_write_body()
+    finally:
+        _brk_exit()
+
+
+def _stdout_can_write_body():
+    global _STDOUT_POLL
+    if _STDOUT_POLL == 2:
+        return True
+    try:
+        import sys
+        out = sys.stdout
+        ioctl = getattr(out, "ioctl", None)
+        if ioctl is None:
+            buf = getattr(out, "buffer", None)
+            ioctl = getattr(buf, "ioctl", None) if buf is not None else None
+        if ioctl is None:
+            _STDOUT_POLL = 2
+            return True
+        got = ioctl(3, 4)
+    except Exception:
+        _STDOUT_POLL = 2
+        return True
+    ready = False
+    try:
+        if got is not None and (int(got) & 4) != 0:
+            ready = True
+    except Exception:
+        _STDOUT_POLL = 2
+        return True
+    if ready:
+        _STDOUT_POLL = 1
+        return True
+    if _STDOUT_POLL == 1:
+        return False
+    return True
+
+
+def _feed_wdt():
+    _brk_enter("wdt")
+    try:
+        wdt = _WDT
+        if wdt is not None:
+            try:
+                wdt.feed()
+            except Exception:
+                pass
+    finally:
+        _brk_exit()
+
+
+def _service():
+    """Feed the watchdog, and poll the face button if it is due.
+
+    ButtonWatch ignores calls closer than FRAME_MIN_MS, so a paint can
+    still call this without stacking M5.update on the frame.
+    """
+    _brk_enter("svc")
+    try:
+        _feed_wdt()
+        hook = _BTN_HOOK
+        if hook is not None:
+            try:
+                hook()
+            except Exception:
+                pass
+    finally:
+        _brk_exit()
+
+
+def _init_wdt():
+    """Arm a long watchdog after boot allocs. A failed port just leaves it off."""
+    global _WDT
+    if _WDT is not None:
+        return
+    try:
+        import machine
+    except ImportError:
+        return
+    ctor = getattr(machine, "WDT", None)
+    if ctor is None:
+        return
+    for timeout in (WDT_TIMEOUT_MS, 15000, 8000, 5000):
+        try:
+            _WDT = ctor(timeout=timeout)
+            print("wdt", timeout)
+            return
+        except Exception:
+            _WDT = None
+
+
+def _arm_socket_timeout(seconds):
+    """New sockets inherit this timeout. getaddrinfo may still block; see OTA."""
+    global _SOCKET_TIMEOUT_S, _SOCKET_PATCHED
+    _SOCKET_TIMEOUT_S = seconds
+    if _SOCKET_PATCHED:
+        return
+    mods = []
+    for name in ("usocket", "socket"):
+        try:
+            mods.append(__import__(name))
+        except ImportError:
+            pass
+    def wrap(orig):
+        def socket_fn(*args, **kwargs):
+            sock = orig(*args, **kwargs)
+            timeout = _SOCKET_TIMEOUT_S
+            if timeout is not None:
+                try:
+                    sock.settimeout(timeout)
+                except Exception:
+                    pass
+            return sock
+        return socket_fn
+    for mod in mods:
+        if hasattr(mod, "socket"):
+            try:
+                mod.socket = wrap(mod.socket)
+            except Exception:
+                pass
+        try:
+            mod.setdefaulttimeout(seconds)
+        except Exception:
+            pass
+    _SOCKET_PATCHED = True
+
+
+def _call_bounded(fn, timeout_ms):
+    """Run fn while the face button stays live. (True, value) or (False, err).
+
+    The socket timeout is what unblocks a hung GET. The waiter also returns
+    so the gauge loop cannot sit inside one check. A second check does not
+    start while the first thread is still inside the socket.
+    """
+    st = _HTTP_STATE
+    if st["busy"]:
+        _service()
+        if st["done"]:
+            st["busy"] = False
+            st["done"] = False
+        return False, "busy"
+    seconds = (timeout_ms + 200) / 1000.0
+    if seconds < 0.2:
+        seconds = 0.2
+    _arm_socket_timeout(seconds)
+    st["busy"] = True
+    st["done"] = False
+    box = []
+
+    def work():
+        try:
+            box.append(fn())
+        except Exception as e:
+            box.append(e)
+        st["done"] = True
+
+    started = False
+    try:
+        import _thread
+        _thread.start_new_thread(work, ())
+        started = True
+    except Exception:
+        started = False
+    if not started:
+        try:
+            value = fn()
+        except Exception as e:
+            st["busy"] = False
+            st["done"] = False
+            _service()
+            return False, "http " + str(e)
+        st["busy"] = False
+        st["done"] = False
+        _service()
+        return True, value
+    wait_ms = timeout_ms + 800
+    t0 = time.ticks_ms()
+    while not st["done"]:
+        _service()
+        if time.ticks_diff(time.ticks_ms(), t0) >= wait_ms:
+            # Leave busy set. The thread clears done when the socket returns.
+            return False, "timeout"
+        try:
+            time.sleep_ms(20)
+        except Exception:
+            time.sleep(0.02)
+    st["busy"] = False
+    st["done"] = False
+    _service()
+    if not box:
+        return False, "empty"
+    item = box[0]
+    if isinstance(item, BaseException):
+        return False, "http " + str(item)
+    return True, item
+
+
+def _install_ota_fetch_timeout(mod):
+    """Bound ota_client HTTP without changing its 90s poll or update rules."""
+    if mod is None or getattr(mod, "_atom_http_timeout", False):
+        return
+    orig = getattr(mod, "_http_get", None)
+    if orig is not None:
+        def _http_get(url):
+            ok, val = _call_bounded(lambda: orig(url), OTA_HTTP_TIMEOUT_MS)
+            if not ok:
+                return None, val
+            return val
+        mod._http_get = _http_get
+    orig_apply = getattr(mod, "apply_update", None)
+    if orig_apply is not None:
+        def apply_update(doc, version_url):
+            # Feed across the file swap. The GET itself is already bounded.
+            _service()
+            try:
+                return orig_apply(doc, version_url)
+            finally:
+                _service()
+        mod.apply_update = apply_update
+    mod._atom_http_timeout = True
+
+
+def _blit_stamp_py(window, vw, tw, stamp, scroll):
+    """V12 scenery blit. The viper path has to match these pixels."""
+    factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
     off = int(scroll * factor) % tw
     if off < 0:
         off += tw
@@ -1054,7 +1871,11 @@ def _blit_stamp(window, vw, tw, stamp, scroll):
             src_x1 = vw - cand
         if src_x1 <= src_x0:
             continue
+        row = 0
         for dy in range(sh):
+            if (row & 7) == 0:
+                _service()
+            row += 1
             wy = oy + dy
             row_i = dy * sw
             dst_row = wy * vw
@@ -1066,6 +1887,22 @@ def _blit_stamp(window, vw, tw, stamp, scroll):
                     diw = (dst_row + wx) * 2
                     window[diw] = sbuf[si]
                     window[diw + 1] = sbuf[si + 1]
+
+
+def _blit_stamp(window, vw, tw, stamp, scroll):
+    _service()
+    kind = _SCENERY_KIND
+    if kind is None:
+        kind = _ensure_scenery()
+    if kind == "viper":
+        try:
+            factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
+            off = _norm_off(scroll * factor, tw)
+            _blit_stamp_viper(window, vw, tw, sbuf, mask, sw, sh, ox, oy, off)
+            return
+        except Exception:
+            _drop_scenery_viper()
+    _blit_stamp_py(window, vw, tw, stamp, scroll)
 
 
 def build_parallax_layers(tile, tw, th):
@@ -1089,11 +1926,13 @@ def build_parallax_layers(tile, tw, th):
 
 
 def compose_parallax_window(tile, tw, th, scroll, stamps, window, vw):
+    _service()
     _copy_rows(tile, tw, 0, HORIZON_Y, scroll * PARALLAX_CLOUDS, window, vw, 0)
     _copy_rows(tile, tw, HORIZON_Y, GRASS_Y, scroll * PARALLAX_WATER, window, vw, HORIZON_Y)
     _copy_rows(tile, tw, GRASS_Y, th, scroll * PARALLAX_GROUND, window, vw, GRASS_Y)
     for st in stamps:
         _blit_stamp(window, vw, tw, st, scroll)
+    _service()
 
 
 def _norm_off(value, tw):
@@ -1102,6 +1941,53 @@ def _norm_off(value, tw):
     if off < 0:
         off += tw
     return off
+
+
+def _signed_delta(old, new, tw):
+    """Smallest scroll step from old to new, in (-tw/2, tw/2]."""
+    d = (new - old) % tw
+    if d > (tw // 2):
+        d -= tw
+    return d
+
+
+def _shift_window_band(window, vw, tile, tw, y0, y1, delta, off_new):
+    """Slide band rows by delta and paint the columns that entered the screen.
+
+    delta > 0 moves existing pixels left (scroll offset increased). The new
+    columns are the backdrop at off_new, same pixels _copy_rows would write.
+    """
+    if delta == 0 or y1 <= y0 or vw <= 0:
+        return
+    scratch = _ROW_SCRATCH
+    y = y0
+    if delta > 0:
+        keep = vw - delta
+        n = keep * 2
+        src = delta * 2
+        x0 = vw - delta
+        x1 = vw
+        while y < y1:
+            if ((y - y0) & 7) == 0:
+                _service()
+            row = y * vw * 2
+            scratch[0:n] = window[row + src:row + src + n]
+            window[row:row + n] = scratch[0:n]
+            _copy_partial_row(tile, tw, y, off_new, window, x0, x1, vw)
+            y += 1
+        return
+    e = 0 - delta
+    keep = vw - e
+    n = keep * 2
+    dst = e * 2
+    while y < y1:
+        if ((y - y0) & 7) == 0:
+            _service()
+        row = y * vw * 2
+        scratch[0:n] = window[row:row + n]
+        window[row + dst:row + dst + n] = scratch[0:n]
+        _copy_partial_row(tile, tw, y, off_new, window, 0, e, vw)
+        y += 1
 
 
 def _mono_us():
@@ -1116,6 +2002,736 @@ def _us_diff(later, earlier):
     if fn is not None:
         return fn(later, earlier)
     return later - earlier
+
+
+# Once-a-second breakdown of the present loop. The `timing` line stays
+# compose+stamp+push. These buckets are the calls that line does not
+# cover, plus the paint pieces inside that total, so `left` is the part
+# of the frame period that no probe named. avg/max are milliseconds.
+# A full CDC skips the print and keeps the counters.
+_BRK_ORDER = (
+    "sleep", "wdt", "frames", "serial", "cdc", "m5", "poll",
+    "can", "sweep", "auto", "ota", "pix", "adv", "plan",
+    "compose", "sonic", "hud", "rings", "fx", "dig", "svc",
+    "copy", "fault", "push", "fill", "flush", "gauge", "gc", "timing",
+    "draw", "tick", "pace",
+)
+_BRK_SUM = {}
+_BRK_MAX = {}
+_BRK_FR = {}
+for _brk_name in _BRK_ORDER:
+    _BRK_SUM[_brk_name] = 0
+    _BRK_MAX[_brk_name] = 0
+    _BRK_FR[_brk_name] = 0
+_BRK_SUM["left"] = 0
+_BRK_SUM["over"] = 0
+_BRK_MAX["left"] = 0
+_BRK_MAX["over"] = 0
+_BRK_ST = [None] * 16
+_BRK_STN = 0
+_BRK_NAME = None
+_BRK_AT = 0
+_BRK_N = 0
+_BRK_WALL = 0
+_BRK_WALL_MAX = 0
+_BRK_T0 = 0
+# The timing line that already arrives intact on this USB CDC is 139
+# characters. A longer brk print was cut at the front and stalled a frame.
+_BRK_CDC = 139
+_BRK_PAGE = 0
+_BRK_ALT_I = 0
+# Page 0, in the order they are added. wall and left go first so a long
+# value cannot push them off the end.
+_BRK_PAGE0 = (
+    "wall", "left", "sleep", "m5", "serial", "compose",
+    "draw", "push", "copy", "over",
+)
+# Page 1 always carries the budget check, then the other buckets.
+_BRK_PAGE1 = ("wall", "left", "over", "copy")
+_BRK_REST = (
+    "tick", "svc", "gauge", "sonic", "hud", "rings", "plan", "adv",
+    "wdt", "frames", "cdc", "poll", "can", "sweep", "auto", "ota", "pix",
+    "fx", "dig", "fault", "fill", "flush", "gc", "timing", "pace",
+)
+
+
+def _brk_add(name, us):
+    if us < 0:
+        us = 0
+    if name not in _BRK_FR:
+        return
+    _BRK_FR[name] = _BRK_FR[name] + us
+
+
+def _brk_enter(name):
+    """Pause the open bucket and start `name`. Nested calls stay exclusive."""
+    global _BRK_NAME, _BRK_AT, _BRK_STN
+    now = _mono_us()
+    cur = _BRK_NAME
+    if cur is not None:
+        _brk_add(cur, _us_diff(now, _BRK_AT))
+        if _BRK_STN < len(_BRK_ST):
+            _BRK_ST[_BRK_STN] = cur
+            _BRK_STN += 1
+    _BRK_NAME = name
+    _BRK_AT = now
+
+
+def _brk_exit():
+    global _BRK_NAME, _BRK_AT, _BRK_STN
+    now = _mono_us()
+    cur = _BRK_NAME
+    dur = 0
+    if cur is not None:
+        dur = _us_diff(now, _BRK_AT)
+        if dur < 0:
+            dur = 0
+        _brk_add(cur, dur)
+    if _BRK_STN > 0:
+        _BRK_STN -= 1
+        _BRK_NAME = _BRK_ST[_BRK_STN]
+        _BRK_ST[_BRK_STN] = None
+        _BRK_AT = now
+    else:
+        _BRK_NAME = None
+    if cur is not None and dur >= _PAUSE_HITCH_US:
+        _pause_on_slow(cur, dur)
+
+
+def _brk_reset_sums():
+    global _BRK_N, _BRK_WALL, _BRK_WALL_MAX
+    for name in _BRK_SUM:
+        _BRK_SUM[name] = 0
+        _BRK_MAX[name] = 0
+    _BRK_N = 0
+    _BRK_WALL = 0
+    _BRK_WALL_MAX = 0
+
+
+def _brk_reset_all():
+    global _BRK_NAME, _BRK_AT, _BRK_STN, _BRK_T0, _BRK_PAGE, _BRK_ALT_I
+    _brk_reset_sums()
+    for name in _BRK_FR:
+        _BRK_FR[name] = 0
+    i = 0
+    while i < _BRK_STN:
+        _BRK_ST[i] = None
+        i += 1
+    _BRK_STN = 0
+    _BRK_NAME = None
+    _BRK_AT = 0
+    _BRK_T0 = 0
+    _BRK_PAGE = 0
+    _BRK_ALT_I = 0
+
+
+def _brk_commit(wall):
+    """Close one frame. `left` is wall minus the named buckets."""
+    global _BRK_N, _BRK_WALL, _BRK_WALL_MAX
+    if wall < 0:
+        wall = 0
+    total = 0
+    for name in _BRK_ORDER:
+        us = _BRK_FR[name]
+        _BRK_FR[name] = 0
+        if us <= 0:
+            continue
+        total += us
+        _BRK_SUM[name] = _BRK_SUM[name] + us
+        if us > _BRK_MAX[name]:
+            _BRK_MAX[name] = us
+    left = wall - total
+    if left < 0:
+        over = -left
+        left = 0
+    else:
+        over = 0
+    _BRK_SUM["left"] = _BRK_SUM["left"] + left
+    _BRK_SUM["over"] = _BRK_SUM["over"] + over
+    if left > _BRK_MAX["left"]:
+        _BRK_MAX["left"] = left
+    if over > _BRK_MAX["over"]:
+        _BRK_MAX["over"] = over
+    if wall > _BRK_WALL_MAX:
+        _BRK_WALL_MAX = wall
+    _BRK_WALL += wall
+    _BRK_N += 1
+    if left >= _PAUSE_HITCH_US:
+        _pause_on_slow("left", left)
+
+
+def _brk_field(name, total, n, peak):
+    return "%s %s/%s" % (
+        name,
+        _fmt_tenths(_avg_tenths_ms(total, n)),
+        _fmt_tenths(_avg_tenths_ms(peak, 1)),
+    )
+
+
+def _brk_line():
+    """Full counter line. The USB print uses `_brk_cdc_line` instead.
+
+    Each field is average/max milliseconds. `wall` is the loop period.
+    `left` was not inside any named call. `over` means the named calls
+    summed past the period.
+    """
+    n = _BRK_N
+    parts = ["brk n=%d" % n, _brk_field("wall", _BRK_WALL, n, _BRK_WALL_MAX)]
+    for name in _BRK_ORDER:
+        parts.append(_brk_field(name, _BRK_SUM[name], n, _BRK_MAX[name]))
+    parts.append(_brk_field("left", _BRK_SUM["left"], n, _BRK_MAX["left"]))
+    parts.append(_brk_field("over", _BRK_SUM["over"], n, _BRK_MAX["over"]))
+    return " ".join(parts)
+
+
+def _brk_text(name, n):
+    if name == "wall":
+        return _brk_field("wall", _BRK_WALL, n, _BRK_WALL_MAX)
+    return _brk_field(name, _BRK_SUM.get(name, 0), n, _BRK_MAX.get(name, 0))
+
+
+def _brk_pack(names, n, limit):
+    """Join fields until one more would pass the CDC length."""
+    s = "brk n=%d" % n
+    for name in names:
+        nxt = s + " " + _brk_text(name, n)
+        if len(nxt) > limit:
+            break
+        s = nxt
+    return s
+
+
+def _brk_cdc_line():
+    """One short line. Pages alternate so an 80 s listen still ranks buckets.
+
+    Page 0: wall left sleep m5 serial compose draw push copy over
+    Page 1: wall left over copy, then the other non-zero buckets.
+    Both stay within the timing-line length. Zero buckets on page 1 are
+    left off. A full set of non-zero buckets continues on the next page 1.
+    """
+    global _BRK_PAGE, _BRK_ALT_I
+    n = _BRK_N
+    if n <= 0:
+        n = 1
+    if _BRK_PAGE == 0:
+        _BRK_PAGE = 1
+        return _brk_pack(_BRK_PAGE0, n, _BRK_CDC)
+    _BRK_PAGE = 0
+    s = _brk_pack(_BRK_PAGE1, n, _BRK_CDC)
+    rest = []
+    for name in _BRK_REST:
+        if _BRK_SUM.get(name, 0) > 0 or _BRK_MAX.get(name, 0) > 0:
+            rest.append(name)
+    if not rest:
+        _BRK_ALT_I = 0
+        return s
+    i = _BRK_ALT_I
+    if i >= len(rest):
+        i = 0
+    taken = 0
+    k = 0
+    while k < len(rest):
+        piece = _brk_text(rest[(i + k) % len(rest)], n)
+        nxt = s + " " + piece
+        if len(nxt) > _BRK_CDC:
+            break
+        s = nxt
+        taken += 1
+        k += 1
+    if taken == 0:
+        _BRK_ALT_I = (i + 1) % len(rest)
+    elif taken >= len(rest):
+        _BRK_ALT_I = 0
+    else:
+        _BRK_ALT_I = (i + taken) % len(rest)
+    return s
+
+
+def _brk_maybe_print(now):
+    """One short line a second, and only when USB CDC can take it."""
+    global _BRK_T0
+    if _BRK_T0 == 0:
+        _BRK_T0 = now
+        return
+    if _ms_diff(now, _BRK_T0) < 1000:
+        return
+    if _BRK_N <= 0:
+        return
+    if not _stdout_can_write():
+        return
+    print(_brk_cdc_line())
+    _brk_reset_sums()
+    _BRK_T0 = now
+    _pause_maybe_print()
+
+
+# A bucket at least this long is a hitch, not steady draw or push work.
+# Logged only. It does not itself collect.
+_PAUSE_HITCH_US = 80000
+_PAUSE_RISE = 1024
+_PAUSE_CAP = 8
+_PAUSE_CAUSE = [None] * _PAUSE_CAP
+_PAUSE_WHERE = [None] * _PAUSE_CAP
+_PAUSE_US = [0] * _PAUSE_CAP
+_PAUSE_A = [0] * _PAUSE_CAP
+_PAUSE_B = [0] * _PAUSE_CAP
+_PAUSE_N = 0
+_PAUSE_DROP = 0
+_PAUSE_FREE = -1
+# Extra fields for a gcwake record: free heap and the ticks_us at the decision.
+_PAUSE_C = [0] * _PAUSE_CAP
+_PAUSE_D = [0] * _PAUSE_CAP
+
+
+def _pause_push(cause, where, dur, a, b):
+    """Queue one pause. The print happens later, and only if CDC is free."""
+    global _PAUSE_N, _PAUSE_DROP
+    if _PAUSE_N >= _PAUSE_CAP:
+        _PAUSE_DROP += 1
+        return
+    i = _PAUSE_N
+    _PAUSE_CAUSE[i] = cause
+    _PAUSE_WHERE[i] = where
+    _PAUSE_US[i] = dur
+    _PAUSE_A[i] = a
+    _PAUSE_B[i] = b
+    _PAUSE_C[i] = 0
+    _PAUSE_D[i] = 0
+    _PAUSE_N = i + 1
+
+
+def _pause_k(n):
+    if n is None or n < 0:
+        return "na"
+    if n >= 1000:
+        return "%dk" % (n // 1000)
+    return "%d" % n
+
+
+def _pause_ms(us):
+    if us < 0:
+        us = 0
+    return _fmt_tenths(_avg_tenths_ms(us, 1))
+
+
+def _gc_int(fn):
+    if fn is None:
+        return -1
+    try:
+        val = fn()
+    except Exception:
+        return -1
+    if isinstance(val, tuple):
+        if not val:
+            return -1
+        val = val[0]
+    try:
+        return int(val)
+    except Exception:
+        return -1
+
+
+def _gc_sample():
+    """Threshold, bytes allocated, and bytes free. Reads only.
+
+    This port exposes gc.threshold(), gc.mem_alloc(), and gc.mem_free().
+    mem_alloc is the heap bytes still in use, not a count of objects.
+    A missing call stays -1.
+    """
+    try:
+        import gc
+    except ImportError:
+        return -1, -1, -1
+    th = _gc_int(getattr(gc, "threshold", None))
+    alloc = _gc_int(getattr(gc, "mem_alloc", None))
+    free = _mem_free()
+    return th, alloc, free
+
+
+def _gcwake_push(kind, t0, us, th, alloc, free):
+    """Queue one wake-up. kind is no, yes, or run. Printed only if CDC can take it."""
+    before = _PAUSE_N
+    if us < 0:
+        us = 0
+    _pause_push("gcwake", kind, us, th, alloc)
+    if _PAUSE_N > before:
+        i = _PAUSE_N - 1
+        _PAUSE_C[i] = free
+        _PAUSE_D[i] = t0
+
+
+def _pause_on_slow(where, dur):
+    """A long span. autogc if the heap grew since the last sample, else stall.
+
+    The milliseconds are the whole span. They are not a clock around the
+    collector. An explicit gc.collect in this same span is already queued.
+    """
+    global _PAUSE_FREE
+    if (
+        _PAUSE_N > 0
+        and _PAUSE_CAUSE[_PAUSE_N - 1] == "collect"
+        and _PAUSE_WHERE[_PAUSE_N - 1] == where
+    ):
+        return
+    free = _mem_free()
+    prev = _PAUSE_FREE
+    if free >= 0:
+        _PAUSE_FREE = free
+    if prev >= 0 and free > prev + _PAUSE_RISE:
+        _pause_push("autogc", where, dur, prev, free)
+    else:
+        _pause_push("stall", where, dur, free, prev)
+
+
+def _pause_piece(i):
+    cause = _PAUSE_CAUSE[i]
+    where = _PAUSE_WHERE[i]
+    dur = _PAUSE_US[i]
+    a = _PAUSE_A[i]
+    b = _PAUSE_B[i]
+    if cause == "thresh":
+        if b < 0:
+            age = "none"
+        else:
+            age = "%ds" % (b // 1000)
+        return "thresh %s %sms free %s age %s" % (where, _pause_ms(dur), _pause_k(a), age)
+    if cause == "collect":
+        return "collect %s %sms %s>%s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
+    if cause == "gcthresh":
+        return "gcthresh %db" % a
+    if cause == "gcauto":
+        return "gcauto %s" % ("off" if a == 0 else "on")
+    if cause == "gcwake":
+        # where is no, yes, or run. dur is the microsecond span.
+        # a is the threshold, b is gc.mem_alloc, C is free, D is t0.
+        return "gcwake %s t0 %d us %d th %d alloc %d free %d" % (
+            where, _PAUSE_D[i], dur, a, b, _PAUSE_C[i]
+        )
+    if cause == "autogc":
+        return "autogc %s %sms %s>%s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
+    return "stall %s %sms free %s was %s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
+
+
+def _pause_shift(keep_from):
+    global _PAUSE_N
+    j = 0
+    i = keep_from
+    while i < _PAUSE_N:
+        _PAUSE_CAUSE[j] = _PAUSE_CAUSE[i]
+        _PAUSE_WHERE[j] = _PAUSE_WHERE[i]
+        _PAUSE_US[j] = _PAUSE_US[i]
+        _PAUSE_A[j] = _PAUSE_A[i]
+        _PAUSE_B[j] = _PAUSE_B[i]
+        _PAUSE_C[j] = _PAUSE_C[i]
+        _PAUSE_D[j] = _PAUSE_D[i]
+        j += 1
+        i += 1
+    _PAUSE_N = j
+
+
+def _pause_line():
+    """One CDC-sized line, or None. Unprinted events stay queued."""
+    global _PAUSE_DROP
+    if _PAUSE_N <= 0 and _PAUSE_DROP <= 0:
+        return None
+    parts = []
+    used = 6
+    i = 0
+    while i < _PAUSE_N:
+        piece = _pause_piece(i)
+        add = len(piece) + (0 if not parts else 1)
+        if used + add > _BRK_CDC:
+            break
+        parts.append(piece)
+        used += add
+        i += 1
+    if _PAUSE_DROP > 0:
+        tail = "drop %d" % _PAUSE_DROP
+        add = len(tail) + (0 if not parts else 1)
+        if used + add <= _BRK_CDC:
+            parts.append(tail)
+            _PAUSE_DROP = 0
+    if not parts:
+        return None
+    if i > 0:
+        _pause_shift(i)
+    return "pause " + " ".join(parts)
+
+
+def _pause_maybe_print():
+    """After the brk line. A full CDC keeps the queue and changes nothing else.
+
+    Up to four short lines, so a burst of stalls is not dropped. Each line
+    stays inside the 139 character cap.
+    """
+    n = 0
+    while n < 4:
+        if _PAUSE_N <= 0 and _PAUSE_DROP <= 0:
+            return
+        if not _stdout_can_write():
+            return
+        line = _pause_line()
+        if not line:
+            return
+        print(line)
+        n += 1
+
+
+def _install_pause_gc():
+    """Time every gc.collect. Set the auto threshold, then log the live value."""
+    try:
+        import gc
+    except ImportError:
+        return
+    orig = getattr(gc, "collect", None)
+    if orig is not None and not getattr(orig, "_pause_wrapped", False):
+        def _wrapped():
+            th, alloc, free0 = _gc_sample()
+            t0 = _mono_us()
+            try:
+                return orig()
+            finally:
+                dur = _us_diff(_mono_us(), t0)
+                if dur < 0:
+                    dur = 0
+                free1 = _mem_free()
+                global _PAUSE_FREE
+                if free1 >= 0:
+                    _PAUSE_FREE = free1
+                where = _BRK_NAME
+                if not where:
+                    where = "boot"
+                _pause_push("collect", where, dur, free0, free1)
+                _gcwake_push("run", t0, dur, th, alloc, free0)
+        _wrapped._pause_wrapped = True
+        try:
+            gc.collect = _wrapped
+        except Exception:
+            pass
+    fn = getattr(gc, "threshold", None)
+    if fn is None:
+        return
+    try:
+        fn(GC_AUTO_BYTES)
+    except Exception:
+        # The write failed, so the previous threshold is unchanged.
+        # The read below still runs, and that live value is what we log.
+        pass
+    val = None
+    try:
+        val = fn()
+    except Exception:
+        val = None
+    if isinstance(val, tuple):
+        if not val:
+            val = None
+        else:
+            val = val[0]
+    try:
+        val = int(val)
+    except Exception:
+        val = None
+    if val is None:
+        # Do not claim GC_AUTO_BYTES. -1 means the live value could not be read.
+        _pause_push("gcthresh", "gc", 0, -1, 0)
+    else:
+        _pause_push("gcthresh", "gc", 0, val, 0)
+    # Stop C from calling gc_collect inside gc_alloc. An explicit collect
+    # still runs, and only after a finished present.
+    dis = getattr(gc, "disable", None)
+    off = False
+    if dis is not None:
+        try:
+            dis()
+            off = True
+        except Exception:
+            off = False
+    isen = getattr(gc, "isenabled", None)
+    if isen is not None:
+        try:
+            off = not bool(isen())
+        except Exception:
+            pass
+    _pause_push("gcauto", "gc", 0, 0 if off else 1, 0)
+
+
+_install_pause_gc()
+
+
+_GC_ALLOC_MARK = None
+_GC_CHECK_N = 0
+
+
+def _gc_after_present():
+    """Collect only after a present, and only after a large allocation gap.
+
+    Called once ui.tick has returned, so compose, stamp, and the display
+    push are already finished. mem_alloc is sampled every GC_CHECK_FRAMES
+    presents, not every frame. A collect here goes through gc.collect, so
+    the existing gcwake / collect lines still record it.
+    """
+    global _GC_ALLOC_MARK, _GC_CHECK_N
+    _GC_CHECK_N += 1
+    if _GC_CHECK_N < GC_CHECK_FRAMES:
+        return
+    _GC_CHECK_N = 0
+    try:
+        import gc
+    except ImportError:
+        return
+    alloc = _gc_int(getattr(gc, "mem_alloc", None))
+    if alloc < 0:
+        return
+    mark = _GC_ALLOC_MARK
+    if mark is None or alloc < mark:
+        _GC_ALLOC_MARK = alloc
+        return
+    if alloc - mark < GC_BETWEEN_BYTES:
+        return
+    _brk_enter("gc")
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    finally:
+        _brk_exit()
+    alloc2 = _gc_int(getattr(gc, "mem_alloc", None))
+    _GC_ALLOC_MARK = alloc2 if alloc2 >= 0 else alloc
+
+
+def draw_due(now, next_draw):
+    """True when the next present is due. None starts immediately."""
+    if next_draw is None:
+        return True
+    return time.ticks_diff(now, next_draw) >= 0
+
+
+def next_draw_deadline(now):
+    """The following present, one ring quantum after this sample."""
+    try:
+        return time.ticks_add(now, RING_FPS_MS)
+    except Exception:
+        return now + RING_FPS_MS
+
+
+def _pace_us():
+    """Ring quantum in microseconds. ticks_ms rounds this to the 10 ms tick."""
+    return RING_FPS_MS * 1000
+
+
+def _ticks_add(now, delta):
+    try:
+        return time.ticks_add(now, delta)
+    except Exception:
+        return now + delta
+
+
+def pace_after(started, finished, quantum=None):
+    """Deadline, in the same ticks as started and finished.
+
+    Pass microsecond samples. The deadline is finished plus the leftover
+    microseconds, not a millisecond remainder that sleep_ms rounds up to
+    the next 10 ms tick. None means the paint already used the quantum.
+    """
+    if quantum is None:
+        quantum = _pace_us()
+    spent = _us_diff(finished, started)
+    if spent < 0 or spent >= quantum:
+        return None
+    return _ticks_add(finished, quantum - spent)
+
+
+def pace_remain(started, finished, quantum=None):
+    """Microseconds to sleep after finished. 0 when the frame was late."""
+    deadline = pace_after(started, finished, quantum)
+    if deadline is None:
+        return 0
+    remain = _us_diff(deadline, finished)
+    if remain < 0:
+        return 0
+    return remain
+
+
+def _sleep_us(us):
+    """One sleep. A 10 ms RTOS tick makes sleep_ms round a short leftover up."""
+    if us <= 0:
+        return
+    try:
+        time.sleep_us(us)
+        return
+    except Exception:
+        pass
+    try:
+        time.sleep(us / 1000000.0)
+    except Exception:
+        pass
+
+
+def live_can(bus, last_rx_ms, now):
+    """True when a CAN frame has arrived inside the fault watchdog."""
+    if bus is None or not last_rx_ms:
+        return False
+    gap = time.ticks_diff(now, last_rx_ms)
+    if gap < 0:
+        return False
+    return gap <= WATCHDOG_MS
+
+
+# Off-vehicle only. 10 s after the first present, then 20 s after each
+# sweep returns to rest. Never while a sweep is running or CAN is live.
+AUTO_SWEEP_BOOT_MS = 10000
+AUTO_SWEEP_IDLE_MS = 20000
+
+
+def auto_sweep_due(now, present_t0, active, can_live, boot_armed, idle_since):
+    """Return (start, boot_armed, idle_since).
+
+    present_t0 is the first present, not boot. active suppresses a start.
+    can_live suppresses every auto start. boot_armed is the first wait.
+    After any sweep, idle_since counts 20 s of rest.
+    """
+    if active:
+        return False, False, None
+    if present_t0 is None or can_live:
+        return False, boot_armed, idle_since
+    if boot_armed:
+        if time.ticks_diff(now, present_t0) >= AUTO_SWEEP_BOOT_MS:
+            return True, False, None
+        return False, True, idle_since
+    if idle_since is None:
+        idle_since = now
+    if time.ticks_diff(now, idle_since) >= AUTO_SWEEP_IDLE_MS:
+        return True, False, None
+    return False, False, idle_since
+
+
+def anim_dt(dt):
+    """Milliseconds of scroll, boost, and cycle to apply for one frame.
+
+    A stall longer than REFRESH_MS does not catch up. The picture holds,
+    then motion continues from the same speed instead of jumping ahead.
+    """
+    if dt < 0 or dt > REFRESH_MS:
+        return REFRESH_MS
+    return dt
+
+
+def collect_due(free, since_ms):
+    """Whether this window should run gc.collect.
+
+    free: gc.mem_free(), or -1 if it could not be read.
+    since_ms: time since the last collect. A large value if none yet.
+    Speed does not matter. A healthy heap never collects on the timing
+    line, including at 0 km/h. Under GC_LOW_FREE, wait GC_MOVE_MIN_MS.
+    Under GC_CRITICAL_FREE, collect immediately. Unknown free skips.
+    """
+    if free < 0:
+        return False
+    if free < GC_CRITICAL_FREE:
+        return True
+    if free < GC_LOW_FREE and since_ms >= GC_MOVE_MIN_MS:
+        return True
+    return False
 
 
 def _ms_diff(later, earlier):
@@ -1310,9 +2926,9 @@ def _stamp_screen_rects(ox, oy, sw, sh, off, tw, vw, vh):
     return found
 
 
-def _blit_stamp_clip(window, vw, tw, stamp, scroll, clip):
-    """Stamp pixels that land inside clip. Matches _blit_stamp inside that box."""
-    factor, ox, oy, sw, sh, sbuf, mask = stamp
+def _blit_stamp_clip_py(window, vw, tw, stamp, scroll, clip):
+    """Stamp pixels that land inside clip. Matches _blit_stamp_py inside that box."""
+    factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
     cx, cy, cw, ch = clip
     if cw <= 0 or ch <= 0 or sw <= 0 or sh <= 0:
         return
@@ -1379,7 +2995,28 @@ def _blit_stamp_clip(window, vw, tw, stamp, scroll, clip):
                     window[diw] = sbuf[si]
                     window[diw + 1] = sbuf[si + 1]
                 dx += 1
+            if (dy & 7) == 0:
+                _service()
             dy += 1
+
+
+def _blit_stamp_clip(window, vw, tw, stamp, scroll, clip):
+    _service()
+    kind = _SCENERY_KIND
+    if kind is None:
+        kind = _ensure_scenery()
+    if kind == "viper":
+        try:
+            factor, ox, oy, sw, sh, sbuf, mask = stamp[:7]
+            cx, cy, cw, ch = clip
+            off = _norm_off(scroll * factor, tw)
+            _blit_stamp_clip_viper(
+                window, vw, tw, sbuf, mask, sw, sh, ox, oy, off, cx, cy, cw, ch
+            )
+            return
+        except Exception:
+            _drop_scenery_viper()
+    _blit_stamp_clip_py(window, vw, tw, stamp, scroll, clip)
 
 
 # Sprite frames baked once at pack load. The mask bit for pixel i is
@@ -1563,31 +3200,216 @@ def stamp_baked(window, vw, vh, rgb, mask, sw, sh, dest_x, dest_y):
         stamp_sprite_rgb565(window, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
 
 
-def tint_sonic_scratch(pack, frame, arena, scratch_off, amount):
-    """Recolor one Sonic frame into the arena scratch. Base cache stays put.
+# Native C hot path. None on a host, or when gh_render.mpy will not import.
+# The Python compose stays as the fallback and as the pixel reference.
+_GH = None
+_GH_KIND = "py"
 
-    Non-blue indices keep the packed RGB565 (the same value fillRect would
-    round-trip). Blue indices use the breathing mix, then 565.
+
+def _load_native():
+    global _GH, _GH_KIND
+    try:
+        import gh_render as mod
+    except Exception:
+        _GH = None
+        _GH_KIND = "py"
+        return
+    _GH = mod
+    _GH_KIND = "native"
+
+
+def _native_self_test():
+    """Tiny compose, stamp, tint expand, and digit against the Python loops.
+
+    A miss drops the module. This runs while the caches are built, not
+    inside a timed frame.
     """
-    w = frame.w
-    h = frame.h
+    gh = _GH
+    if gh is None:
+        return False
+    try:
+        sw = 8
+        sh = 2
+        rgb = bytearray(sw * sh * 2)
+        mask = bytearray((sw * sh + 7) // 8)
+        i = 0
+        while i < sw * sh:
+            if (i & 1) != 0:
+                mask[i >> 3] = mask[i >> 3] | (1 << (i & 7))
+                rgb[i * 2] = (0xF0 + i) & 0xFF
+                rgb[i * 2 + 1] = (0x80 + i * 3) & 0xFF
+            i += 1
+        vw = 6
+        vh = 4
+        for dest_x, dest_y in ((0, 0), (-2, -1), (4, 1), (9, 0)):
+            a = bytearray(vw * vh * 2)
+            b = bytearray(vw * vh * 2)
+            j = 0
+            while j < len(a):
+                a[j] = 0x11
+                b[j] = 0x11
+                j += 1
+            gh.stamp(a, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
+            stamp_sprite_rgb565(b, vw, vh, rgb, mask, sw, sh, dest_x, dest_y)
+            if a != b:
+                return False
+        # Wider than the 128-wide window so a wrapped row stays inside the tile.
+        tw = 160
+        th = 8
+        tile = bytearray(tw * th * 2)
+        j = 0
+        while j < len(tile):
+            tile[j] = (j * 3) & 0xFF
+            tile[j + 1] = (j * 5) & 0xFF
+            j += 2
+        sw = 10
+        sh = 4
+        sbuf = bytearray(sw * sh * 2)
+        mask = bytearray((sw * sh + 7) // 8)
+        i = 0
+        while i < sw * sh:
+            if (i % 3) != 0:
+                mask[i >> 3] = mask[i >> 3] | (1 << (i & 7))
+                sbuf[i * 2] = (0xA0 + i) & 0xFF
+                sbuf[i * 2 + 1] = (0x10 + i * 5) & 0xFF
+            i += 1
+        stamp = (1.0, 20, 1, sw, sh, sbuf, mask)
+        # compose() always writes a 128-wide window, same as the panel.
+        window_w = 128
+        py = bytearray(window_w * th * 2)
+        nat = bytearray(window_w * th * 2)
+        off_c, off_w, off_g = 100, 140, 150
+        _copy_rows(tile, tw, 0, 3, off_c, py, window_w, 0)
+        _copy_rows(tile, tw, 3, 5, off_w, py, window_w, 3)
+        _copy_rows(tile, tw, 5, th, off_g, py, window_w, 5)
+        _blit_stamp_py(py, window_w, tw, stamp, off_g)
+        gh.compose(tile, tw, th, off_c, off_w, off_g, 3, 5, [stamp], [off_g], nat)
+        if py != nat:
+            return False
+        src = bytearray(b"\x10\x20\x01\x00")
+        pairs = bytearray(b"\x00\x00\x11\x22\x33\x44")
+        dst = bytearray(4 * 2)
+        ref = bytearray(4 * 2)
+        gh.expand(src, 2, 4, 4, 1, pairs, 3, dst)
+        # 4bpp row: pixels 1, 0, 2, 0 from bytes 0x10, 0x20? 
+        # x0 nibble high of byte0 = 1, x1 low = 0, x2 high of byte1 = 2, x3 low = 0.
+        ref[0] = 0x11
+        ref[1] = 0x22
+        ref[4] = 0x33
+        ref[5] = 0x44
+        if dst != ref:
+            return False
+        digit = bytearray(48 * 16 * 2)
+        gh.digits(digit, 48, 16, 0, 2, 7)
+        if digit == bytearray(len(digit)):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _drop_native():
+    global _GH, _GH_KIND
+    _GH = None
+    _GH_KIND = "py"
+
+
+def _note_c(name):
+    gh = _GH
+    if gh is None:
+        return
+    fn = getattr(gh, name, None)
+    if fn is None:
+        return
+    fn()
+
+
+def _note_presented():
+    """present-ok then refresh ok, after the panel call has returned."""
+    global _presented_n, _presented_total
+    _presented_n += 1
+    _presented_total += 1
+    if FRAME_TRACE:
+        _note_c("refresh_ok")
+    # The gap clock starts after those prints, so their serial stall shows
+    # up in the next frame's `other`, not inside raw.
+    _FLOW["present"] = _mono_us()
+    _FLOW["mem"] = _mem_free()
+    _FLOW["gap_printed"] = 0
+    _FLOW["gauge"] = 0
+    _FLOW["loop"] = 0
+    _FLOW["gc"] = 0
+    _FLOW["adv"] = 0
+    _FLOW["paint"] = 0
+
+
+_presented_n = 0
+_presented_total = 0
+_presented_t0 = 0
+
+
+def _report_presented(now):
+    """One line per second: playfield frames the panel accepted in that second."""
+    global _presented_n, _presented_t0
+    _brk_enter("frames")
+    try:
+        if _presented_t0 == 0:
+            _presented_t0 = now
+            return
+        if _ms_diff(now, _presented_t0) < 1000:
+            return
+        # A full USB CDC must not stall the present. Retry on a later pass.
+        if not _stdout_can_write():
+            return
+        _brk_enter("serial")
+        try:
+            print("frames %d total %d" % (_presented_n, _presented_total))
+        finally:
+            _brk_exit()
+        _presented_n = 0
+        _presented_t0 = now
+    finally:
+        _brk_exit()
+
+
+_load_native()
+
+
+def _tint_pair_bytes(pack, frame, amount):
+    """LE RGB565 pairs for one frame. Index 0 stays transparent (0, 0).
+
+    Non-blue indices keep the packed RGB565. Blue indices use the breathing
+    mix, then the same 565 rounding as the ocean bake.
+    """
     pal_id = frame.pal_id
     if pal_id < 0 or pal_id >= len(pack.palettes):
         pal_id = 0
     pal888 = pack.palettes[pal_id]
     pal565 = pack.palettes_565[pal_id]
     tinted = tint_blue_palette(pal888, amount)
-    pairs = []
     ncolors = len(pal565)
-    for i in range(ncolors):
+    out = bytearray(ncolors * 2)
+    i = 0
+    while i < ncolors:
         if i == 0:
-            pairs.append((0, 0))
+            i += 1
             continue
         if tinted[i] == pal888[i]:
             v = pal565[i]
         else:
             v = _rgb888_to_565(tinted[i])
-        pairs.append((v & 0xFF, (v >> 8) & 0xFF))
+        out[i * 2] = v & 0xFF
+        out[i * 2 + 1] = (v >> 8) & 0xFF
+        i += 1
+    return out
+
+
+def tint_sonic_scratch(pack, frame, arena, scratch_off, amount):
+    """Recolor one Sonic frame into the arena scratch. Base cache stays put."""
+    w = frame.w
+    h = frame.h
+    pairs = _tint_pair_bytes(pack, frame, amount)
+    ncolors = len(pairs) // 2
     scratch = memoryview(arena)[scratch_off:scratch_off + (w * h * 2)]
     data = pack.data
     base = pack.pix_off + frame.data_offset
@@ -1606,9 +3428,8 @@ def tint_sonic_scratch(pack, frame, arena, scratch_off, amount):
                 scratch[di] = 0
                 scratch[di + 1] = 0
             else:
-                lo, hi = pairs[idx]
-                scratch[di] = lo
-                scratch[di + 1] = hi
+                scratch[di] = pairs[idx * 2]
+                scratch[di + 1] = pairs[idx * 2 + 1]
             di += 2
     return scratch
 
@@ -1657,6 +3478,203 @@ try:
             y += 1
 except Exception:
     _stamp_viper = None
+
+
+def _drop_scenery_viper():
+    global _SCENERY_KIND
+    _SCENERY_KIND = "py"
+
+
+def _viper_scenery_ok():
+    """Full and clipped scenery blits against the Python loops. A miss stays on Python."""
+    if _blit_stamp_viper is None or _blit_stamp_clip_viper is None:
+        return False
+    tw = 12
+    vw = 16
+    sw = 10
+    sh = 4
+    sbuf = bytearray(sw * sh * 2)
+    mask = bytearray((sw * sh + 7) // 8)
+    i = 0
+    while i < sw * sh:
+        if (i % 3) != 0:
+            mask[i >> 3] = mask[i >> 3] | (1 << (i & 7))
+            sbuf[i * 2] = (0xA0 + i) & 0xFF
+            sbuf[i * 2 + 1] = (0x10 + i * 5) & 0xFF
+        i += 1
+    stamp = (1.0, 0, 1, sw, sh, sbuf, mask)
+    vh = 8
+    cases = (
+        (0, None),
+        (2, None),
+        (5, (1, 0, 6, 3)),
+        (0, (0, 1, 16, 2)),
+        (11, (14, 2, 4, 5)),
+        (3, (-4, -2, 8, 3)),
+        (0, (20, 0, 4, 4)),
+    )
+    try:
+        for off, clip in cases:
+            a = bytearray(vw * vh * 2)
+            b = bytearray(vw * vh * 2)
+            fill = 0x3C
+            j = 0
+            while j < len(a):
+                a[j] = fill
+                b[j] = fill
+                j += 1
+            # factor is 1.0, so the Python blit mods scroll by tw. Keep off < tw.
+            wrapped = off % tw
+            _blit_stamp_viper(a, vw, tw, sbuf, mask, sw, sh, 0, 1, wrapped)
+            _blit_stamp_py(b, vw, tw, stamp, wrapped)
+            if a != b:
+                return False
+            if clip is not None:
+                j = 0
+                while j < len(a):
+                    a[j] = fill
+                    b[j] = fill
+                    j += 1
+                cx, cy, cw, ch = clip
+                _blit_stamp_clip_viper(
+                    a, vw, tw, sbuf, mask, sw, sh, 0, 1, wrapped, cx, cy, cw, ch
+                )
+                _blit_stamp_clip_py(b, vw, tw, stamp, wrapped, clip)
+                if a != b:
+                    return False
+    except Exception:
+        return False
+    return True
+
+
+def _ensure_scenery():
+    global _SCENERY_KIND
+    if _SCENERY_KIND is not None:
+        return _SCENERY_KIND
+    if _blit_stamp_viper is not None and _viper_scenery_ok():
+        _SCENERY_KIND = "viper"
+    else:
+        _SCENERY_KIND = "py"
+    return _SCENERY_KIND
+
+
+try:
+    import micropython
+
+    @micropython.viper
+    def _blit_stamp_viper(window, vw: int, tw: int, sbuf, mask, sw: int, sh: int, ox: int, oy: int, off: int):
+        wp = ptr8(window)
+        sp = ptr8(sbuf)
+        mp = ptr8(mask)
+        if sw <= 0 or sh <= 0 or vw <= 0:
+            return
+        sx = ox - off
+        k = 0
+        while k < 3:
+            if k == 0:
+                cand = sx
+            elif k == 1:
+                cand = sx - tw
+            else:
+                cand = sx + tw
+            k += 1
+            if cand + sw > 0 and cand < vw:
+                src_x0 = 0
+                dst_x0 = cand
+                if dst_x0 < 0:
+                    src_x0 = 0 - dst_x0
+                    dst_x0 = 0
+                src_x1 = sw
+                if cand + sw > vw:
+                    src_x1 = vw - cand
+                if src_x1 > src_x0:
+                    dy = 0
+                    while dy < sh:
+                        wy = oy + dy
+                        row_i = dy * sw
+                        dst_row = wy * vw
+                        dx = src_x0
+                        while dx < src_x1:
+                            di = row_i + dx
+                            if mp[di >> 3] & (1 << (di & 7)):
+                                wx = dst_x0 + (dx - src_x0)
+                                si = di * 2
+                                wi = (dst_row + wx) * 2
+                                wp[wi] = sp[si]
+                                wp[wi + 1] = sp[si + 1]
+                            dx += 1
+                        dy += 1
+
+    @micropython.viper
+    def _blit_stamp_clip_viper(
+        window, vw: int, tw: int, sbuf, mask, sw: int, sh: int,
+        ox: int, oy: int, off: int, cx: int, cy: int, cw: int, ch: int,
+    ):
+        wp = ptr8(window)
+        sp = ptr8(sbuf)
+        mp = ptr8(mask)
+        if cw <= 0 or ch <= 0 or sw <= 0 or sh <= 0 or vw <= 0:
+            return
+        cright = cx + cw
+        cbot = cy + ch
+        sx = ox - off
+        k = 0
+        while k < 3:
+            if k == 0:
+                cand = sx
+            elif k == 1:
+                cand = sx - tw
+            else:
+                cand = sx + tw
+            k += 1
+            if cand + sw > 0 and cand < vw:
+                src_x0 = 0
+                dst_x0 = cand
+                if dst_x0 < 0:
+                    src_x0 = 0 - dst_x0
+                    dst_x0 = 0
+                src_x1 = sw
+                if cand + sw > vw:
+                    src_x1 = vw - cand
+                if src_x1 > src_x0:
+                    if dst_x0 < cx:
+                        shift = cx - dst_x0
+                        src_x0 += shift
+                        dst_x0 = cx
+                    dest_end = dst_x0 + (src_x1 - src_x0)
+                    if dest_end > cright:
+                        src_x1 -= dest_end - cright
+                    if src_x1 > src_x0:
+                        dy0 = 0
+                        if oy < cy:
+                            dy0 = cy - oy
+                        dy1 = sh
+                        if oy + dy1 > cbot:
+                            dy1 = cbot - oy
+                        if dy0 < 0:
+                            dy0 = 0
+                        if dy1 > sh:
+                            dy1 = sh
+                        if dy0 < dy1:
+                            dy = dy0
+                            while dy < dy1:
+                                wy = oy + dy
+                                row_i = dy * sw
+                                dst_row = wy * vw
+                                dx = src_x0
+                                while dx < src_x1:
+                                    di = row_i + dx
+                                    if mp[di >> 3] & (1 << (di & 7)):
+                                        wx = dst_x0 + (dx - src_x0)
+                                        si = di * 2
+                                        wi = (dst_row + wx) * 2
+                                        wp[wi] = sp[si]
+                                        wp[wi + 1] = sp[si + 1]
+                                    dx += 1
+                                dy += 1
+except Exception:
+    _blit_stamp_viper = None
+    _blit_stamp_clip_viper = None
 
 
 def _pixidx_geometry_ok(pack):
@@ -1743,27 +3761,26 @@ def try_fetch_pixidx():
             import requests
         except ImportError:
             return None
-    try:
-        resp = requests.get(PIXIDX_URL)
-    except Exception:
-        return None
-    try:
-        status = getattr(resp, "status_code", None)
-        if status is None:
-            status = getattr(resp, "status", 200)
-        if int(status) != 200:
+    def _read_body():
+        try:
+            resp = requests.get(PIXIDX_URL, timeout=OTA_HTTP_TIMEOUT_MS / 1000.0)
+        except TypeError:
+            resp = requests.get(PIXIDX_URL)
+        try:
+            status = getattr(resp, "status_code", None)
+            if status is None:
+                status = getattr(resp, "status", 200)
+            if int(status) != 200:
+                return None
+            return resp.content
+        finally:
             try:
                 resp.close()
             except Exception:
                 pass
-            return None
-        data = resp.content
-        resp.close()
-    except Exception:
-        try:
-            resp.close()
-        except Exception:
-            pass
+
+    ok, data = _call_bounded(_read_body, OTA_HTTP_TIMEOUT_MS)
+    if not ok or not data:
         return None
     got = _sha256_hex(data)
     if got is not None and got != PIXIDX_SHA256:
@@ -1781,8 +3798,18 @@ def try_fetch_pixidx():
         print("fetched pixidx.bin is not the current pack")
         return None
     try:
+        _service()
         with open(PIXIDX_NAME, "wb") as f:
-            f.write(data)
+            i = 0
+            n = len(data)
+            while i < n:
+                nxt = i + 1024
+                if nxt > n:
+                    nxt = n
+                f.write(data[i:nxt])
+                i = nxt
+                # Feed between chunks so the watchdog cannot fire mid-write.
+                _service()
     except Exception as e:
         print("pixidx save failed:", e)
         return None
@@ -2163,6 +4190,10 @@ class Sprite:
         self.ocean_tw = 0
         self.ocean_th = 0
         self.ocean_window = None
+        # Clean backdrop lives in ocean_window. Sprites are stamped only
+        # into play_window, which is the buffer that gets pushed.
+        self.play_window = None
+        self.present_buf = None
         self.ocean_stamps = []
         self._parallax = False
         self._ocean_push = True
@@ -2191,16 +4222,55 @@ class Sprite:
         self._dirty = bytearray(0)
         self._band_off = [0, 0, 0]
         self._band_new = [0, 0, 0]
+        self._band_mode = [0, 0, 0]
+        self._band_delta = [0, 0, 0]
         self._stamp_off = []
         self._stamp_new = []
         self._flat_off = -1
         self._pf_valid = False
+        self._play_valid = False
+        self._placed = []
+        self._planned = []
+        self._bd_mode = 0
+        self._bd_clips = []
+        self._part_hud = 0
+        self._part_sonic = 0
+        self._part_rings = 0
         self._tim_n = 0
         self._tim_compose = 0
         self._tim_stamp = 0
         self._tim_push = 0
+        self._tim_fill = 0
+        self._tim_flush = 0
         self._tim_hold = 0
+        self._tim_hud = 0
+        self._tim_sonic = 0
+        self._tim_rings = 0
+        self._tim_shift = 0
+        self._tim_full = 0
         self._tim_t0 = 0
+        self._tim_gc_at = 0
+        self._gc_pending = 0
+        self._fx_in_buffer = False
+        self._corner_pushed = False
+        self._dot_on_play = False
+        self._native_ready = False
+        self._nat_c = -1
+        self._nat_w = -1
+        self._nat_g = -1
+        self._nat_flat = -1
+        self._nat_parallax = False
+        self._nat_stamp = []
+        self._nat_tag = None
+        self._nat_anim = -1
+        self._nat_ring_i = -1
+        self._nat_amount = None
+        self._nat_rings = -1
+        self._nat_aura = -999
+        self._nat_sw = -999
+        self._nat_bar = -999
+        self._nat_spark = []
+        self._off_buf = []
         self._sync_ground()
 
     def _sync_ground(self):
@@ -2211,6 +4281,8 @@ class Sprite:
             self.ground_y = self._surface
             self.ocean_rgb565 = None
             self.ocean_window = None
+            self.play_window = None
+            self.present_buf = None
             self.ocean_stamps = []
             self._parallax = False
             self._ocean_push = True
@@ -2234,10 +4306,14 @@ class Sprite:
         ):
             return
         self._pf_valid = False
+        self._play_valid = False
         self._sprites_on = False
         self._sig_ok = False
+        del self._placed[:]
         self.ocean_rgb565 = None
         self.ocean_window = None
+        self.play_window = None
+        self.present_buf = None
         self.ocean_stamps = []
         self._parallax = False
         self.ocean_tw = 0
@@ -2282,8 +4358,34 @@ class Sprite:
         self.ocean_window = window
         self.ocean_stamps = stamps
         self._parallax = parallax
+        play = None
+        try:
+            play = bytearray(len(window))
+        except MemoryError:
+            print("playfield alloc failed")
+        self.play_window = play
+        self.present_buf = None
+        if play is not None:
+            try:
+                self.present_buf = bytearray(len(play))
+                print("present buf %d" % len(self.present_buf))
+            except MemoryError:
+                print("present buf alloc failed")
+                self.present_buf = None
+        self._play_valid = False
+        del self._placed[:]
         self._bind_parallax_state()
-        print("ocean rgb565", len(buf), "window", len(window))
+        # Viper self-tests belong to cache prepare. The first timed frame
+        # must not pay for them inside compose or stamp.
+        try:
+            _ensure_scenery()
+        except Exception as e:
+            print("scenery check failed:", e)
+        try:
+            _ensure_stamp()
+        except Exception as e:
+            print("stamp check failed:", e)
+        print("ocean rgb565", len(buf), "window", len(window), "play", 0 if play is None else len(play))
 
     def _bind_parallax_state(self):
         """Offset trackers for the retained window. Not a per-frame rebuild."""
@@ -2291,11 +4393,17 @@ class Sprite:
         self._dirty = bytearray(th)
         self._band_off = [0, 0, 0]
         self._band_new = [0, 0, 0]
+        self._band_mode = [0, 0, 0]
+        self._band_delta = [0, 0, 0]
         n = len(self.ocean_stamps) if self.ocean_stamps else 0
         self._stamp_off = [0] * n
         self._stamp_new = [0] * n
         self._flat_off = -1
         self._pf_valid = False
+        self._play_valid = False
+        del self._placed[:]
+        del self._bd_clips[:]
+        self._bd_mode = 0
         self._sprites_on = False
         self._sig_ok = False
 
@@ -2313,6 +4421,9 @@ class Sprite:
         self._sig_ok = False
         self._retain = False
         self._pf_valid = False
+        self._play_valid = False
+        self._native_ready = False
+        del self._placed[:]
 
     def _prepare_sprites(self, force=False):
         """Bake Sonic, HUD, and field rings once per pack load. Not per frame."""
@@ -2347,6 +4458,22 @@ class Sprite:
         self._sprite_bake = True
         kind = _ensure_stamp()
         print("sprite cache", len(arena), "frames", len(info), kind)
+        if _GH is not None:
+            if _native_self_test():
+                build = getattr(_GH, "BUILD", "on")
+                print("native render", build)
+            else:
+                print("native self-test failed")
+                _drop_native()
+        else:
+            print("native render off")
+        if self.play_window is not None:
+            # Clean backdrop + playfield replaces the underlay save/restore.
+            self._under_buf = None
+            self._under_used = 0
+            del self._under_spans[:]
+            self._retain = True
+            return
         self._alloc_underlay(pack)
 
     def _alloc_underlay(self, pack):
@@ -2405,21 +4532,17 @@ class Sprite:
                 tag = "run_medium"
             else:
                 tag = "run_fast"
+        frames = self._cycle_frames(tag)
+        if not frames:
+            return
         if tag != self.anim_tag:
+            # Show the first frame of the new cycle for this present.
             self.anim_tag = tag
             self.anim_i = 0
             self.anim_accum = 0
-        frames = self._cycle_frames(self.anim_tag)
-        if not frames:
-            return
-        if self.anim_i >= len(frames):
-            self.anim_i = 0
-        dur = frames[self.anim_i].duration_ms
-        if dur <= 0:
-            dur = RING_FPS_MS
-        self.anim_accum += dt_ms
-        while self.anim_accum >= dur:
-            self.anim_accum -= dur
+        else:
+            # One Sonic frame per present. A late paint must not spend
+            # leftover dt on a second step.
             self.anim_i += 1
             if self.anim_i >= len(frames):
                 self.anim_i = 0
@@ -2427,18 +4550,7 @@ class Sprite:
                     self.triggering = False
                     self.anim_tag = "idle"
                     self.idle_wait = 0
-                    break
-            frames = self._cycle_frames(self.anim_tag)
-            if not frames:
-                break
-            dur = frames[self.anim_i].duration_ms
-            if dur <= 0:
-                dur = RING_FPS_MS
-        # Spin the mid-ground rings at 30 fps regardless of Sonic's cycle.
-        self.ring_accum += dt_ms
-        while self.ring_accum >= RING_FPS_MS:
-            self.ring_accum -= RING_FPS_MS
-            self.ring_i = (self.ring_i + 1) & 7
+        self.ring_i = (self.ring_i + 1) & 7
 
     def _step_sparkles(self, dt_ms):
         if not self.sparkles:
@@ -2504,6 +4616,9 @@ class Sprite:
     def _draw_ring_hud(self, lcd):
         # Compact original ring + digits. Kept in the playfield, not in the gauges.
         # Offset from the CAN-fault dot in the upper-left corner.
+        # The native frame already stamped the bar, the ring, and the digits.
+        if self._fx_in_buffer:
+            return
         pack = self.pack
         if pack is not None:
             bx, by = HUD_BAR_POS
@@ -2545,24 +4660,57 @@ class Sprite:
         fill_ellipse(lcd, cx, cy, max(1, rx - 3), max(1, ry - 3), COL_WATER)
         lcd.fillRect(cx - 1, cy - ry + 1, 2, 1, COL_RING_HI)
 
-    def draw(self, lcd, values, now=0):
-        speed = values.get("spd") or 0.0
-        tps = values.get("tps") or 0.0
-        clt = values.get("clt") or 0.0
-        self.body_col = sonic_body_color(clt, now)
-        if self.pack is not None:
-            # Ocean and sprite caches are prepared once at pack load
-            # (_sync_ground), not on every frame.
-            self._draw_sheet_scene(lcd, speed, clt, now)
-        else:
-            self._playfield_stamped = False
-            self._draw_background(lcd)
-            tip_y = SONIC_MID_Y
-            self._draw_sonic(lcd, speed, tps, clt)
-            # Aura is layered on top of Sonic at the locked tip.
-            self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
-            self.boost.draw_front(lcd, SW_TIP_X, tip_y)
-        self._draw_ring_hud(lcd)
+    def _stamp_fault(self, buf, fault):
+        """Put the CAN-fault dot in the buffer that is about to be pushed.
+
+        The dot is not stored in play_window when a separate present buffer
+        exists, so a later held frame does not keep a stale mark. Stamping
+        the live playfield itself forces the next frame to recompose.
+        """
+        _brk_enter("fault")
+        try:
+            return self._stamp_fault_at(buf, fault)
+        finally:
+            _brk_exit()
+
+    def _stamp_fault_at(self, buf, fault):
+        if buf is None:
+            return buf
+        if not fault:
+            if buf is self.play_window and self._dot_on_play:
+                self._native_ready = False
+                self._dot_on_play = False
+            return buf
+        vh = self.ocean_th if self.ocean_th else GAUGE_Y
+        stamp_disk565(buf, W, vh, DOT_X, DOT_Y, DOT_R, COL_ERR)
+        if buf is self.play_window:
+            self._dot_on_play = True
+            self._native_ready = False
+        return buf
+
+    def draw(self, lcd, values, now=0, fault=False):
+        _brk_enter("draw")
+        try:
+            speed = values.get("spd") or 0.0
+            tps = values.get("tps") or 0.0
+            clt = values.get("clt") or 0.0
+            self._corner_pushed = False
+            self.body_col = sonic_body_color(clt, now)
+            if self.pack is not None:
+                # Ocean and sprite caches are prepared once at pack load
+                # (_sync_ground), not on every frame.
+                self._draw_sheet_scene(lcd, speed, clt, now, fault)
+            else:
+                self._playfield_stamped = False
+                self._draw_background(lcd)
+                tip_y = SONIC_MID_Y
+                self._draw_sonic(lcd, speed, tps, clt)
+                # Aura is layered on top of Sonic at the locked tip.
+                self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
+                self.boost.draw_front(lcd, SW_TIP_X, tip_y)
+            self._draw_ring_hud(lcd)
+        finally:
+            _brk_exit()
 
     def _field_ring_xs(self, off):
         period = RING_PERIOD
@@ -2595,13 +4743,16 @@ class Sprite:
             blit_frame(lcd, pack, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, pal_c, 0, GAUGE_Y, True)
 
     def _can_retain(self):
-        return (
+        if not (
             self._retain
-            and self._under_buf is not None
             and self._sprite_bake
             and self.ocean_rgb565 is not None
             and self.ocean_window is not None
-        )
+        ):
+            return False
+        if self.play_window is not None:
+            return True
+        return self._under_buf is not None
 
     def _disable_retain(self):
         """Stay on the full V11 compose. The picture does not change."""
@@ -2677,33 +4828,99 @@ class Sprite:
         self._under_used = 0
         del self._under_spans[:]
 
-    def _collect_dirty_clips(self):
-        """Rectangles whose backdrop pixels are not already correct."""
-        clips = []
-        band_clips = []
+    def _band_spans(self):
         th = self.ocean_th
-        vw = W
-        spans = (
+        return (
             (0, HORIZON_Y, 0),
             (HORIZON_Y, GRASS_Y, 1),
             (GRASS_Y, th, 2),
         )
-        oldb = self._band_off
-        newb = self._band_new
-        for y0, y1, idx in spans:
-            if y1 <= y0 or oldb[idx] == newb[idx]:
+
+    def _apply_band_scroll(self):
+        """Shift a band that only moved a few columns. Large jumps stay full restores.
+
+        mode 0: offset unchanged. mode 1: window rows already shifted, new
+        columns painted from the tile. mode 2: caller must restore the band.
+        """
+        th = self.ocean_th
+        tw = self.ocean_tw
+        window = self.ocean_window
+        tile = self.ocean_rgb565
+        for y0, y1, idx in self._band_spans():
+            self._band_mode[idx] = 0
+            self._band_delta[idx] = 0
+            if y1 <= y0:
                 continue
             if y0 < 0:
                 y0 = 0
-            if y0 >= th:
-                continue
             if y1 > th:
                 y1 = th
             if y1 <= y0:
                 continue
-            box = (0, y0, vw, y1 - y0)
-            clips.append(box)
-            band_clips.append(box)
+            old = self._band_off[idx]
+            new = self._band_new[idx]
+            if old == new:
+                continue
+            d = _signed_delta(old, new, tw)
+            self._band_delta[idx] = d
+            if d != 0 and d > -W and d < W:
+                _shift_window_band(window, W, tile, tw, y0, y1, d, new)
+                self._band_mode[idx] = 1
+            else:
+                self._band_mode[idx] = 2
+
+    def _stamp_carried(self, oy, sh, d_stamp):
+        """True when the shift already left this stamp on its new pixels.
+
+        The exposed columns are still clean backdrop. A stamp that crosses a
+        band which moved by a different delta, or a band that was not shifted,
+        is not carried and has to be erased and redrawn.
+        """
+        y1 = oy + sh
+        saw = False
+        for by0, by1, idx in self._band_spans():
+            if y1 <= by0 or oy >= by1:
+                continue
+            saw = True
+            mode = self._band_mode[idx]
+            if mode == 1:
+                if self._band_delta[idx] != d_stamp:
+                    return False
+            elif mode == 0:
+                if d_stamp != 0:
+                    return False
+            else:
+                return False
+        return saw
+
+    def _collect_dirty_clips(self):
+        """Rectangles whose backdrop pixels are not already correct.
+
+        A shifted band only dirties the columns that entered the screen.
+        Stamps that rode along with that shift are restamped there. Stamps
+        that did not are restored at the old and new screen boxes.
+        """
+        clips = []
+        th = self.ocean_th
+        vw = W
+        for y0, y1, idx in self._band_spans():
+            mode = self._band_mode[idx]
+            if mode == 0 or y1 <= y0:
+                continue
+            if y0 < 0:
+                y0 = 0
+            if y1 > th:
+                y1 = th
+            if y1 <= y0:
+                continue
+            if mode == 2:
+                clips.append((0, y0, vw, y1 - y0))
+                continue
+            d = self._band_delta[idx]
+            if d > 0:
+                clips.append((vw - d, y0, d, y1 - y0))
+            elif d < 0:
+                clips.append((0, y0, 0 - d, y1 - y0))
         stamps = self.ocean_stamps
         old = self._stamp_off
         new = self._stamp_new
@@ -2711,27 +4928,40 @@ class Sprite:
         i = 0
         n = len(stamps)
         while i < n:
-            if old[i] != new[i]:
-                st = stamps[i]
-                rects = []
-                for off in (old[i], new[i]):
-                    rects.extend(
-                        _stamp_screen_rects(st[1], st[2], st[3], st[4], off, tw, vw, th)
-                    )
-                rects = _merge_x_rects(rects)
-                for box in rects:
-                    pieces = [box]
-                    for bx, by, bw, bh in band_clips:
-                        if bw < vw or bx > 0:
+            st = stamps[i]
+            d_stamp = _signed_delta(old[i], new[i], tw)
+            if not self._stamp_carried(st[2], st[4], d_stamp):
+                old_rects = _stamp_screen_rects(
+                    st[1], st[2], st[3], st[4], old[i], tw, vw, th
+                )
+                new_rects = _stamp_screen_rects(
+                    st[1], st[2], st[3], st[4], new[i], tw, vw, th
+                )
+                for box in old_rects:
+                    clips.append(box)
+                for box in new_rects:
+                    clips.append(box)
+                # A band shift has already slid this stamp's pixels by the
+                # band delta. That is not the stamp's own delta, so the
+                # pixels now sit outside the pre-shift box. Cover that spot.
+                for by0, by1, idx in self._band_spans():
+                    if self._band_mode[idx] != 1:
+                        continue
+                    bd = self._band_delta[idx]
+                    if bd == 0 or by1 <= by0:
+                        continue
+                    band = (0, by0, vw, by1 - by0)
+                    for box in old_rects:
+                        inter = _rect_intersect(box, band)
+                        if inter is None:
                             continue
-                        nxt = []
-                        for px, py, pw, ph in pieces:
-                            nxt.extend(_subtract_y(px, py, pw, ph, by, by + bh))
-                        pieces = nxt
-                    for piece in pieces:
-                        if piece[2] > 0 and piece[3] > 0:
-                            clips.append(piece)
+                        x, y, w, h = inter
+                        moved = _clip_box(x - bd, y, w, h, vw, th)
+                        if moved is not None:
+                            clips.append(moved)
             i += 1
+            if (i & 3) == 0:
+                _service()
         return clips
 
     def _clips_cover_all(self, clips):
@@ -2816,12 +5046,23 @@ class Sprite:
                     if inter is not None:
                         _blit_stamp_clip(window, vw, tw, st, scroll, inter)
             i += 1
+            if (i & 3) == 0:
+                _service()
+
+    def _clear_band_motion(self):
+        """Backdrop did not move. Sprite repair must not reuse an old delta."""
+        self._band_mode[0] = 0
+        self._band_mode[1] = 0
+        self._band_mode[2] = 0
+        self._band_delta[0] = 0
+        self._band_delta[1] = 0
+        self._band_delta[2] = 0
 
     def _update_flat(self, scroll):
         off = _norm_off(scroll, self.ocean_tw)
         if self._pf_valid and off == self._flat_off:
             return False
-        if self._pf_valid and self._sprites_on:
+        if self.play_window is None and self._pf_valid and self._sprites_on:
             self._restore_underlays()
         copy_ocean_window(
             self.ocean_rgb565,
@@ -2839,36 +5080,58 @@ class Sprite:
         return True
 
     def _update_backdrop(self, scroll):
-        """Bring ocean_window back to a clean V11 backdrop for this scroll.
+        """Bring ocean_window back to a clean backdrop for this scroll.
 
-        Returns True when any band or scenery stamp was rewritten.
+        Sprites are not stored here when play_window exists, so a shift
+        does not restore underlays first. Returns True when any band or
+        scenery stamp was rewritten. _bd_mode is 0 (held), 1 (shifted),
+        or 2 (full compose). _bd_clips are the screen rects patched after
+        a shift; a full compose leaves that list empty.
         """
+        self._bd_mode = 0
+        del self._bd_clips[:]
         if not self._parallax:
-            return self._update_flat(scroll)
+            changed = self._update_flat(scroll)
+            if changed:
+                self._bd_mode = 2
+            else:
+                self._clear_band_motion()
+            return changed
         self._load_new_offs(scroll)
         if self._pf_valid and self._offs_unchanged():
+            self._clear_band_motion()
             return False
-        if self._pf_valid and self._sprites_on:
+        if self.play_window is None and self._pf_valid and self._sprites_on:
             self._restore_underlays()
         if not self._pf_valid:
             self._compose_full(scroll)
+            self._bd_mode = 2
             return True
+        _service()
+        self._apply_band_scroll()
         clips = self._collect_dirty_clips()
         if not clips:
             self._commit_offs()
-            self._sprites_on = False
-            self._under_used = 0
-            del self._under_spans[:]
+            if self.play_window is None:
+                self._sprites_on = False
+                self._under_used = 0
+                del self._under_spans[:]
+            self._bd_mode = 1
             return True
         if self._clips_cover_all(clips):
             self._compose_full(scroll)
+            self._bd_mode = 2
             return True
         self._patch_dirty(clips, scroll)
         self._commit_offs()
         self._pf_valid = True
-        self._sprites_on = False
-        self._under_used = 0
-        del self._under_spans[:]
+        if self.play_window is None:
+            self._sprites_on = False
+            self._under_used = 0
+            del self._under_spans[:]
+        self._bd_mode = 1
+        for clip in clips:
+            self._bd_clips.append(clip)
         return True
 
     def _sprite_unchanged(self, amount):
@@ -2995,9 +5258,324 @@ class Sprite:
             self._save_underlay(x0, y0, fr.w, fr.h, vw, vh)
         stamp_baked(window, vw, vh, rgb, mask, fr.w, fr.h, x0, y0)
 
-    def _stamp_playfield_sprites(self, amount, save_under=False):
+    def _plan_places(self, amount):
+        _brk_enter("plan")
+        try:
+            return self._plan_places_at(amount)
+        finally:
+            _brk_exit()
+
+    def _plan_places_at(self, amount):
+        """Screen rects in stamp order. Top-left is after the frame origin.
+
+        Order matches _stamp_playfield_sprites: rings, sparkles, Sonic,
+        HUD bar, HUD ring. extra is the tint for Sonic and 0 otherwise.
+        """
+        out = self._planned
+        del out[:]
         pack = self.pack
-        window = self.ocean_window
+        if pack is None:
+            return out
+        off = int(self.scroll)
+        ring_frames = pack.cycles.get("rings")
+        if ring_frames:
+            fr = ring_frames[self.ring_i % len(ring_frames)]
+            period = RING_PERIOD
+            idx = 0
+            for wx in FIELD_RING_X:
+                x = (wx - off) % period
+                if x > W + 40:
+                    x -= period
+                if -40 < x < W + 40:
+                    x0 = int(x - fr.origin_x)
+                    y0 = int(FIELD_RING_Y - fr.origin_y)
+                    out.append(("r%d" % idx, x0, y0, fr.w, fr.h, fr, 0, "rings"))
+                idx += 1
+        spark_frames = pack.cycles.get("rings_sparkle")
+        if spark_frames:
+            si = 0
+            for item in self.sparkles:
+                x, y, i, _acc = item
+                if i < len(spark_frames):
+                    fr = spark_frames[i]
+                    x0 = int(int(x) - fr.origin_x)
+                    y0 = int(int(y) - fr.origin_y)
+                    out.append(("k%d" % si, x0, y0, fr.w, fr.h, fr, 0, "rings"))
+                si += 1
+        frames = self._cycle_frames(self.anim_tag)
+        if frames:
+            fr = frames[self.anim_i % len(frames)]
+            x0 = int(SONIC_FEET_DEST_X - fr.origin_x)
+            y0 = int(SONIC_FEET_DEST_Y - fr.origin_y)
+            out.append(("sonic", x0, y0, fr.w, fr.h, fr, amount, "sonic"))
+        bar = pack.by_name.get("hud_bar")
+        if bar is not None:
+            out.append((
+                "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
+            ))
+        ring = pack.by_name.get("hud_ring")
+        if ring is not None:
+            out.append((
+                "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
+            ))
+        return out
+
+    def _places_same(self, places):
+        old = self._placed
+        n = len(places)
+        if len(old) != n:
+            return False
+        i = 0
+        while i < n:
+            a = old[i]
+            b = places[i]
+            if (
+                a[0] != b[0]
+                or a[1] != b[1]
+                or a[2] != b[2]
+                or a[3] != b[3]
+                or a[4] != b[4]
+                or a[5].name != b[5].name
+                or a[6] != b[6]
+            ):
+                return False
+            i += 1
+        return True
+
+    def _hits(self, rect, rects):
+        for other in rects:
+            if _rect_intersect(rect, other) is not None:
+                return True
+        return False
+
+    def _place_carried(self, old, new, clips):
+        """True when the band shift already left this sprite on its new pixels."""
+        if old[3] != new[3] or old[4] != new[4]:
+            return False
+        if old[5].name != new[5].name or old[6] != new[6]:
+            return False
+        if old[2] != new[2]:
+            return False
+        d = old[1] - new[1]
+        y0 = new[2]
+        y1 = y0 + new[4]
+        if y1 <= y0:
+            return False
+        saw = False
+        for by0, by1, idx in self._band_spans():
+            if y1 <= by0 or y0 >= by1:
+                continue
+            saw = True
+            if d == 0:
+                if self._band_mode[idx] != 0:
+                    return False
+            elif self._band_mode[idx] != 1 or self._band_delta[idx] != d:
+                return False
+        if not saw:
+            return False
+        if self._hits((new[1], new[2], new[3], new[4]), clips):
+            return False
+        return True
+
+    def _post_shift_rects(self, place):
+        """Where this sprite's pixels sit after the playfield band shift."""
+        x = place[1]
+        y = place[2]
+        w = place[3]
+        h = place[4]
+        vh = self.ocean_th
+        found = []
+        y_end = y + h
+        for by0, by1, idx in self._band_spans():
+            iy0 = y if y > by0 else by0
+            iy1 = y_end if y_end < by1 else by1
+            if iy0 < 0:
+                iy0 = 0
+            if iy1 > vh:
+                iy1 = vh
+            if iy1 <= iy0 or w <= 0:
+                continue
+            d = self._band_delta[idx] if self._band_mode[idx] == 1 else 0
+            found.append((x - d, iy0, w, iy1 - iy0))
+        return found
+
+    def _copy_rect(self, src, dst, rect):
+        box = _clip_box(rect[0], rect[1], rect[2], rect[3], W, self.ocean_th)
+        if box is None:
+            return
+        x, y, w, h = box
+        if w <= 0 or h <= 0:
+            return
+        vw = W
+        nbytes = w * 2
+        row = 0
+        while row < h:
+            o = ((y + row) * vw + x) * 2
+            dst[o:o + nbytes] = src[o:o + nbytes]
+            row += 1
+            if (row & 7) == 0:
+                _service()
+
+    def _copy_full_play(self):
+        src = self.ocean_window
+        dst = self.play_window
+        n = len(src)
+        if dst is None or len(dst) != n:
+            raise MemoryError("playfield")
+        step = 4096
+        i = 0
+        while i < n:
+            j = i + step
+            if j > n:
+                j = n
+            dst[i:j] = src[i:j]
+            i = j
+            _service()
+
+    def _shift_play_band(self, y0, y1, delta):
+        """Same slide as the clean window. New columns come from that window."""
+        if delta == 0 or y1 <= y0:
+            return
+        window = self.play_window
+        clean = self.ocean_window
+        vw = W
+        scratch = _ROW_SCRATCH
+        y = y0
+        if delta > 0:
+            if delta >= vw:
+                return
+            keep = vw - delta
+            n = keep * 2
+            src = delta * 2
+            ncol = delta * 2
+            while y < y1:
+                if ((y - y0) & 7) == 0:
+                    _service()
+                row = y * vw * 2
+                scratch[0:n] = window[row + src:row + src + n]
+                window[row:row + n] = scratch[0:n]
+                di = row + n
+                window[di:di + ncol] = clean[di:di + ncol]
+                y += 1
+            return
+        e = 0 - delta
+        if e >= vw:
+            return
+        keep = vw - e
+        n = keep * 2
+        dst = e * 2
+        ncol = e * 2
+        while y < y1:
+            if ((y - y0) & 7) == 0:
+                _service()
+            row = y * vw * 2
+            scratch[0:n] = window[row:row + n]
+            window[row + dst:row + dst + n] = scratch[0:n]
+            window[row:row + ncol] = clean[row:row + ncol]
+            y += 1
+
+    def _shift_play_bands(self):
+        th = self.ocean_th
+        for y0, y1, idx in self._band_spans():
+            if self._band_mode[idx] != 1:
+                continue
+            if y0 < 0:
+                y0 = 0
+            if y1 > th:
+                y1 = th
+            if y1 <= y0:
+                continue
+            self._shift_play_band(y0, y1, self._band_delta[idx])
+
+    def _note_stamp_part(self, kind, dt):
+        if dt < 0:
+            dt = 0
+        if kind == "hud":
+            self._part_hud += dt
+        elif kind == "sonic":
+            self._part_sonic += dt
+        else:
+            self._part_rings += dt
+
+    def _stamp_places(self, places, window, which):
+        """Stamp every place, or only keys listed in which. which None stamps all."""
+        vw = W
+        vh = self._playfield_vh()
+        for p in places:
+            if which is not None and p[0] not in which:
+                continue
+            t0 = _mono_us()
+            self._stamp_frame(window, vw, vh, p[5], p[1], p[2], False, p[6], False)
+            self._note_stamp_part(p[7], _us_diff(_mono_us(), t0))
+            _service()
+
+    def _sync_playfield(self, amount):
+        """Copy the clean backdrop into play_window and restamp dirty sprites.
+
+        ocean_window has just been updated and holds no sprites. A held
+        backdrop with the same sprites leaves the playfield untouched.
+        """
+        self._part_hud = 0
+        self._part_sonic = 0
+        self._part_rings = 0
+        places = self._plan_places(amount)
+        mode = self._bd_mode
+        if (not self._play_valid) or mode == 2:
+            self._copy_full_play()
+            self._stamp_places(places, self.play_window, None)
+            self._placed = places[:]
+            self._play_valid = True
+            return
+        if mode == 0 and self._places_same(places):
+            return
+        if mode == 1:
+            self._shift_play_bands()
+            for clip in self._bd_clips:
+                self._copy_rect(self.ocean_window, self.play_window, clip)
+        repairs = []
+        marked = []
+        old_map = {}
+        for old in self._placed:
+            old_map[old[0]] = old
+        clips = self._bd_clips
+        seen = {}
+        for p in places:
+            seen[p[0]] = p
+            old = old_map.get(p[0])
+            if old is not None and self._place_carried(old, p, clips):
+                continue
+            marked.append(p[0])
+            repairs.append((p[1], p[2], p[3], p[4]))
+            if old is not None:
+                for rect in self._post_shift_rects(old):
+                    repairs.append(rect)
+        for key in old_map:
+            if key not in seen:
+                for rect in self._post_shift_rects(old_map[key]):
+                    repairs.append(rect)
+        grew = True
+        while grew:
+            grew = False
+            for p in places:
+                key = p[0]
+                if key in marked:
+                    continue
+                rect = (p[1], p[2], p[3], p[4])
+                if self._hits(rect, repairs):
+                    marked.append(key)
+                    repairs.append(rect)
+                    grew = True
+        for rect in repairs:
+            self._copy_rect(self.ocean_window, self.play_window, rect)
+        if marked:
+            self._stamp_places(places, self.play_window, marked)
+        self._placed = places[:]
+        self._play_valid = True
+
+    def _stamp_playfield_sprites(self, amount, save_under=False, window=None):
+        pack = self.pack
+        if window is None:
+            window = self.ocean_window
         vw = W
         vh = self._playfield_vh()
         off = int(self.scroll)
@@ -3052,15 +5630,17 @@ class Sprite:
         if held:
             self._tim_hold += 1
 
-    def report_timing(self, now):
-        """One serial line per 2 seconds. Does not rebuild caches."""
-        n = self._tim_n
-        if n <= 0 or self._tim_t0 == 0:
-            return
-        elapsed = _ms_diff(now, self._tim_t0)
-        if elapsed < 2000:
-            return
-        gc_us = 0
+    def note_chrome(self, fill_us, flush_us):
+        """fillScreen and the full-canvas push. 0 when that work was skipped."""
+        if fill_us < 0:
+            fill_us = 0
+        if flush_us < 0:
+            flush_us = 0
+        self._tim_fill += fill_us
+        self._tim_flush += flush_us
+
+    def _timing_gc(self):
+        """One collect. Not a multi-second sweep, and not once per frame."""
         try:
             import gc
             g0 = _mono_us()
@@ -3068,33 +5648,450 @@ class Sprite:
             gc_us = _us_diff(_mono_us(), g0)
             if gc_us < 0:
                 gc_us = 0
+            _flow_add("gc", gc_us)
+            return gc_us
         except Exception:
-            gc_us = 0
+            return 0
+
+    def _collect_since(self, now):
+        if self._tim_gc_at == 0:
+            return GC_MOVE_MIN_MS
+        since = _ms_diff(now, self._tim_gc_at)
+        if since < 0:
+            return 0
+        return since
+
+    def _collect_due(self, speed, now):
+        # speed is unused. Idle and motion share collect_due.
+        # The check is logged even when it does not collect.
+        global _PAUSE_FREE
+        t0 = _mono_us()
+        th, alloc, free = _gc_sample()
+        since = self._collect_since(now)
+        due = collect_due(free, since)
+        dur = _us_diff(_mono_us(), t0)
+        if dur < 0:
+            dur = 0
+        if self._tim_gc_at == 0:
+            age = -1
+        else:
+            age = since
+        if free < 0:
+            why = "unk"
+        elif free < GC_CRITICAL_FREE:
+            why = "crit"
+        elif free < GC_LOW_FREE and since >= GC_MOVE_MIN_MS:
+            why = "low"
+        elif free < GC_LOW_FREE:
+            why = "wait"
+        else:
+            why = "skip"
+        if free >= 0:
+            _PAUSE_FREE = free
+        _pause_push("thresh", why, dur, free, age)
+        _gcwake_push("yes" if due else "no", t0, dur, th, alloc, free)
+        return due
+
+    def report_timing(self, now, speed=0.0):
+        """One serial line per 2 seconds. Does not rebuild caches.
+
+        The V14 fields stay in front so old logs still compare. hud, sonic,
+        and rings are the stamp split (they sit inside stamp, along with
+        the playfield shift and the backdrop copies). shift and full count
+        backdrop updates. A USB CDC that has not drained the previous line
+        skips the print; the counters stay. gc is the collect in this
+        window, or 0 when the heap is not low, including at 0 km/h.
+        """
+        n = self._tim_n
+        if n <= 0 or self._tim_t0 == 0:
+            return
+        elapsed = _ms_diff(now, self._tim_t0)
+        if elapsed < 2000:
+            return
+        gc_us = 0
+        if self._collect_due(speed, now):
+            _brk_enter("gc")
+            try:
+                gc_us = self._timing_gc()
+            finally:
+                _brk_exit()
+            self._tim_gc_at = now
+            self._gc_pending = gc_us
+            _service()
+        if not _stdout_can_write():
+            return
+        _service()
+        if gc_us == 0:
+            gc_us = self._gc_pending
+        self._gc_pending = 0
         total_us = self._tim_compose + self._tim_stamp + self._tim_push
         fps_tenths = 0
         if elapsed > 0:
             fps_tenths = (n * 10000) // elapsed
-        print(
-            "timing n=%d compose %s stamp %s push %s gc %s total %s fps %s hold %d"
+        _brk_enter("serial")
+        try:
+            print(
+            "timing n=%d compose %s stamp %s push %s fill %s flush %s gc %s total %s fps %s hold %d hud %s sonic %s rings %s shift %d full %d"
             % (
                 n,
                 _fmt_tenths(_avg_tenths_ms(self._tim_compose, n)),
                 _fmt_tenths(_avg_tenths_ms(self._tim_stamp, n)),
                 _fmt_tenths(_avg_tenths_ms(self._tim_push, n)),
+                _fmt_tenths(_avg_tenths_ms(self._tim_fill, n)),
+                _fmt_tenths(_avg_tenths_ms(self._tim_flush, n)),
                 _fmt_tenths(_avg_tenths_ms(gc_us, 1)),
                 _fmt_tenths(_avg_tenths_ms(total_us, n)),
                 _fmt_tenths(fps_tenths),
                 self._tim_hold,
+                _fmt_tenths(_avg_tenths_ms(self._tim_hud, n)),
+                _fmt_tenths(_avg_tenths_ms(self._tim_sonic, n)),
+                _fmt_tenths(_avg_tenths_ms(self._tim_rings, n)),
+                self._tim_shift,
+                self._tim_full,
             )
-        )
+            )
+        finally:
+            _brk_exit()
         self._tim_n = 0
         self._tim_compose = 0
         self._tim_stamp = 0
         self._tim_push = 0
+        self._tim_fill = 0
+        self._tim_flush = 0
         self._tim_hold = 0
+        self._tim_hud = 0
+        self._tim_sonic = 0
+        self._tim_rings = 0
+        self._tim_shift = 0
+        self._tim_full = 0
         self._tim_t0 = now
 
-    def _draw_sheet_scene(self, lcd, speed, clt, now):
+    def _frame_index(self, fr):
+        pack = self.pack
+        w = fr.w
+        h = fr.h
+        bpp4 = pack.bpp == 4
+        row_bytes = ((w + 1) // 2) if bpp4 else w
+        base = pack.pix_off + fr.data_offset
+        src = memoryview(pack.data)[base:base + row_bytes * h]
+        return src, row_bytes, 4 if bpp4 else 8
+
+    def _native_views(self, fr, amount):
+        """Baked RGB565 and mask. A hot tint is expanded in C from the pairs."""
+        at = self._bake_at.get(fr.name)
+        if at is None:
+            raise KeyError(fr.name)
+        rgb_off, mask_off = at
+        n = fr.w * fr.h
+        mask = memoryview(self._arena)[mask_off:mask_off + ((n + 7) // 8)]
+        if amount > 0:
+            pairs = _tint_pair_bytes(self.pack, fr, amount)
+            scratch = memoryview(self._arena)[self._scratch_off:self._scratch_off + (n * 2)]
+            src, stride, bpp = self._frame_index(fr)
+            _GH.expand(src, stride, bpp, fr.w, fr.h, pairs, len(pairs) // 2, scratch)
+            return scratch, mask
+        rgb = memoryview(self._arena)[rgb_off:rgb_off + (n * 2)]
+        return rgb, mask
+
+    def _fill_native_offs(self, scroll):
+        _brk_enter("plan")
+        try:
+            return self._fill_native_offs_at(scroll)
+        finally:
+            _brk_exit()
+
+    def _fill_native_offs_at(self, scroll):
+        """Write stamp offsets into _off_buf. Returns cloud, water, ground."""
+        tw = self.ocean_tw
+        offs = self._off_buf
+        del offs[:]
+        if not self._parallax:
+            return _norm_off(scroll, tw), 0, 0
+        off_c = _norm_off(scroll * PARALLAX_CLOUDS, tw)
+        off_w = _norm_off(scroll * PARALLAX_WATER, tw)
+        off_g = _norm_off(scroll * PARALLAX_GROUND, tw)
+        stamps = self.ocean_stamps
+        i = 0
+        n = len(stamps) if stamps else 0
+        while i < n:
+            offs.append(_norm_off(scroll * stamps[i][0], tw))
+            i += 1
+        return off_c, off_w, off_g
+
+    def _native_same(self, off_c, off_w, off_g, amount):
+        _brk_enter("plan")
+        try:
+            return self._native_same_at(off_c, off_w, off_g, amount)
+        finally:
+            _brk_exit()
+
+    def _native_same_at(self, off_c, off_w, off_g, amount):
+        if not self._native_ready:
+            return False
+        if self._parallax:
+            if not self._nat_parallax:
+                return False
+            if self._nat_c != off_c or self._nat_w != off_w or self._nat_g != off_g:
+                return False
+            prev = self._nat_stamp
+            cur = self._off_buf
+            if len(prev) != len(cur):
+                return False
+            i = 0
+            while i < len(cur):
+                if prev[i] != cur[i]:
+                    return False
+                i += 1
+        else:
+            if self._nat_parallax or self._nat_flat != off_c:
+                return False
+        if self._nat_tag != self.anim_tag or self._nat_anim != self.anim_i:
+            return False
+        if self._nat_ring_i != self.ring_i or self._nat_amount != amount:
+            return False
+        if self._nat_rings != self.rings:
+            return False
+        boost = self.boost
+        if (
+            self._nat_aura != boost.aura_i
+            or self._nat_sw != boost.sw_i
+            or self._nat_bar != boost.bar_i
+        ):
+            return False
+        sp = self.sparkles
+        prev_s = self._nat_spark
+        if len(sp) != len(prev_s):
+            return False
+        i = 0
+        while i < len(sp):
+            item = sp[i]
+            p = prev_s[i]
+            if item[0] != p[0] or item[1] != p[1] or item[2] != p[2]:
+                return False
+            i += 1
+        return True
+
+    def _remember_native(self, off_c, off_w, off_g, amount):
+        self._nat_parallax = bool(self._parallax)
+        self._nat_c = off_c
+        self._nat_w = off_w
+        self._nat_g = off_g
+        if self._parallax:
+            self._nat_stamp = self._off_buf[:]
+        else:
+            self._nat_flat = off_c
+            del self._nat_stamp[:]
+        self._nat_tag = self.anim_tag
+        self._nat_anim = self.anim_i
+        self._nat_ring_i = self.ring_i
+        self._nat_amount = amount
+        self._nat_rings = self.rings
+        boost = self.boost
+        self._nat_aura = boost.aura_i
+        self._nat_sw = boost.sw_i
+        self._nat_bar = boost.bar_i
+        prev = self._nat_spark
+        del prev[:]
+        for item in self.sparkles:
+            prev.append((item[0], item[1], item[2]))
+        self._native_ready = True
+
+    def _paint_native(self, amount, with_fx):
+        """Fill play_window. Returns compose, stamp, hud, sonic, rings microseconds.
+
+        with_fx draws boost and the ring digits into the same buffer. The
+        playfield underneath matches a full V15 compose plus stamp.
+        """
+        gh = _GH
+        window = self.play_window
+        vw = W
+        th = self.ocean_th
+        vh = self._playfield_vh()
+        tw = self.ocean_tw
+        tile = self.ocean_rgb565
+        off_c, off_w, off_g = self._fill_native_offs(self.scroll)
+        t0 = _mono_us()
+        _brk_enter("compose")
+        try:
+            if self._parallax:
+                gh.compose(
+                    tile, tw, th, off_c, off_w, off_g, HORIZON_Y, GRASS_Y,
+                    self.ocean_stamps, self._off_buf, window,
+                )
+            else:
+                gh.copy(tile, tw, th, off_c, window, vw)
+        finally:
+            _brk_exit()
+        t1 = _mono_us()
+        _service()
+        places = self._plan_places(amount)
+        hud_us = 0
+        sonic_us = 0
+        rings_us = 0
+        for p in places:
+            kind = p[7]
+            if kind != "sonic" and kind != "hud" and kind != "rings":
+                kind = "rings"
+            ts = _mono_us()
+            _brk_enter(kind)
+            try:
+                fr = p[5]
+                if fr.nruns and hasattr(gh, "stamp_runs"):
+                    if p[6] > 0:
+                        pairs = _tint_pair_bytes(self.pack, fr, p[6])
+                    else:
+                        pal_id = fr.pal_id
+                        if pal_id < 0 or pal_id >= len(self.pack.pair_bytes):
+                            pal_id = 0
+                        pairs = self.pack.pair_bytes[pal_id]
+                    gh.stamp_runs(
+                        window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2, p[1], p[2]
+                    )
+                else:
+                    rgb, mask = self._native_views(fr, p[6])
+                    gh.stamp(window, vw, vh, rgb, mask, fr.w, fr.h, p[1], p[2])
+            finally:
+                _brk_exit()
+            dt = _us_diff(_mono_us(), ts)
+            if dt < 0:
+                dt = 0
+            if p[7] == "hud":
+                hud_us += dt
+            elif p[7] == "sonic":
+                sonic_us += dt
+            else:
+                rings_us += dt
+        fx_us = 0
+        dig_us = 0
+        if with_fx:
+            boost = self.boost
+            t_fx = _mono_us()
+            _brk_enter("fx")
+            try:
+                gh.fx(
+                    window, vw, vh,
+                    boost.aura_i, boost.sw_i, boost.bar_i,
+                    AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
+                )
+            finally:
+                _brk_exit()
+            fx_us = _us_diff(_mono_us(), t_fx)
+            if fx_us < 0:
+                fx_us = 0
+            t_dig = _mono_us()
+            _brk_enter("dig")
+            try:
+                gh.digits(window, vw, vh, HUD_BAR_POS[0], HUD_BAR_POS[1], int(self.rings) % 1000)
+            finally:
+                _brk_exit()
+            dig_us = _us_diff(_mono_us(), t_dig)
+            if dig_us < 0:
+                dig_us = 0
+            hud_us += dig_us
+            # Boost sits in the stamp total. Digits are the only part of that
+            # overlay counted in hud. The two-second line still uses that
+            # combined stamp. The per-frame stage line splits fx and digits.
+            stamp_us = _us_diff(_mono_us(), t1)
+            if stamp_us < 0:
+                stamp_us = 0
+        else:
+            stamp_us = hud_us + sonic_us + rings_us
+        compose_us = _us_diff(t1, t0)
+        if compose_us < 0:
+            compose_us = 0
+        return compose_us, stamp_us, hud_us, sonic_us, rings_us, fx_us, dig_us
+
+    def _present_copy(self, src):
+        """Copy a finished playfield into the buffer the panel will read."""
+        _brk_enter("copy")
+        try:
+            dst = self.present_buf
+            if src is None:
+                return src
+            if dst is None or len(dst) != len(src):
+                return src
+            dst[:] = src
+            return dst
+        finally:
+            _brk_exit()
+
+    def _draw_native_frame(self, lcd, amount, fault=False):
+        """Compose, stamp, and push through C. False falls back to Python."""
+        if (
+            _GH is None
+            or self.play_window is None
+            or self.ocean_rgb565 is None
+            or not self._sprite_bake
+        ):
+            return False
+        _FLOW["gap_printed"] = 0
+        off_c, off_w, off_g = self._fill_native_offs(self.scroll)
+        held = 0
+        compose_us = 0
+        stamp_us = 0
+        sprite_us = 0
+        fx_us = 0
+        dig_us = 0
+        between_us = 0
+        self._part_hud = 0
+        self._part_sonic = 0
+        self._part_rings = 0
+        t_paint = _mono_us()
+        if self._native_same(off_c, off_w, off_g, amount):
+            held = 1
+        else:
+            compose_us, stamp_us, hud_us, sonic_us, rings_us, fx_us, dig_us = self._paint_native(amount, True)
+            self._remember_native(off_c, off_w, off_g, amount)
+            sprite_us = hud_us + sonic_us + rings_us - dig_us
+            if sprite_us < 0:
+                sprite_us = 0
+            between_us = _us_diff(_mono_us(), t_paint) - compose_us - sprite_us - fx_us - dig_us
+            if between_us < 0:
+                between_us = 0
+            self._tim_full += 1
+            self._tim_hud += hud_us
+            self._tim_sonic += sonic_us
+            self._tim_rings += rings_us
+            self._part_hud = hud_us
+            self._part_sonic = sonic_us
+            self._part_rings = rings_us
+        t_copy = _mono_us()
+        # Blit has returned. Copy into a buffer the next paint cannot touch,
+        # then start the panel transfer.
+        hand = self._present_copy(self.play_window)
+        copy_us = _us_diff(_mono_us(), t_copy)
+        if copy_us < 0:
+            copy_us = 0
+        self._stamp_fault(hand, fault)
+        _FLOW["paint"] = compose_us + sprite_us + fx_us + dig_us + between_us + copy_us
+        t0 = _mono_us()
+        ok = push_rgb565_window(lcd, hand, W, self.ocean_th)
+        push_us = _us_diff(_mono_us(), t0)
+        if push_us < 0:
+            push_us = 0
+        parts = _PUSH_PARTS
+        if FRAME_TRACE:
+            print(
+                "stage us compose %d stamp %d fx %d digits %d between %d copy %d pre %d raw %d post %d held %d"
+                % (
+                    compose_us, sprite_us, fx_us, dig_us, between_us, copy_us,
+                    parts["pre"], parts["raw"], parts["post"], held,
+                )
+            )
+        if not ok:
+            self._ocean_push = False
+            self._native_ready = False
+            self._fx_in_buffer = False
+            self._playfield_stamped = False
+            return False
+        self._corner_pushed = True
+        _note_presented()
+        self._fx_in_buffer = True
+        self._playfield_stamped = True
+        self._note_timing(compose_us, stamp_us, push_us, held)
+        return True
+
+    def _draw_sheet_scene(self, lcd, speed, clt, now, fault=False):
         pack = self.pack
         pal_s = pack.pal(1)
         pal_c = pack.pal(0)
@@ -3102,6 +6099,16 @@ class Sprite:
         amount = sonic_tint_amount(clt, now)
         if amount > 0:
             pal_c = tint_blue_palette(pal_c, amount)
+        self._fx_in_buffer = False
+        if _GH is not None and self.play_window is not None and self._sprite_bake:
+            try:
+                if self._draw_native_frame(lcd, amount, fault):
+                    return
+            except Exception as e:
+                print("native frame failed:", e)
+                self._native_ready = False
+                self._fx_in_buffer = False
+                self._play_valid = False
         ocean = pack.by_name.get("ocean")
         off = int(self.scroll)
         self._playfield_stamped = False
@@ -3115,6 +6122,7 @@ class Sprite:
         stamp_us = 0
         push_us = 0
         held = 0
+        push_buf = self.ocean_window
         t_enter = _mono_us()
         ocean_ready = (
             self.ocean_rgb565 is not None
@@ -3123,19 +6131,36 @@ class Sprite:
         )
         if ocean_ready and self._can_retain():
             try:
-                changed = self._update_backdrop(self.scroll)
+                self._part_hud = 0
+                self._part_sonic = 0
+                self._part_rings = 0
+                self._update_backdrop(self.scroll)
                 t1 = _mono_us()
-                self._update_sprites(amount)
+                if self.play_window is not None:
+                    self._sync_playfield(amount)
+                    push_buf = self.play_window
+                else:
+                    self._update_sprites(amount)
                 t2 = _mono_us()
                 compose_us = _us_diff(t1, t_enter)
                 stamp_us = _us_diff(t2, t1)
-                held = 0 if changed else 1
+                held = 1 if self._bd_mode == 0 else 0
+                if self._bd_mode == 1:
+                    self._tim_shift += 1
+                elif self._bd_mode == 2:
+                    self._tim_full += 1
+                self._tim_hud += self._part_hud
+                self._tim_sonic += self._part_sonic
+                self._tim_rings += self._part_rings
                 window_ready = True
                 stamped = True
                 used_retain = True
             except MemoryError:
+                self.play_window = None
+                self._play_valid = False
                 self._disable_retain()
                 used_retain = False
+                push_buf = self.ocean_window
                 t_enter = _mono_us()
             except Exception as e:
                 # Torn window: do not push it. fillRect takes over, and the
@@ -3176,7 +6201,9 @@ class Sprite:
             compose_us = _us_diff(_mono_us(), t0)
             window_ready = True
             self._pf_valid = False
+            self._play_valid = False
             self._sprites_on = False
+            push_buf = self.ocean_window
         if window_ready and self._sprite_bake and not stamped:
             try:
                 t0 = _mono_us()
@@ -3191,15 +6218,20 @@ class Sprite:
                 print("sprite stamp failed:", e)
         if window_ready:
             t0 = _mono_us()
-            ok = push_rgb565_window(lcd, self.ocean_window, W, self.ocean_th)
+            hand = self._present_copy(push_buf)
+            self._stamp_fault(hand, fault)
+            ok = push_rgb565_window(lcd, hand, W, self.ocean_th)
             push_us = _us_diff(_mono_us(), t0)
             if not ok:
                 self._ocean_push = False
                 self._drop_sprite_cache()
                 window_ready = False
                 stamped = False
-            elif stamped:
-                self._playfield_stamped = True
+            else:
+                self._corner_pushed = True
+                _note_presented()
+                if stamped:
+                    self._playfield_stamped = True
         if ocean_ready:
             self._note_timing(compose_us, stamp_us, push_us, held)
         if not self._playfield_stamped:
@@ -3484,56 +6516,65 @@ def make_canvas(lcd):
 
 
 class ButtonWatch:
-    """Poll the face button on every call. Double-press starts the bench sweep.
+    """Poll the face button on every call. One press starts the bench sweep.
 
-    M5.update() is done here so a mid-draw poll still sees a fresh click,
-    and wasClicked is always read in the same call that updates it.
+    M5.update() runs at most once per FRAME_MIN_MS. wasClicked is read in
+    that same call. Extra polls during a paint only feed the watchdog.
+    BtnA, Btn, and BtnPWR only. This board has no touch screen.
     """
 
-    def __init__(self, btn, on_double=None):
+    def __init__(self, btn, on_press=None):
         self.btn = btn
-        self.on_double = on_double
-        self.last_click_ms = -1000
-        self.pending_click = False
+        self.on_press = on_press
+        self._last_poll = None
 
     def poll(self, now=None):
-        if now is None:
-            now = time.ticks_ms()
-        M5.update()
-        btn = self.btn
-        if btn is None:
-            return False
-        tapped = False
-        if hasattr(btn, "wasDoubleClicked"):
+        _brk_enter("poll")
+        try:
+            if now is None:
+                now = time.ticks_ms()
+            last = self._last_poll
+            if last is not None:
+                gap = time.ticks_diff(now, last)
+                if 0 <= gap < FRAME_MIN_MS:
+                    return False
+            self._last_poll = now
+            _brk_enter("m5")
             try:
-                tapped = bool(btn.wasDoubleClicked())
-            except Exception:
-                tapped = False
-        if not tapped and hasattr(btn, "wasClicked"):
-            try:
-                clicked = bool(btn.wasClicked())
-            except Exception:
-                clicked = False
-            if clicked:
-                if self.pending_click and time.ticks_diff(now, self.last_click_ms) <= DBL_TAP_MS:
-                    tapped = True
-                    self.pending_click = False
-                else:
-                    self.pending_click = True
-                    self.last_click_ms = now
-        if self.pending_click and time.ticks_diff(now, self.last_click_ms) > DBL_TAP_MS:
-            self.pending_click = False
-        if tapped and self.on_double is not None:
-            self.on_double(now)
-        return tapped
+                M5.update()
+            finally:
+                _brk_exit()
+            btn = self.btn
+            if btn is None:
+                return False
+            clicked = False
+            if hasattr(btn, "wasClicked"):
+                try:
+                    clicked = bool(btn.wasClicked())
+                except Exception:
+                    clicked = False
+            if hasattr(btn, "wasDoubleClicked"):
+                try:
+                    extra = bool(btn.wasDoubleClicked())
+                except Exception:
+                    extra = False
+                if extra and not clicked:
+                    clicked = True
+            if clicked and self.on_press is not None:
+                self.on_press(now)
+            return clicked
+        finally:
+            _brk_exit()
 
 
 class Dashboard:
     def __init__(self, lcd, pack=None, button=None):
+        self.panel = lcd
         self.lcd, self._use_push = make_canvas(lcd)
         self.sprite = Sprite(pack)
         self.button = button
         self._last_fill = {g[0]: -1 for g in GAUGES}
+        self._gauge_bg = False
         self._fault_shown = None
         self._last_ms = time.ticks_ms()
 
@@ -3541,33 +6582,112 @@ class Dashboard:
         if self.button is not None:
             self.button.poll(now)
 
+    def _direct_playfield(self):
+        """The playfield image is pushed onto the panel, so a clear would erase it."""
+        sp = self.sprite
+        return (
+            sp.pack is not None
+            and sp._ocean_push
+            and sp.ocean_window is not None
+            and sp.ocean_rgb565 is not None
+        )
+
     def tick(self, values, fault, now):
+        _brk_enter("tick")
+        try:
+            self._tick_body(values, fault, now)
+        finally:
+            _brk_exit()
+
+    def _tick_body(self, values, fault, now):
         self._poll_button(now)
-        dt = time.ticks_diff(now, self._last_ms)
-        if dt < 0 or dt > 500:
-            dt = REFRESH_MS
+        dt = anim_dt(time.ticks_diff(now, self._last_ms))
         self._last_ms = now
         speed = values.get("spd") or 0.0
-        self.sprite.advance(speed, dt)
+        t_adv = _mono_us()
+        _brk_enter("adv")
+        try:
+            self.sprite.advance(speed, dt)
+        finally:
+            _brk_exit()
+        _flow_add("adv", _us_diff(_mono_us(), t_adv))
 
-        lcd = self.lcd
-        lcd.fillScreen(COL_BG)
-        self._poll_button(now)
-        self.sprite.draw(lcd, values, now)
-        self._poll_button(now)
-        self._draw_gauges(values)
-        self._draw_fault(fault)
-        if self._use_push:
+        # pushImage already covers y 0-102. Gauges repaint y 103-127.
+        # Skipping fillScreen and the canvas push avoids a second full-panel
+        # flush and a clear that would wipe the playfield.
+        direct = self._direct_playfield()
+        surface = self.panel if direct else self.lcd
+        fill_us = 0
+        flush_us = 0
+        if not direct:
+            _service()
+            t0 = _mono_us()
+            _brk_enter("fill")
             try:
-                lcd.push(0, 0)
-            except Exception:
-                self._use_push = False
+                surface.fillScreen(COL_BG)
+            finally:
+                _brk_exit()
+            fill_us = _us_diff(_mono_us(), t0)
+            if fill_us < 0:
+                fill_us = 0
+            self._gauge_bg = False
+            for key in self._last_fill:
+                self._last_fill[key] = -1
+            _service()
+        noted = self.sprite._tim_n
+        self.sprite.draw(surface, values, now, fault)
         self._poll_button(now)
-        self.sprite.report_timing(now)
+        prev = self.lcd
+        self.lcd = surface
+        t_gauge = _mono_us()
+        _brk_enter("gauge")
+        try:
+            self._draw_gauges(values)
+            if not self.sprite._corner_pushed:
+                self._draw_fault(fault)
+            else:
+                self._fault_shown = fault
+        finally:
+            self.lcd = prev
+            _flow_add("gauge", _us_diff(_mono_us(), t_gauge))
+            _brk_exit()
+        if (not direct) and self._use_push:
+            _service()
+            t0 = _mono_us()
+            _brk_enter("flush")
+            try:
+                try:
+                    surface.push(0, 0)
+                except Exception:
+                    self._use_push = False
+            finally:
+                _brk_exit()
+            flush_us = _us_diff(_mono_us(), t0)
+            if flush_us < 0:
+                flush_us = 0
+            _service()
+        if self.sprite._tim_n != noted:
+            self.sprite.note_chrome(fill_us, flush_us)
+        self._poll_button(now)
+        _brk_enter("timing")
+        try:
+            self.sprite.report_timing(now, speed)
+        finally:
+            _brk_exit()
 
     def _draw_gauges(self, values):
+        """Update the four bars in place.
+
+        The near-black band is painted once. A later frame only repaints a
+        bar whose width or color changed. A shrink is the track color on
+        the uncovered span, not another full-band clear.
+        """
         lcd = self.lcd
-        lcd.fillRect(0, GAUGE_Y, W, GAUGE_H, 0x101012)
+        if not self._gauge_bg:
+            lcd.fillRect(0, GAUGE_Y, W, GAUGE_H, 0x101012)
+            self._gauge_bg = True
+            for key in self._last_fill:
+                self._last_fill[key] = -1
         for key, lo, hi, x, y, w, h, mode in GAUGES:
             raw = values.get(key)
             if raw is None:
@@ -3578,10 +6698,24 @@ class Dashboard:
                 span = hi - lo
                 frac = ((v - lo) / span) if span else 0.0
                 fill_w = int(frac * w)
-            lcd.fillRect(x, y, w, h, COL_TRACK)
-            if fill_w > 0:
-                color = COL_ORANGE if mode == "orange" else value_rgb(frac)
-                lcd.fillRect(x, y, fill_w, h, color)
+            color = COL_ORANGE if mode == "orange" else value_rgb(frac)
+            prev = self._last_fill[key]
+            if prev == -1:
+                lcd.fillRect(x, y, w, h, COL_TRACK)
+                if fill_w > 0:
+                    lcd.fillRect(x, y, fill_w, h, color)
+            else:
+                old_w = prev[0]
+                old_color = prev[1]
+                if old_w == fill_w and old_color == color:
+                    continue
+                if color != old_color and fill_w > 0:
+                    lcd.fillRect(x, y, fill_w, h, color)
+                if fill_w < old_w:
+                    lcd.fillRect(x + fill_w, y, old_w - fill_w, h, COL_TRACK)
+                elif fill_w > old_w:
+                    lcd.fillRect(x + old_w, y, fill_w - old_w, h, color)
+            self._last_fill[key] = (fill_w, color)
 
     def _draw_fault(self, fault):
         if fault:
@@ -3624,27 +6758,44 @@ def pull_frames(bus, values):
         if msg[0] == ID_RPM and data is not None and len(data) >= 5:
             values["brk"] = 1.0 if (data[4] & 0x01) else 0.0
         n += 1
+        if (n & 7) == 0:
+            _service()
         if n >= 64:
             break
     return n
 
 
 def main():
+    global _BTN_HOOK
     M5.begin()
     lcd = Lcd
     pack = try_load_pixidx()
     sweep = Sweep()
     button = ButtonWatch(find_btn(), sweep.start)
+    # Ocean and sprite caches allocate here. Arm the watchdog after that so
+    # the first build cannot reset the device.
     ui = Dashboard(lcd, pack, button=button)
+    _init_wdt()
+
+    def _face_hook():
+        button.poll(time.ticks_ms())
+
+    _BTN_HOOK = _face_hook
     try:
         import ota_client
     except ImportError:
         ota_client = None
+    _install_ota_fetch_timeout(ota_client)
     _last_fetch_ms = -PIXIDX_FETCH_EVERY_MS
 
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
     last_rx_ms = 0
-    last_draw_ms = 0
+    next_draw = None
+    last_ota_ms = 0
+    present_t0 = None
+    boot_sweep_armed = True
+    sweep_idle_since = None
+    loop_mark = _mono_us()
 
     bus = None
     try:
@@ -3653,49 +6804,123 @@ def main():
         bus = None
 
     while True:
+        iter_us = _mono_us()
+        _feed_wdt()
+        if next_draw is not None:
+            # Sleep the microsecond leftover once. Do not come back and
+            # sleep_ms a remainder smaller than the 10 ms tick.
+            remain = _us_diff(next_draw, _mono_us())
+            if remain > 0:
+                _feed_wdt()
+                _brk_enter("sleep")
+                try:
+                    _sleep_us(remain)
+                finally:
+                    _brk_exit()
         now = time.ticks_ms()
-        # Poll every iteration, not only when a frame has finished.
+        if present_t0 is None:
+            present_t0 = now
+        frame_started = _mono_us()
+        _report_presented(now)
         button.poll(now)
 
         if sweep.active:
-            swept = sweep.step(now)
-            if swept is not None:
-                values.update(swept)
-            fault = False
-        else:
-            if bus is not None:
-                if pull_frames(bus, values):
-                    last_rx_ms = now
-            fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
-
-        if ota_client is not None:
+            _brk_enter("sweep")
             try:
-                ota_client.poll(now)
-            except Exception:
-                pass
+                swept = sweep.step(now)
+                if swept is not None:
+                    values.update(swept)
+                fault = False
+            finally:
+                _brk_exit()
+        else:
+            _brk_enter("can")
+            try:
+                if bus is not None:
+                    if pull_frames(bus, values):
+                        last_rx_ms = now
+                fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
+            finally:
+                _brk_exit()
+
+        _brk_enter("auto")
+        try:
+            start_auto, boot_sweep_armed, sweep_idle_since = auto_sweep_due(
+                now,
+                present_t0,
+                sweep.active,
+                live_can(bus, last_rx_ms, now),
+                boot_sweep_armed,
+                sweep_idle_since,
+            )
+            if start_auto:
+                sweep.start(now)
+                swept = sweep.step(now)
+                if swept is not None:
+                    values.update(swept)
+                fault = False
+                _brk_enter("serial")
+                try:
+                    print("auto-sweep")
+                finally:
+                    _brk_exit()
+        finally:
+            _brk_exit()
+
+        if ota_client is not None and (
+            last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
+        ):
+            _brk_enter("ota")
+            try:
+                last_ota_ms = now
+                _service()
+                try:
+                    ota_client.poll(now)
+                except Exception:
+                    pass
+            finally:
+                _brk_exit()
 
         if ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
             # Keep retrying while the current pack is missing or was rejected
             # (a leftover V6 file must not block the download).
-            wifi_ok = False
-            if ota_client is not None and hasattr(ota_client, "wifi_connected"):
-                try:
-                    wifi_ok = bool(ota_client.wifi_connected())
-                except Exception:
-                    wifi_ok = False
-            if wifi_ok or ota_client is None:
-                _last_fetch_ms = now
-                try:
-                    fetched = try_fetch_pixidx()
-                except Exception:
-                    fetched = None
-                if fetched is not None:
-                    ui.sprite.pack = fetched
-                    ui.sprite._sync_ground()
+            _brk_enter("pix")
+            try:
+                wifi_ok = False
+                if ota_client is not None and hasattr(ota_client, "wifi_connected"):
+                    try:
+                        wifi_ok = bool(ota_client.wifi_connected())
+                    except Exception:
+                        wifi_ok = False
+                if wifi_ok or ota_client is None:
+                    _last_fetch_ms = now
+                    try:
+                        fetched = try_fetch_pixidx()
+                    except Exception:
+                        fetched = None
+                    if fetched is not None:
+                        ui.sprite.pack = fetched
+                        ui.sprite._sync_ground()
+            finally:
+                _brk_exit()
 
-        if time.ticks_diff(now, last_draw_ms) >= REFRESH_MS:
-            ui.tick(values, fault, now)
-            last_draw_ms = now
+        _flow_add("loop", _us_diff(_mono_us(), loop_mark))
+        ui.tick(values, fault, now)
+        # The present has already been pushed. Collect here, never inside
+        # compose, stamp, or the display push.
+        _gc_after_present()
+        _brk_enter("pace")
+        try:
+            next_draw = pace_after(frame_started, _mono_us())
+        finally:
+            _brk_exit()
+        loop_mark = _mono_us()
+        _brk_enter("serial")
+        try:
+            _brk_maybe_print(now)
+        finally:
+            _brk_exit()
+        _brk_commit(_us_diff(_mono_us(), iter_us))
 
 
 if __name__ == "__main__":
