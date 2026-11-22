@@ -2049,33 +2049,6 @@ def _brk_add(name, us):
     _BRK_FR[name] = _BRK_FR[name] + us
 
 
-# Recent stage edges for the pause log. Not printed every frame.
-# wdt and svc fire too often to keep a stall window in this ring.
-_ST_CAP = 64
-_ST_TAG = [None] * _ST_CAP
-_ST_US = [0] * _ST_CAP
-_ST_IN = [0] * _ST_CAP
-_ST_I = 0
-_ST_N = 0
-_STAGE_SKIP = {"wdt": 1, "svc": 1}
-
-
-def _stage_mark(tag, is_in, now):
-    global _ST_I, _ST_N
-    if tag is None or tag in _STAGE_SKIP:
-        return
-    i = _ST_I
-    _ST_TAG[i] = tag
-    _ST_US[i] = now
-    _ST_IN[i] = 1 if is_in else 0
-    i += 1
-    if i >= _ST_CAP:
-        i = 0
-    _ST_I = i
-    if _ST_N < _ST_CAP:
-        _ST_N += 1
-
-
 def _brk_enter(name):
     """Pause the open bucket and start `name`. Nested calls stay exclusive."""
     global _BRK_NAME, _BRK_AT, _BRK_STN
@@ -2088,21 +2061,18 @@ def _brk_enter(name):
             _BRK_STN += 1
     _BRK_NAME = name
     _BRK_AT = now
-    _stage_mark(name, 1, now)
 
 
 def _brk_exit():
     global _BRK_NAME, _BRK_AT, _BRK_STN
     now = _mono_us()
     cur = _BRK_NAME
-    t0 = _BRK_AT
     dur = 0
     if cur is not None:
-        dur = _us_diff(now, t0)
+        dur = _us_diff(now, _BRK_AT)
         if dur < 0:
             dur = 0
         _brk_add(cur, dur)
-        _stage_mark(cur, 0, now)
     if _BRK_STN > 0:
         _BRK_STN -= 1
         _BRK_NAME = _BRK_ST[_BRK_STN]
@@ -2111,7 +2081,7 @@ def _brk_exit():
     else:
         _BRK_NAME = None
     if cur is not None and dur >= _PAUSE_HITCH_US:
-        _pause_on_slow(cur, dur, t0, now)
+        _pause_on_slow(cur, dur)
 
 
 def _brk_reset_sums():
@@ -2294,34 +2264,23 @@ _PAUSE_B = [0] * _PAUSE_CAP
 _PAUSE_N = 0
 _PAUSE_DROP = 0
 _PAUSE_FREE = -1
-# Stage snapshot for stall and autogc. Filled only when one of those fires.
-_PAUSE_AT = [None] * _PAUSE_CAP
-_PAUSE_X = [0] * _PAUSE_CAP
+# Sub-steps of the draw-to-plan calls only. Copied onto a stall or autogc.
+_DP_CAP = 6
+_DP_WHICH = None
+_DP_T = 0
+_DP_N = 0
+_DP_TAG = [None] * _DP_CAP
+_DP_US = [0] * _DP_CAP
+_PAUSE_FN = [None] * _PAUSE_CAP
 _PAUSE_DOM = [None] * _PAUSE_CAP
-_PAUSE_RN = [0] * _PAUSE_CAP
-_PAUSE_RT = []
-_PAUSE_R0 = []
-_PAUSE_R1 = []
+_PAUSE_DN = [0] * _PAUSE_CAP
+_PAUSE_DTAG = []
+_PAUSE_DUS = []
 _pi = 0
 while _pi < _PAUSE_CAP:
-    _PAUSE_RT.append([None, None, None, None])
-    _PAUSE_R0.append([0, 0, 0, 0])
-    _PAUSE_R1.append([0, 0, 0, 0])
+    _PAUSE_DTAG.append([None] * _DP_CAP)
+    _PAUSE_DUS.append([0] * _DP_CAP)
     _pi += 1
-_SC_TAG = [None] * 8
-_SC_IN = [0] * 8
-_SC_OUT = [0] * 8
-_SC_OV = [0] * 8
-_SC_ST = [0] * 8
-_SC_OP = [0] * 8
-_PAUSE_OP = []
-_oi = 0
-while _oi < _PAUSE_CAP:
-    _PAUSE_OP.append([0, 0, 0, 0])
-    _oi += 1
-_SP_TAG = [None] * 8
-_SP_US = [0] * 8
-_ORD = [0, 0, 0, 0]
 
 
 def _pause_push(cause, where, dur, a, b):
@@ -2336,10 +2295,9 @@ def _pause_push(cause, where, dur, a, b):
     _PAUSE_US[i] = dur
     _PAUSE_A[i] = a
     _PAUSE_B[i] = b
-    _PAUSE_AT[i] = None
-    _PAUSE_X[i] = 0
+    _PAUSE_FN[i] = None
     _PAUSE_DOM[i] = None
-    _PAUSE_RN[i] = 0
+    _PAUSE_DN[i] = 0
     _PAUSE_N = i + 1
 
 
@@ -2357,207 +2315,60 @@ def _pause_ms(us):
     return _fmt_tenths(_avg_tenths_ms(us, 1))
 
 
-def _stage_off(ts, t0):
-    d = _us_diff(ts, t0)
-    neg = 0
-    if d < 0:
-        neg = 1
-        d = -d
-    tenths = (d * 10 + 500) // 1000
-    if tenths > 99999:
-        tenths = 99999
-    if neg:
-        return -tenths
-    return tenths
+def _dp_begin(which):
+    """Start sub-step timing for one draw-to-plan call."""
+    global _DP_WHICH, _DP_T, _DP_N
+    _DP_WHICH = which
+    _DP_N = 0
+    _DP_T = _mono_us()
 
 
-def _stage_fmt_off(tenths):
-    if tenths < 0:
-        sign = "-"
-        tenths = -tenths
-    else:
-        sign = ""
-    return "%s%d.%d" % (sign, tenths // 10, tenths % 10)
+def _dp_step(tag):
+    """Close the current sub-step. Called only inside the plan entry path."""
+    global _DP_T, _DP_N
+    now = _mono_us()
+    dur = _us_diff(now, _DP_T)
+    if dur < 0:
+        dur = 0
+    if _DP_N < _DP_CAP:
+        _DP_TAG[_DP_N] = tag
+        _DP_US[_DP_N] = dur
+        _DP_N += 1
+    _DP_T = now
 
 
-def _stage_ov(a0, a1, b0, b1):
-    """Overlap of [a0, a1] with [b0, b1], in microseconds."""
-    sa = _us_diff(a0, b0)
-    ea = _us_diff(a1, b0)
-    eb = _us_diff(b1, b0)
-    s = sa if sa > 0 else 0
-    e = ea if ea < eb else eb
-    if e > s:
-        return e - s
-    return 0
+def _dp_snap(slot):
+    """Copy the plan-entry sub-steps onto one queued stall or autogc."""
+    n = _DP_N
+    which = _DP_WHICH
+    if n <= 0 or not which:
+        _PAUSE_FN[slot] = None
+        _PAUSE_DOM[slot] = None
+        _PAUSE_DN[slot] = 0
+        return
+    best = -1
+    bi = 0
+    i = 0
+    tags = _PAUSE_DTAG[slot]
+    uss = _PAUSE_DUS[slot]
+    while i < n and i < _DP_CAP:
+        tags[i] = _DP_TAG[i]
+        uss[i] = _DP_US[i]
+        if _DP_US[i] > best:
+            best = _DP_US[i]
+            bi = i
+        i += 1
+    _PAUSE_FN[slot] = which
+    _PAUSE_DN[slot] = i
+    _PAUSE_DOM[slot] = _DP_TAG[bi]
 
 
-def _stage_keep(etag, et, ts, t0, t1, cn, opened):
-    """Keep one stage if it meets the stall window. opened means no real exit yet."""
-    ov = _stage_ov(et, ts, t0, t1)
-    near = _us_diff(ts, t0)
-    if near < 0:
-        near = -near
-    ent = _us_diff(et, t0)
-    if ent < 0:
-        ent = -ent
-    if ov <= 0 and near > 5000 and ent > 5000:
-        return cn
-    if ov <= 0:
-        ov = 1
-    if cn < 8:
-        _SC_TAG[cn] = etag
-        _SC_ST[cn] = et
-        _SC_OUT[cn] = ts
-        _SC_OV[cn] = ov
-        _SC_OP[cn] = opened
-        return cn + 1
-    w = 0
-    m = 1
-    while m < 8:
-        if _SC_OV[m] < _SC_OV[w]:
-            w = m
-        m += 1
-    if ov > _SC_OV[w]:
-        _SC_TAG[w] = etag
-        _SC_ST[w] = et
-        _SC_OUT[w] = ts
-        _SC_OV[w] = ov
-        _SC_OP[w] = opened
-    return cn
-
-
-def _stage_fill(slot, t0, t1, dur):
-    """Remember who was open at t0, and the stages that touch the window."""
-    sp = 0
-    cn = 0
-    trans_from = None
-    trans_to = None
-    saw_edge = 0
-    active = None
-    n = _ST_N
-    if n > 0:
-        start = _ST_I - n
-        if start < 0:
-            start += _ST_CAP
-        k = 0
-        while k < n:
-            i = start + k
-            if i >= _ST_CAP:
-                i -= _ST_CAP
-            ts = _ST_US[i]
-            tag = _ST_TAG[i]
-            is_in = _ST_IN[i]
-            dt = _us_diff(ts, t0)
-            if -2000 <= dt <= 2000:
-                saw_edge = 1
-                if is_in:
-                    trans_to = tag
-                    if sp > 0:
-                        trans_from = _SP_TAG[sp - 1]
-                else:
-                    trans_from = tag
-                    if sp > 1:
-                        trans_to = _SP_TAG[sp - 2]
-                    elif sp == 1:
-                        trans_to = None
-            if is_in:
-                if sp < 8:
-                    _SP_TAG[sp] = tag
-                    _SP_US[sp] = ts
-                    sp += 1
-            else:
-                if sp > 0:
-                    sp -= 1
-                    cn = _stage_keep(_SP_TAG[sp], _SP_US[sp], ts, t0, t1, cn, 0)
-            if dt <= 0:
-                if sp > 0:
-                    active = _SP_TAG[sp - 1]
-                else:
-                    active = None
-            k += 1
-        p = 0
-        while p < sp:
-            cn = _stage_keep(_SP_TAG[p], _SP_US[p], t1, t0, t1, cn, 1)
-            p += 1
-    best = 0
-    best_i = -1
-    j = 0
-    while j < cn:
-        later = 0
-        if best_i >= 0 and _us_diff(_SC_ST[j], _SC_ST[best_i]) > 0:
-            later = 1
-        if _SC_OV[j] > best or (_SC_OV[j] == best and later):
-            best = _SC_OV[j]
-            best_i = j
-        j += 1
-    if dur > 0 and best * 10 >= dur * 7 and best_i >= 0:
-        _PAUSE_DOM[slot] = _SC_TAG[best_i]
-    else:
-        _PAUSE_DOM[slot] = "split"
-    if saw_edge:
-        left = trans_from if trans_from else "na"
-        right = trans_to if trans_to else "na"
-        _PAUSE_X[slot] = 1
-        _PAUSE_AT[slot] = "%s_%s" % (left, right)
-    else:
-        _PAUSE_X[slot] = 0
-        _PAUSE_AT[slot] = active if active else "na"
-    want0 = active
-    want1 = _PAUSE_DOM[slot]
-    if want1 == "split":
-        want1 = None
-    want2 = trans_from
-    on = 0
-    j = 0
-    while j < cn and on < 4:
-        tag = _SC_TAG[j]
-        if tag == want0 or tag == want1 or tag == want2:
-            _ORD[on] = j
-            on += 1
-        j += 1
-    j = 0
-    while j < cn and on < 4:
-        seen = 0
-        s = 0
-        while s < on:
-            if _ORD[s] == j:
-                seen = 1
-            s += 1
-        if not seen:
-            _ORD[on] = j
-            on += 1
-        j += 1
-    a = 0
-    while a < on:
-        b = a + 1
-        while b < on:
-            if _us_diff(_SC_ST[_ORD[b]], _SC_ST[_ORD[a]]) < 0:
-                tmp = _ORD[a]
-                _ORD[a] = _ORD[b]
-                _ORD[b] = tmp
-            b += 1
-        a += 1
-    rt = _PAUSE_RT[slot]
-    r0 = _PAUSE_R0[slot]
-    r1 = _PAUSE_R1[slot]
-    p = 0
-    while p < on:
-        src = _ORD[p]
-        rt[p] = _SC_TAG[src]
-        r0[p] = _stage_off(_SC_ST[src], t0)
-        r1[p] = _stage_off(_SC_OUT[src], t0)
-        _PAUSE_OP[slot][p] = _SC_OP[src]
-        p += 1
-    _PAUSE_RN[slot] = on
-
-
-def _pause_on_slow(where, dur, t0=None, t1=None):
+def _pause_on_slow(where, dur):
     """A long span. autogc if the heap grew since the last sample, else stall.
 
     The milliseconds are the whole span. They are not a clock around the
     collector. An explicit gc.collect in this same span is already queued.
-    t0 and t1 are the span start and end in ticks_us, when known.
+    A plan span also keeps the draw-to-plan sub-steps just measured.
     """
     global _PAUSE_FREE
     if (
@@ -2575,8 +2386,8 @@ def _pause_on_slow(where, dur, t0=None, t1=None):
         _pause_push("autogc", where, dur, prev, free)
     else:
         _pause_push("stall", where, dur, free, prev)
-    if t0 is not None and _PAUSE_N > before:
-        _stage_fill(_PAUSE_N - 1, t0, t1, dur)
+    if where == "plan" and _PAUSE_N > before:
+        _dp_snap(_PAUSE_N - 1)
 
 
 def _pause_piece(i):
@@ -2601,28 +2412,21 @@ def _pause_piece(i):
     else:
         head = "stall %s %sms" % (where, _pause_ms(dur))
         tail = "free %s was %s" % (_pause_k(a), _pause_k(b))
-    if _PAUSE_AT[i] is not None:
-        if _PAUSE_X[i]:
-            head = head + " x " + _PAUSE_AT[i]
-        else:
-            head = head + " at " + _PAUSE_AT[i]
-        if _PAUSE_DOM[i]:
-            head = head + " dom " + _PAUSE_DOM[i]
+    # Identity and the dominant sub-step stay in front of the 133-char cap.
+    if _PAUSE_FN[i]:
+        dom = _PAUSE_DOM[i] or "na"
+        nxt = head + " dom " + dom
+        if len(nxt) <= 133:
+            head = nxt
+        nxt = head + " fn " + _PAUSE_FN[i]
+        if len(nxt) <= 133:
+            head = nxt
     nxt = head + " " + tail
     if len(nxt) <= 133:
         head = nxt
     p = 0
-    rn = _PAUSE_RN[i]
-    while p < rn:
-        if _PAUSE_OP[i][p]:
-            end = "op"
-        else:
-            end = _stage_fmt_off(_PAUSE_R1[i][p])
-        bit = "%s %s-%s" % (
-            _PAUSE_RT[i][p],
-            _stage_fmt_off(_PAUSE_R0[i][p]),
-            end,
-        )
+    while p < _PAUSE_DN[i]:
+        bit = "%s %dus" % (_PAUSE_DTAG[i][p], _PAUSE_DUS[i][p])
         nxt = head + " " + bit
         if len(nxt) > 133:
             break
@@ -2641,16 +2445,13 @@ def _pause_shift(keep_from):
         _PAUSE_US[j] = _PAUSE_US[i]
         _PAUSE_A[j] = _PAUSE_A[i]
         _PAUSE_B[j] = _PAUSE_B[i]
-        _PAUSE_AT[j] = _PAUSE_AT[i]
-        _PAUSE_X[j] = _PAUSE_X[i]
+        _PAUSE_FN[j] = _PAUSE_FN[i]
         _PAUSE_DOM[j] = _PAUSE_DOM[i]
-        _PAUSE_RN[j] = _PAUSE_RN[i]
+        _PAUSE_DN[j] = _PAUSE_DN[i]
         k = 0
-        while k < 4:
-            _PAUSE_RT[j][k] = _PAUSE_RT[i][k]
-            _PAUSE_R0[j][k] = _PAUSE_R0[i][k]
-            _PAUSE_R1[j][k] = _PAUSE_R1[i][k]
-            _PAUSE_OP[j][k] = _PAUSE_OP[i][k]
+        while k < _DP_CAP:
+            _PAUSE_DTAG[j][k] = _PAUSE_DTAG[i][k]
+            _PAUSE_DUS[j][k] = _PAUSE_DUS[i][k]
             k += 1
         j += 1
         i += 1
@@ -5440,54 +5241,65 @@ class Sprite:
         Order matches _stamp_playfield_sprites: rings, sparkles, Sonic,
         HUD bar, HUD ring. extra is the tint for Sonic and 0 otherwise.
         """
-        out = self._planned
-        del out[:]
-        pack = self.pack
-        if pack is None:
+        _dp_begin("places")
+        seg = "clr"
+        try:
+            out = self._planned
+            del out[:]
+            pack = self.pack
+            if pack is None:
+                return out
+            _dp_step("clr")
+            seg = "ring"
+            off = int(self.scroll)
+            ring_frames = pack.cycles.get("rings")
+            if ring_frames:
+                fr = ring_frames[self.ring_i % len(ring_frames)]
+                period = RING_PERIOD
+                idx = 0
+                for wx in FIELD_RING_X:
+                    x = (wx - off) % period
+                    if x > W + 40:
+                        x -= period
+                    if -40 < x < W + 40:
+                        x0 = int(x - fr.origin_x)
+                        y0 = int(FIELD_RING_Y - fr.origin_y)
+                        out.append(("r%d" % idx, x0, y0, fr.w, fr.h, fr, 0, "rings"))
+                    idx += 1
+            _dp_step("ring")
+            seg = "spark"
+            spark_frames = pack.cycles.get("rings_sparkle")
+            if spark_frames:
+                si = 0
+                for item in self.sparkles:
+                    x, y, i, _acc = item
+                    if i < len(spark_frames):
+                        fr = spark_frames[i]
+                        x0 = int(int(x) - fr.origin_x)
+                        y0 = int(int(y) - fr.origin_y)
+                        out.append(("k%d" % si, x0, y0, fr.w, fr.h, fr, 0, "rings"))
+                    si += 1
+            _dp_step("spark")
+            seg = "rest"
+            frames = self._cycle_frames(self.anim_tag)
+            if frames:
+                fr = frames[self.anim_i % len(frames)]
+                x0 = int(SONIC_FEET_DEST_X - fr.origin_x)
+                y0 = int(SONIC_FEET_DEST_Y - fr.origin_y)
+                out.append(("sonic", x0, y0, fr.w, fr.h, fr, amount, "sonic"))
+            bar = pack.by_name.get("hud_bar")
+            if bar is not None:
+                out.append((
+                    "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
+                ))
+            ring = pack.by_name.get("hud_ring")
+            if ring is not None:
+                out.append((
+                    "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
+                ))
             return out
-        off = int(self.scroll)
-        ring_frames = pack.cycles.get("rings")
-        if ring_frames:
-            fr = ring_frames[self.ring_i % len(ring_frames)]
-            period = RING_PERIOD
-            idx = 0
-            for wx in FIELD_RING_X:
-                x = (wx - off) % period
-                if x > W + 40:
-                    x -= period
-                if -40 < x < W + 40:
-                    x0 = int(x - fr.origin_x)
-                    y0 = int(FIELD_RING_Y - fr.origin_y)
-                    out.append(("r%d" % idx, x0, y0, fr.w, fr.h, fr, 0, "rings"))
-                idx += 1
-        spark_frames = pack.cycles.get("rings_sparkle")
-        if spark_frames:
-            si = 0
-            for item in self.sparkles:
-                x, y, i, _acc = item
-                if i < len(spark_frames):
-                    fr = spark_frames[i]
-                    x0 = int(int(x) - fr.origin_x)
-                    y0 = int(int(y) - fr.origin_y)
-                    out.append(("k%d" % si, x0, y0, fr.w, fr.h, fr, 0, "rings"))
-                si += 1
-        frames = self._cycle_frames(self.anim_tag)
-        if frames:
-            fr = frames[self.anim_i % len(frames)]
-            x0 = int(SONIC_FEET_DEST_X - fr.origin_x)
-            y0 = int(SONIC_FEET_DEST_Y - fr.origin_y)
-            out.append(("sonic", x0, y0, fr.w, fr.h, fr, amount, "sonic"))
-        bar = pack.by_name.get("hud_bar")
-        if bar is not None:
-            out.append((
-                "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
-            ))
-        ring = pack.by_name.get("hud_ring")
-        if ring is not None:
-            out.append((
-                "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
-            ))
-        return out
+        finally:
+            _dp_step(seg)
 
     def _places_same(self, places):
         old = self._placed
@@ -5970,21 +5782,30 @@ class Sprite:
 
     def _fill_native_offs_at(self, scroll):
         """Write stamp offsets into _off_buf. Returns cloud, water, ground."""
-        tw = self.ocean_tw
-        offs = self._off_buf
-        del offs[:]
-        if not self._parallax:
-            return _norm_off(scroll, tw), 0, 0
-        off_c = _norm_off(scroll * PARALLAX_CLOUDS, tw)
-        off_w = _norm_off(scroll * PARALLAX_WATER, tw)
-        off_g = _norm_off(scroll * PARALLAX_GROUND, tw)
-        stamps = self.ocean_stamps
-        i = 0
-        n = len(stamps) if stamps else 0
-        while i < n:
-            offs.append(_norm_off(scroll * stamps[i][0], tw))
-            i += 1
-        return off_c, off_w, off_g
+        _dp_begin("offs")
+        seg = "clr"
+        try:
+            tw = self.ocean_tw
+            offs = self._off_buf
+            del offs[:]
+            _dp_step("clr")
+            seg = "norm"
+            if not self._parallax:
+                return _norm_off(scroll, tw), 0, 0
+            off_c = _norm_off(scroll * PARALLAX_CLOUDS, tw)
+            off_w = _norm_off(scroll * PARALLAX_WATER, tw)
+            off_g = _norm_off(scroll * PARALLAX_GROUND, tw)
+            _dp_step("norm")
+            seg = "loop"
+            stamps = self.ocean_stamps
+            i = 0
+            n = len(stamps) if stamps else 0
+            while i < n:
+                offs.append(_norm_off(scroll * stamps[i][0], tw))
+                i += 1
+            return off_c, off_w, off_g
+        finally:
+            _dp_step(seg)
 
     def _native_same(self, off_c, off_w, off_g, amount):
         _brk_enter("plan")
@@ -5994,50 +5815,61 @@ class Sprite:
             _brk_exit()
 
     def _native_same_at(self, off_c, off_w, off_g, amount):
-        if not self._native_ready:
-            return False
-        if self._parallax:
-            if not self._nat_parallax:
+        _dp_begin("same")
+        seg = "gate"
+        try:
+            if not self._native_ready:
                 return False
-            if self._nat_c != off_c or self._nat_w != off_w or self._nat_g != off_g:
+            _dp_step("gate")
+            seg = "off"
+            if self._parallax:
+                if not self._nat_parallax:
+                    return False
+                if self._nat_c != off_c or self._nat_w != off_w or self._nat_g != off_g:
+                    return False
+                prev = self._nat_stamp
+                cur = self._off_buf
+                if len(prev) != len(cur):
+                    return False
+                i = 0
+                while i < len(cur):
+                    if prev[i] != cur[i]:
+                        return False
+                    i += 1
+            else:
+                if self._nat_parallax or self._nat_flat != off_c:
+                    return False
+            _dp_step("off")
+            seg = "anim"
+            if self._nat_tag != self.anim_tag or self._nat_anim != self.anim_i:
                 return False
-            prev = self._nat_stamp
-            cur = self._off_buf
-            if len(prev) != len(cur):
+            if self._nat_ring_i != self.ring_i or self._nat_amount != amount:
+                return False
+            if self._nat_rings != self.rings:
+                return False
+            boost = self.boost
+            if (
+                self._nat_aura != boost.aura_i
+                or self._nat_sw != boost.sw_i
+                or self._nat_bar != boost.bar_i
+            ):
+                return False
+            _dp_step("anim")
+            seg = "spark"
+            sp = self.sparkles
+            prev_s = self._nat_spark
+            if len(sp) != len(prev_s):
                 return False
             i = 0
-            while i < len(cur):
-                if prev[i] != cur[i]:
+            while i < len(sp):
+                item = sp[i]
+                p = prev_s[i]
+                if item[0] != p[0] or item[1] != p[1] or item[2] != p[2]:
                     return False
                 i += 1
-        else:
-            if self._nat_parallax or self._nat_flat != off_c:
-                return False
-        if self._nat_tag != self.anim_tag or self._nat_anim != self.anim_i:
-            return False
-        if self._nat_ring_i != self.ring_i or self._nat_amount != amount:
-            return False
-        if self._nat_rings != self.rings:
-            return False
-        boost = self.boost
-        if (
-            self._nat_aura != boost.aura_i
-            or self._nat_sw != boost.sw_i
-            or self._nat_bar != boost.bar_i
-        ):
-            return False
-        sp = self.sparkles
-        prev_s = self._nat_spark
-        if len(sp) != len(prev_s):
-            return False
-        i = 0
-        while i < len(sp):
-            item = sp[i]
-            p = prev_s[i]
-            if item[0] != p[0] or item[1] != p[1] or item[2] != p[2]:
-                return False
-            i += 1
-        return True
+            return True
+        finally:
+            _dp_step(seg)
 
     def _remember_native(self, off_c, off_w, off_g, amount):
         self._nat_parallax = bool(self._parallax)
