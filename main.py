@@ -2159,6 +2159,10 @@ _BRK_T0 = 0
 # The timing line that already arrives intact on this USB CDC is 139
 # characters. A longer brk print was cut at the front and stalled a frame.
 _BRK_CDC = 139
+# Once a second this line blocked USB for 15–19 ms and pulled a 30 fps
+# window down to 29. Every two seconds, and not on the timing frame.
+_BRK_PRINT_MS = 2000
+_DIAG_SKIP_BRK = False
 _BRK_PAGE = 0
 _BRK_ALT_I = 0
 # Page 0, in the order they are added. wall and left go first so a long
@@ -2369,12 +2373,20 @@ def _brk_cdc_line():
 
 
 def _brk_maybe_print(now):
-    """One short line a second, and only when USB CDC can take it."""
-    global _BRK_T0
+    """One short line every two seconds, and only when USB CDC can take it.
+
+    Skipped on a frame that just printed timing, so the two long lines
+    do not stack into one 15 ms USB stall.
+    """
+    global _BRK_T0, _DIAG_SKIP_BRK
     if _BRK_T0 == 0:
         _BRK_T0 = now
         return
-    if _ms_diff(now, _BRK_T0) < 1000:
+    if _ms_diff(now, _BRK_T0) < _BRK_PRINT_MS:
+        return
+    if _DIAG_SKIP_BRK:
+        _DIAG_SKIP_BRK = False
+        _BRK_T0 = now
         return
     if _BRK_N <= 0:
         return
@@ -2483,6 +2495,9 @@ def _pause_piece(i):
         )
     if cause == "autogc":
         return "autogc %s %sms %s>%s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
+    if cause == "spark":
+        # dur is how many sparkle slots were not a 4-list. No heap walk.
+        return "spark drop %d" % dur
     return "stall %s %sms free %s was %s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
 
 
@@ -4648,7 +4663,45 @@ class Sprite:
                     self.idle_wait = 0
         self.ring_i = (self.ring_i + 1) & 7
 
+    def _purge_sparkles(self):
+        """Drop a sparkle slot that is not [x, y, frame, acc].
+
+        Every writer stores a 4-list. A slot that is an int instead makes
+        the native paint raise, and the fallback blit then reboots the
+        board. Those slots are removed. The pause line is the only record.
+        """
+        sp = self.sparkles
+        if not isinstance(sp, list):
+            self.sparkles = []
+            _pause_push("spark", "gc", 1, 0, 0)
+            return
+        w = 0
+        i = 0
+        n = len(sp)
+        bad = 0
+        while i < n:
+            item = sp[i]
+            keep = False
+            if isinstance(item, list) and len(item) >= 4:
+                try:
+                    item[0] + item[1] + item[2] + item[3]
+                    keep = True
+                except Exception:
+                    keep = False
+            if keep:
+                if w != i:
+                    sp[w] = item
+                w += 1
+            else:
+                bad += 1
+            i += 1
+        if w != n:
+            del sp[w:]
+        if bad:
+            _pause_push("spark", "gc", bad, 0, 0)
+
     def _step_sparkles(self, dt_ms):
+        self._purge_sparkles()
         sp = self.sparkles
         if not sp:
             return
@@ -4838,6 +4891,7 @@ class Sprite:
         return found
 
     def _blit_playfield_sprites(self, lcd, pal_s, pal_c, off):
+        self._purge_sparkles()
         pack = self.pack
         ring_frames = pack.cycles.get("rings")
         if ring_frames:
@@ -5249,6 +5303,7 @@ class Sprite:
         return True
 
     def _sprite_unchanged(self, amount):
+        self._purge_sparkles()
         if not self._sprites_on or not self._sig_ok:
             return False
         if self._sig_ring_i != self.ring_i:
@@ -5274,6 +5329,7 @@ class Sprite:
         return True
 
     def _remember_sprites(self, amount):
+        self._purge_sparkles()
         self._sig_ring_i = self.ring_i
         self._sig_anim_tag = self.anim_tag
         self._sig_anim_i = self.anim_i
@@ -5385,6 +5441,7 @@ class Sprite:
         Order matches _stamp_playfield_sprites: rings, sparkles, Sonic,
         HUD bar, HUD ring. extra is the tint for Sonic and 0 otherwise.
         """
+        self._purge_sparkles()
         out = self._planned
         del out[:]
         pack = self.pack
@@ -5720,6 +5777,7 @@ class Sprite:
         self._play_valid = True
 
     def _stamp_playfield_sprites(self, amount, save_under=False, window=None):
+        self._purge_sparkles()
         pack = self.pack
         if window is None:
             window = self.ocean_window
@@ -5836,6 +5894,8 @@ class Sprite:
                 self._tim_full,
             )
             )
+            global _DIAG_SKIP_BRK
+            _DIAG_SKIP_BRK = True
         finally:
             _brk_exit()
         self._tim_n = 0
@@ -5917,6 +5977,7 @@ class Sprite:
             _brk_exit()
 
     def _native_same_at(self, off_c, off_w, off_g, amount):
+        self._purge_sparkles()
         if not self._native_ready:
             return False
         if self._parallax:
@@ -5963,6 +6024,7 @@ class Sprite:
         return True
 
     def _remember_native(self, off_c, off_w, off_g, amount):
+        self._purge_sparkles()
         self._nat_parallax = bool(self._parallax)
         self._nat_c = off_c
         self._nat_w = off_w

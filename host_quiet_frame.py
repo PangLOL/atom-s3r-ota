@@ -727,6 +727,37 @@ def main():
     draw_src = inspect.getsource(fw.Sprite._draw_native_frame)
     assert draw_src.index("_fill_native_offs") < draw_src.index("_paint_native")
 
+    # A sparkle slot that is an int used to fail the native paint, then
+    # the fallback blit raised again and rebooted. It is dropped instead.
+    sp.sparkles = [[3, 78, 1, 0], 9, "nope", [1, 2]]
+    fw._PAUSE_N = 0
+    sp._purge_sparkles()
+    assert sp.sparkles == [[3, 78, 1, 0]]
+    assert fw._pause_piece(0) == "spark drop 3"
+    sp.pack = None
+    sp.sparkles = [9, [8, 78, 0, 0]]
+    sp._step_sparkles(16)
+    assert sp.sparkles == []
+
+    class _SparkPack(object):
+        def __init__(self):
+            self.cycles = {"rings_sparkle": [object()]}
+            self.by_name = {}
+
+    sp.pack = _SparkPack()
+    sp.sparkles = [4]
+    sp._blit_playfield_sprites(None, None, None, 0)
+    assert sp.sparkles == []
+    sp.sparkles = [5]
+    sp._planned = []
+    sp._plan_places_at(0)
+    assert sp.sparkles == []
+    sp._native_ready = False
+    sp.sparkles = [6]
+    assert sp._native_same_at(0, 0, 0, 0) is False
+    assert sp.sparkles == []
+    assert fw._BRK_PRINT_MS == 2000
+
     print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped, "vtec", int(peak_rpm))
 
 
