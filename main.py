@@ -102,40 +102,25 @@ FRAME_MIN_MS = 16
 # Present on the ring quantum so each paint advances the rings by one
 # step. 16 ms would alias against this 33 ms cycle (fast, then slow).
 # The loop waits out the remainder instead of drawing again early.
-# The two-second timing line still collects only when the heap is low.
-# The same rule applies at rest and in motion.
-GC_LOW_FREE = 64 * 1024
-GC_CRITICAL_FREE = 24 * 1024
-GC_MOVE_MIN_MS = 15000
 # C gc_alloc collects by itself when bytes allocated since the last
-# collection reach gc.threshold. The stock 57,344-byte value fired about
-# twice a second inside a present (~137 ms, ~119 KB/s). Automatic
-# collection stays off; this value is the safety net if that call is
-# missing. One frame is only a few KB. The ceiling is above the
-# between-frame trigger, one mem_alloc check of slack, and the full
-# deferral, so waiting for a stop or a gap between boosts cannot let C
-# collect mid-present. At the measured settled rate (512 KiB in about
-# 10 s, ~51 KiB/s) the worst wait is about 1.25 MiB + ~90 KiB + 10 s,
-# under 2 MiB. 3 MiB still covers a faster ~100 KiB/s burst of that
-# same shape. The old mid-present thrash rate is not this path.
+# collection reach gc.threshold. The stock value fired about twice a
+# second inside a present. Automatic collection stays off. This ceiling
+# is only the safety net if that call is missing, so a full collect
+# stays rare. On the flashed Atom S3R VM, gc.collect() with no argument
+# is one slice of about GC_SLICE_US and then returns. Later bytecode and
+# the ESP32 event poll continue that same cycle, at least 12 ms apart.
+# An allocation that finds no free block, or this threshold, finishes
+# the rest of the cycle inside the call. That finish is a full stall.
 GC_AUTO_BYTES = 3072 * 1024
-# Explicit collect after a finished present, once the heap has grown by
-# this much since the last collect. On the 1.0 build, 512 KiB of growth
-# landed about every 10 s once the listen settled (the first gap was
-# shorter). 2.5× that gap is 1.25 MiB, about 25 s at that rate, inside
-# the 20–30 s window. Trimming present-path garbage makes the heap grow
-# more slowly, so the same byte gap waits longer. Not every frame: a
-# full collect scans the PSRAM heap and costs ~157 ms.
-GC_BETWEEN_BYTES = 1280 * 1024
-# How many completed presents between mem_alloc samples. The sample walks
-# the heap (~13 ms), so it is not done on every frame. Once a collect is
-# due, the stop / boost-gap check does not sample again.
-GC_CHECK_FRAMES = 30
-# After growth crosses GC_BETWEEN_BYTES, wait this long for a stop or a
-# gap between boosts, then collect anyway. The wait is checked on later
-# presents without another heap walk. 10 s at the measured rate is about
-# 0.5 MiB, which still fits under GC_AUTO_BYTES.
-GC_DEFER_MS = 10000
+# After the present, one slice runs only when the 33 ms frame still has
+# this much leftover. The margin covers the call and a slice that runs
+# a little past the 3 ms cap. A tighter frame skips. One call, no loop,
+# and no deferred cycle.
+GC_SLICE_US = 3000
+GC_SLICE_MARGIN_US = 2000
+# Longer than one slice: the call finished a cycle (threshold or no
+# free block). Logged without reading the heap.
+GC_SLICE_STALL_US = 20000
 # A full 128x103 RGB565 push is about 26 KB. 800 ms is well past a slow
 # SPI transfer and still shorter than the 30 s watchdog. The driver call
 # itself has no timeout; this bound is the one the handoff waits on.
@@ -2404,7 +2389,6 @@ def _brk_maybe_print(now):
 # A bucket at least this long is a hitch, not steady draw or push work.
 # Logged only. It does not itself collect.
 _PAUSE_HITCH_US = 80000
-_PAUSE_RISE = 1024
 _PAUSE_CAP = 8
 _PAUSE_CAUSE = [None] * _PAUSE_CAP
 _PAUSE_WHERE = [None] * _PAUSE_CAP
@@ -2413,7 +2397,6 @@ _PAUSE_A = [0] * _PAUSE_CAP
 _PAUSE_B = [0] * _PAUSE_CAP
 _PAUSE_N = 0
 _PAUSE_DROP = 0
-_PAUSE_FREE = -1
 # Extra fields for a gcwake record: free heap and the ticks_us at the decision.
 _PAUSE_C = [0] * _PAUSE_CAP
 _PAUSE_D = [0] * _PAUSE_CAP
@@ -2450,73 +2433,22 @@ def _pause_ms(us):
     return _fmt_tenths(_avg_tenths_ms(us, 1))
 
 
-def _gc_int(fn):
-    if fn is None:
-        return -1
-    try:
-        val = fn()
-    except Exception:
-        return -1
-    if isinstance(val, tuple):
-        if not val:
-            return -1
-        val = val[0]
-    try:
-        return int(val)
-    except Exception:
-        return -1
-
-
-def _gc_sample():
-    """Threshold, bytes allocated, and bytes free. Reads only.
-
-    This port exposes gc.threshold(), gc.mem_alloc(), and gc.mem_free().
-    mem_alloc is the heap bytes still in use, not a count of objects.
-    A missing call stays -1.
-    """
-    try:
-        import gc
-    except ImportError:
-        return -1, -1, -1
-    th = _gc_int(getattr(gc, "threshold", None))
-    alloc = _gc_int(getattr(gc, "mem_alloc", None))
-    free = _mem_free()
-    return th, alloc, free
-
-
-def _gcwake_push(kind, t0, us, th, alloc, free):
-    """Queue one wake-up. kind is no, yes, or run. Printed only if CDC can take it."""
-    before = _PAUSE_N
-    if us < 0:
-        us = 0
-    _pause_push("gcwake", kind, us, th, alloc)
-    if _PAUSE_N > before:
-        i = _PAUSE_N - 1
-        _PAUSE_C[i] = free
-        _PAUSE_D[i] = t0
-
-
 def _pause_on_slow(where, dur):
-    """A long span. autogc if the heap grew since the last sample, else stall.
+    """A long span. Logged only. Does not walk the heap.
 
     The milliseconds are the whole span. They are not a clock around the
     collector. An explicit gc.collect in this same span is already queued.
+    gc.mem_free() scans every block. On the sliced-VM listen that scan
+    was the hitch beside the free= field (stall left, stall sonic) and
+    was charged to the parent bucket. free stays unknown.
     """
-    global _PAUSE_FREE
     if (
         _PAUSE_N > 0
         and _PAUSE_CAUSE[_PAUSE_N - 1] == "collect"
         and _PAUSE_WHERE[_PAUSE_N - 1] == where
     ):
         return
-    free = _mem_free()
-    prev = _PAUSE_FREE
-    if free >= 0:
-        _PAUSE_FREE = free
-    if prev >= 0 and free > prev + _PAUSE_RISE:
-        _pause_push("autogc", where, dur, prev, free)
-    else:
-        _pause_push("stall", where, dur, free, prev)
+    _pause_push("stall", where, dur, -1, -1)
 
 
 def _pause_piece(i):
@@ -2628,7 +2560,10 @@ def _install_pause_gc():
     orig = getattr(gc, "collect", None)
     if orig is not None and not getattr(orig, "_pause_wrapped", False):
         def _wrapped():
-            th, alloc, free0 = _gc_sample()
+            # No mem_alloc / mem_free. Both walk the heap, and a slice
+            # returns before the sweep has freed anything. A short call
+            # is one slice and is not logged. A long call finished the
+            # cycle; the line records the time and not a heap sample.
             t0 = _mono_us()
             try:
                 return orig()
@@ -2636,15 +2571,11 @@ def _install_pause_gc():
                 dur = _us_diff(_mono_us(), t0)
                 if dur < 0:
                     dur = 0
-                free1 = _mem_free()
-                global _PAUSE_FREE
-                if free1 >= 0:
-                    _PAUSE_FREE = free1
-                where = _BRK_NAME
-                if not where:
-                    where = "boot"
-                _pause_push("collect", where, dur, free0, free1)
-                _gcwake_push("run", t0, dur, th, alloc, free0)
+                if dur >= GC_SLICE_STALL_US:
+                    where = _BRK_NAME
+                    if not where:
+                        where = "boot"
+                    _pause_push("collect", where, dur, -1, -1)
         _wrapped._pause_wrapped = True
         try:
             gc.collect = _wrapped
@@ -2700,39 +2631,39 @@ def _install_pause_gc():
 _install_pause_gc()
 
 
-_GC_ALLOC_MARK = None
-_GC_CHECK_N = 0
-# ticks_ms when growth first crossed GC_BETWEEN_BYTES, or None if not due.
-_GC_DUE_AT = None
-# Last mem_free sample and the last explicit collect, in the caller's
-# ticks_ms. A sample suppresses another walk for GC_MOVE_MIN_MS so a
-# heap that stays critical does not collect on every present.
-_GC_FREE_AT = None
-_GC_COLLECT_AT = None
+def gc_slice_room(spent_us, quantum_us=None):
+    """True when one slice fits in the leftover of this frame.
 
-
-def gc_moment(speed, boost_phase):
-    """True when a between-frame collect can sit after the aura sequence.
-
-    Mid-aura (run), the end shockwave, and the sound barrier are not
-    moments, including when the car has already stopped, so a collect
-    does not land on those frames. Stopped with the sequence idle, and
-    any speed once the sequence is idle, are moments. 100 km/h is not
-    the gap: the aura follows rpm, so a cruise above that with the
-    sequence finished is still a place to collect. Chao, item boxes,
-    and enemy hits are not in this dashboard, so they are not moments.
-    `speed` stays in the signature for the caller. It does not open or
-    close the gap.
+    spent_us is microseconds from the frame start to just after the
+    present. quantum_us defaults to the 33 ms ring quantum. A slice is
+    about GC_SLICE_US. It runs only when the leftover is at least that
+    plus GC_SLICE_MARGIN_US. A negative spent, a frame that already
+    used the quantum, or a smaller leftover skips. This does not read
+    the heap.
     """
-    if boost_phase in ("run", "end_sw", "barrier"):
+    if quantum_us is None:
+        quantum_us = _pace_us()
+    if spent_us < 0 or quantum_us <= 0:
         return False
-    return True
+    if spent_us >= quantum_us:
+        return False
+    return (quantum_us - spent_us) >= (GC_SLICE_US + GC_SLICE_MARGIN_US)
 
 
-def _gc_collect_between(now=None):
-    """One explicit collect. The caller is already after a finished present."""
-    global _GC_ALLOC_MARK, _GC_CHECK_N, _GC_DUE_AT
-    global _GC_COLLECT_AT, _GC_FREE_AT
+def _gc_after_present(spent_us):
+    """One sliced collect after the present, when this frame has room.
+
+    The panel already has this frame. When the leftover of the 33 ms
+    budget covers one slice plus a small margin, this calls collect
+    once with no arguments and returns. On the flashed Atom S3R VM that
+    call is one slice of about 3 ms. Later bytecode and the event poll
+    continue that cycle, at least 12 ms apart. A late frame skips.
+    This does not loop, and it does not wait out a deferral and then
+    start a cycle. It does not read the heap: a free or alloc sample
+    walks every block, and the sweep may not have finished.
+    """
+    if not gc_slice_room(spent_us):
+        return
     _brk_enter("gc")
     try:
         try:
@@ -2742,116 +2673,6 @@ def _gc_collect_between(now=None):
             pass
     finally:
         _brk_exit()
-    try:
-        import gc
-        alloc2 = _gc_int(getattr(gc, "mem_alloc", None))
-    except ImportError:
-        alloc2 = -1
-    if alloc2 >= 0:
-        _GC_ALLOC_MARK = alloc2
-    _GC_DUE_AT = None
-    _GC_CHECK_N = 0
-    if now is not None:
-        _GC_COLLECT_AT = now
-        _GC_FREE_AT = now
-
-
-def _gc_low_free(now):
-    """True when the after-present low-free rule says to collect.
-
-    gc.mem_free scans the heap. The timing line used to do that, plus
-    gc.mem_alloc, every two seconds inside ui.tick. On the PR #13 listen
-    the pair grew from ~55 ms to ~118 ms once a split-heap area doubled
-    the scan, and that was the `timing` max. Any sample, high or low,
-    waits GC_MOVE_MIN_MS before the next walk, so a heap that stays
-    critical does not collect on every following present. The walk and
-    the collect are after the push, not on the timing line.
-    """
-    global _GC_FREE_AT, _PAUSE_FREE
-    if _GC_FREE_AT is not None:
-        age = _ms_diff(now, _GC_FREE_AT)
-        if 0 <= age < GC_MOVE_MIN_MS:
-            return False
-    t0 = _mono_us()
-    free = _mem_free()
-    dur = _us_diff(_mono_us(), t0)
-    if dur < 0:
-        dur = 0
-    if free >= 0:
-        _PAUSE_FREE = free
-    _GC_FREE_AT = now
-    if _GC_COLLECT_AT is None:
-        since = GC_MOVE_MIN_MS
-        age = -1
-    else:
-        since = _ms_diff(now, _GC_COLLECT_AT)
-        if since < 0:
-            since = 0
-        age = since
-    if free < 0:
-        why = "unk"
-    elif free < GC_CRITICAL_FREE:
-        why = "crit"
-    elif free < GC_LOW_FREE and since >= GC_MOVE_MIN_MS:
-        why = "low"
-    elif free < GC_LOW_FREE:
-        why = "wait"
-    else:
-        why = "skip"
-    _pause_push("thresh", why, dur, free, age)
-    return collect_due(free, since)
-
-
-def _gc_after_present(now, speed, boost_phase):
-    """Collect only after a present, and only after a large allocation gap.
-
-    Called once ui.tick has returned, so compose, stamp, and the display
-    push are already finished. mem_alloc is sampled every GC_CHECK_FRAMES
-    presents, not every frame. A due collect waits out the aura, and
-    runs anyway after GC_DEFER_MS. It can still run when the sequence is
-    idle, including at a stop. The collect goes through gc.collect, so
-    the existing gcwake / collect lines still record it. A separate
-    low-free walk is not on the two-second timing line.
-    """
-    global _GC_ALLOC_MARK, _GC_CHECK_N, _GC_DUE_AT
-    # The growth sample is its own heap walk. Do not stack a mem_free
-    # walk on that same present; the next one is soon enough.
-    growth_sample = _GC_DUE_AT is None and (_GC_CHECK_N + 1) >= GC_CHECK_FRAMES
-    if not growth_sample and _gc_low_free(now):
-        _gc_collect_between(now)
-        return
-    due = _GC_DUE_AT
-    if due is not None:
-        if gc_moment(speed, boost_phase):
-            _gc_collect_between(now)
-            return
-        waited = _ms_diff(now, due)
-        if waited < 0 or waited >= GC_DEFER_MS:
-            _pause_push("gcwait", "gc", waited if waited > 0 else 0, 0, 0)
-            _gc_collect_between(now)
-        return
-    _GC_CHECK_N += 1
-    if _GC_CHECK_N < GC_CHECK_FRAMES:
-        return
-    _GC_CHECK_N = 0
-    try:
-        import gc
-    except ImportError:
-        return
-    alloc = _gc_int(getattr(gc, "mem_alloc", None))
-    if alloc < 0:
-        return
-    mark = _GC_ALLOC_MARK
-    if mark is None or alloc < mark:
-        _GC_ALLOC_MARK = alloc
-        return
-    if alloc - mark < GC_BETWEEN_BYTES:
-        return
-    if gc_moment(speed, boost_phase):
-        _gc_collect_between(now)
-        return
-    _GC_DUE_AT = now
-    _pause_push("gcdefer", "gc", 0, GC_DEFER_MS, 0)
 
 
 def draw_due(now, next_draw):
@@ -2969,24 +2790,6 @@ def anim_dt(dt):
     if dt < 0 or dt > REFRESH_MS:
         return REFRESH_MS
     return dt
-
-
-def collect_due(free, since_ms):
-    """Whether this window should run gc.collect.
-
-    free: gc.mem_free(), or -1 if it could not be read.
-    since_ms: time since the last collect. A large value if none yet.
-    Speed does not matter. A healthy heap never collects on the timing
-    line, including at 0 km/h. Under GC_LOW_FREE, wait GC_MOVE_MIN_MS.
-    Under GC_CRITICAL_FREE, collect immediately. Unknown free skips.
-    """
-    if free < 0:
-        return False
-    if free < GC_CRITICAL_FREE:
-        return True
-    if free < GC_LOW_FREE and since_ms >= GC_MOVE_MIN_MS:
-        return True
-    return False
 
 
 def _ms_diff(later, earlier):
@@ -5993,7 +5796,8 @@ class Sprite:
         skips the print; the counters stay. gc stays 0 here. A heap walk
         or a collect on this line was inside the frame: on the PR #13
         listen the walk alone was the 55 ms, then 118 ms, timing hitch.
-        Low-free and growth collects run after ui.tick returns.
+        The one slice, when the frame budget has room, runs after
+        ui.tick returns.
         """
         n = self._tim_n
         if n <= 0 or self._tim_t0 == 0:
@@ -7232,10 +7036,9 @@ def main():
 
         _flow_add("loop", _us_diff(_mono_us(), loop_mark))
         ui.tick(values, fault, now)
-        # The present has already been pushed. Collect here, never inside
-        # compose, stamp, or the display push. A due collect waits out the
-        # aura and still runs when that sequence is idle, including a stop.
-        _gc_after_present(now, values.get("spd"), ui.sprite.boost.phase)
+        # The panel has this frame. One slice only if this 33 ms budget
+        # still has room. The pace below sleeps what remains.
+        _gc_after_present(_us_diff(_mono_us(), frame_started))
         _brk_enter("pace")
         try:
             next_draw = pace_after(frame_started, _mono_us())
