@@ -2049,6 +2049,33 @@ def _brk_add(name, us):
     _BRK_FR[name] = _BRK_FR[name] + us
 
 
+# Recent stage edges for the pause log. Not printed every frame.
+# wdt and svc fire too often to keep a stall window in this ring.
+_ST_CAP = 64
+_ST_TAG = [None] * _ST_CAP
+_ST_US = [0] * _ST_CAP
+_ST_IN = [0] * _ST_CAP
+_ST_I = 0
+_ST_N = 0
+_STAGE_SKIP = {"wdt": 1, "svc": 1}
+
+
+def _stage_mark(tag, is_in, now):
+    global _ST_I, _ST_N
+    if tag is None or tag in _STAGE_SKIP:
+        return
+    i = _ST_I
+    _ST_TAG[i] = tag
+    _ST_US[i] = now
+    _ST_IN[i] = 1 if is_in else 0
+    i += 1
+    if i >= _ST_CAP:
+        i = 0
+    _ST_I = i
+    if _ST_N < _ST_CAP:
+        _ST_N += 1
+
+
 def _brk_enter(name):
     """Pause the open bucket and start `name`. Nested calls stay exclusive."""
     global _BRK_NAME, _BRK_AT, _BRK_STN
@@ -2061,18 +2088,21 @@ def _brk_enter(name):
             _BRK_STN += 1
     _BRK_NAME = name
     _BRK_AT = now
+    _stage_mark(name, 1, now)
 
 
 def _brk_exit():
     global _BRK_NAME, _BRK_AT, _BRK_STN
     now = _mono_us()
     cur = _BRK_NAME
+    t0 = _BRK_AT
     dur = 0
     if cur is not None:
-        dur = _us_diff(now, _BRK_AT)
+        dur = _us_diff(now, t0)
         if dur < 0:
             dur = 0
         _brk_add(cur, dur)
+        _stage_mark(cur, 0, now)
     if _BRK_STN > 0:
         _BRK_STN -= 1
         _BRK_NAME = _BRK_ST[_BRK_STN]
@@ -2081,7 +2111,7 @@ def _brk_exit():
     else:
         _BRK_NAME = None
     if cur is not None and dur >= _PAUSE_HITCH_US:
-        _pause_on_slow(cur, dur)
+        _pause_on_slow(cur, dur, t0, now)
 
 
 def _brk_reset_sums():
@@ -2264,6 +2294,34 @@ _PAUSE_B = [0] * _PAUSE_CAP
 _PAUSE_N = 0
 _PAUSE_DROP = 0
 _PAUSE_FREE = -1
+# Stage snapshot for stall and autogc. Filled only when one of those fires.
+_PAUSE_AT = [None] * _PAUSE_CAP
+_PAUSE_X = [0] * _PAUSE_CAP
+_PAUSE_DOM = [None] * _PAUSE_CAP
+_PAUSE_RN = [0] * _PAUSE_CAP
+_PAUSE_RT = []
+_PAUSE_R0 = []
+_PAUSE_R1 = []
+_pi = 0
+while _pi < _PAUSE_CAP:
+    _PAUSE_RT.append([None, None, None, None])
+    _PAUSE_R0.append([0, 0, 0, 0])
+    _PAUSE_R1.append([0, 0, 0, 0])
+    _pi += 1
+_SC_TAG = [None] * 8
+_SC_IN = [0] * 8
+_SC_OUT = [0] * 8
+_SC_OV = [0] * 8
+_SC_ST = [0] * 8
+_SC_OP = [0] * 8
+_PAUSE_OP = []
+_oi = 0
+while _oi < _PAUSE_CAP:
+    _PAUSE_OP.append([0, 0, 0, 0])
+    _oi += 1
+_SP_TAG = [None] * 8
+_SP_US = [0] * 8
+_ORD = [0, 0, 0, 0]
 
 
 def _pause_push(cause, where, dur, a, b):
@@ -2278,6 +2336,10 @@ def _pause_push(cause, where, dur, a, b):
     _PAUSE_US[i] = dur
     _PAUSE_A[i] = a
     _PAUSE_B[i] = b
+    _PAUSE_AT[i] = None
+    _PAUSE_X[i] = 0
+    _PAUSE_DOM[i] = None
+    _PAUSE_RN[i] = 0
     _PAUSE_N = i + 1
 
 
@@ -2295,11 +2357,207 @@ def _pause_ms(us):
     return _fmt_tenths(_avg_tenths_ms(us, 1))
 
 
-def _pause_on_slow(where, dur):
+def _stage_off(ts, t0):
+    d = _us_diff(ts, t0)
+    neg = 0
+    if d < 0:
+        neg = 1
+        d = -d
+    tenths = (d * 10 + 500) // 1000
+    if tenths > 99999:
+        tenths = 99999
+    if neg:
+        return -tenths
+    return tenths
+
+
+def _stage_fmt_off(tenths):
+    if tenths < 0:
+        sign = "-"
+        tenths = -tenths
+    else:
+        sign = ""
+    return "%s%d.%d" % (sign, tenths // 10, tenths % 10)
+
+
+def _stage_ov(a0, a1, b0, b1):
+    """Overlap of [a0, a1] with [b0, b1], in microseconds."""
+    sa = _us_diff(a0, b0)
+    ea = _us_diff(a1, b0)
+    eb = _us_diff(b1, b0)
+    s = sa if sa > 0 else 0
+    e = ea if ea < eb else eb
+    if e > s:
+        return e - s
+    return 0
+
+
+def _stage_keep(etag, et, ts, t0, t1, cn, opened):
+    """Keep one stage if it meets the stall window. opened means no real exit yet."""
+    ov = _stage_ov(et, ts, t0, t1)
+    near = _us_diff(ts, t0)
+    if near < 0:
+        near = -near
+    ent = _us_diff(et, t0)
+    if ent < 0:
+        ent = -ent
+    if ov <= 0 and near > 5000 and ent > 5000:
+        return cn
+    if ov <= 0:
+        ov = 1
+    if cn < 8:
+        _SC_TAG[cn] = etag
+        _SC_ST[cn] = et
+        _SC_OUT[cn] = ts
+        _SC_OV[cn] = ov
+        _SC_OP[cn] = opened
+        return cn + 1
+    w = 0
+    m = 1
+    while m < 8:
+        if _SC_OV[m] < _SC_OV[w]:
+            w = m
+        m += 1
+    if ov > _SC_OV[w]:
+        _SC_TAG[w] = etag
+        _SC_ST[w] = et
+        _SC_OUT[w] = ts
+        _SC_OV[w] = ov
+        _SC_OP[w] = opened
+    return cn
+
+
+def _stage_fill(slot, t0, t1, dur):
+    """Remember who was open at t0, and the stages that touch the window."""
+    sp = 0
+    cn = 0
+    trans_from = None
+    trans_to = None
+    saw_edge = 0
+    active = None
+    n = _ST_N
+    if n > 0:
+        start = _ST_I - n
+        if start < 0:
+            start += _ST_CAP
+        k = 0
+        while k < n:
+            i = start + k
+            if i >= _ST_CAP:
+                i -= _ST_CAP
+            ts = _ST_US[i]
+            tag = _ST_TAG[i]
+            is_in = _ST_IN[i]
+            dt = _us_diff(ts, t0)
+            if -2000 <= dt <= 2000:
+                saw_edge = 1
+                if is_in:
+                    trans_to = tag
+                    if sp > 0:
+                        trans_from = _SP_TAG[sp - 1]
+                else:
+                    trans_from = tag
+                    if sp > 1:
+                        trans_to = _SP_TAG[sp - 2]
+                    elif sp == 1:
+                        trans_to = None
+            if is_in:
+                if sp < 8:
+                    _SP_TAG[sp] = tag
+                    _SP_US[sp] = ts
+                    sp += 1
+            else:
+                if sp > 0:
+                    sp -= 1
+                    cn = _stage_keep(_SP_TAG[sp], _SP_US[sp], ts, t0, t1, cn, 0)
+            if dt <= 0:
+                if sp > 0:
+                    active = _SP_TAG[sp - 1]
+                else:
+                    active = None
+            k += 1
+        p = 0
+        while p < sp:
+            cn = _stage_keep(_SP_TAG[p], _SP_US[p], t1, t0, t1, cn, 1)
+            p += 1
+    best = 0
+    best_i = -1
+    j = 0
+    while j < cn:
+        later = 0
+        if best_i >= 0 and _us_diff(_SC_ST[j], _SC_ST[best_i]) > 0:
+            later = 1
+        if _SC_OV[j] > best or (_SC_OV[j] == best and later):
+            best = _SC_OV[j]
+            best_i = j
+        j += 1
+    if dur > 0 and best * 10 >= dur * 7 and best_i >= 0:
+        _PAUSE_DOM[slot] = _SC_TAG[best_i]
+    else:
+        _PAUSE_DOM[slot] = "split"
+    if saw_edge:
+        left = trans_from if trans_from else "na"
+        right = trans_to if trans_to else "na"
+        _PAUSE_X[slot] = 1
+        _PAUSE_AT[slot] = "%s_%s" % (left, right)
+    else:
+        _PAUSE_X[slot] = 0
+        _PAUSE_AT[slot] = active if active else "na"
+    want0 = active
+    want1 = _PAUSE_DOM[slot]
+    if want1 == "split":
+        want1 = None
+    want2 = trans_from
+    on = 0
+    j = 0
+    while j < cn and on < 4:
+        tag = _SC_TAG[j]
+        if tag == want0 or tag == want1 or tag == want2:
+            _ORD[on] = j
+            on += 1
+        j += 1
+    j = 0
+    while j < cn and on < 4:
+        seen = 0
+        s = 0
+        while s < on:
+            if _ORD[s] == j:
+                seen = 1
+            s += 1
+        if not seen:
+            _ORD[on] = j
+            on += 1
+        j += 1
+    a = 0
+    while a < on:
+        b = a + 1
+        while b < on:
+            if _us_diff(_SC_ST[_ORD[b]], _SC_ST[_ORD[a]]) < 0:
+                tmp = _ORD[a]
+                _ORD[a] = _ORD[b]
+                _ORD[b] = tmp
+            b += 1
+        a += 1
+    rt = _PAUSE_RT[slot]
+    r0 = _PAUSE_R0[slot]
+    r1 = _PAUSE_R1[slot]
+    p = 0
+    while p < on:
+        src = _ORD[p]
+        rt[p] = _SC_TAG[src]
+        r0[p] = _stage_off(_SC_ST[src], t0)
+        r1[p] = _stage_off(_SC_OUT[src], t0)
+        _PAUSE_OP[slot][p] = _SC_OP[src]
+        p += 1
+    _PAUSE_RN[slot] = on
+
+
+def _pause_on_slow(where, dur, t0=None, t1=None):
     """A long span. autogc if the heap grew since the last sample, else stall.
 
     The milliseconds are the whole span. They are not a clock around the
     collector. An explicit gc.collect in this same span is already queued.
+    t0 and t1 are the span start and end in ticks_us, when known.
     """
     global _PAUSE_FREE
     if (
@@ -2312,10 +2570,13 @@ def _pause_on_slow(where, dur):
     prev = _PAUSE_FREE
     if free >= 0:
         _PAUSE_FREE = free
+    before = _PAUSE_N
     if prev >= 0 and free > prev + _PAUSE_RISE:
         _pause_push("autogc", where, dur, prev, free)
     else:
         _pause_push("stall", where, dur, free, prev)
+    if t0 is not None and _PAUSE_N > before:
+        _stage_fill(_PAUSE_N - 1, t0, t1, dur)
 
 
 def _pause_piece(i):
@@ -2330,13 +2591,44 @@ def _pause_piece(i):
         else:
             age = "%ds" % (b // 1000)
         return "thresh %s %sms free %s age %s" % (where, _pause_ms(dur), _pause_k(a), age)
-    if cause == "autogc":
-        return "autogc %s %sms %s>%s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
     if cause == "collect":
         return "collect %s %sms %s>%s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
     if cause == "gcthresh":
         return "gcthresh %db" % a
-    return "stall %s %sms free %s was %s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
+    if cause == "autogc":
+        head = "autogc %s %sms" % (where, _pause_ms(dur))
+        tail = "%s>%s" % (_pause_k(a), _pause_k(b))
+    else:
+        head = "stall %s %sms" % (where, _pause_ms(dur))
+        tail = "free %s was %s" % (_pause_k(a), _pause_k(b))
+    if _PAUSE_AT[i] is not None:
+        if _PAUSE_X[i]:
+            head = head + " x " + _PAUSE_AT[i]
+        else:
+            head = head + " at " + _PAUSE_AT[i]
+        if _PAUSE_DOM[i]:
+            head = head + " dom " + _PAUSE_DOM[i]
+    nxt = head + " " + tail
+    if len(nxt) <= 133:
+        head = nxt
+    p = 0
+    rn = _PAUSE_RN[i]
+    while p < rn:
+        if _PAUSE_OP[i][p]:
+            end = "op"
+        else:
+            end = _stage_fmt_off(_PAUSE_R1[i][p])
+        bit = "%s %s-%s" % (
+            _PAUSE_RT[i][p],
+            _stage_fmt_off(_PAUSE_R0[i][p]),
+            end,
+        )
+        nxt = head + " " + bit
+        if len(nxt) > 133:
+            break
+        head = nxt
+        p += 1
+    return head
 
 
 def _pause_shift(keep_from):
@@ -2349,6 +2641,17 @@ def _pause_shift(keep_from):
         _PAUSE_US[j] = _PAUSE_US[i]
         _PAUSE_A[j] = _PAUSE_A[i]
         _PAUSE_B[j] = _PAUSE_B[i]
+        _PAUSE_AT[j] = _PAUSE_AT[i]
+        _PAUSE_X[j] = _PAUSE_X[i]
+        _PAUSE_DOM[j] = _PAUSE_DOM[i]
+        _PAUSE_RN[j] = _PAUSE_RN[i]
+        k = 0
+        while k < 4:
+            _PAUSE_RT[j][k] = _PAUSE_RT[i][k]
+            _PAUSE_R0[j][k] = _PAUSE_R0[i][k]
+            _PAUSE_R1[j][k] = _PAUSE_R1[i][k]
+            _PAUSE_OP[j][k] = _PAUSE_OP[i][k]
+            k += 1
         j += 1
         i += 1
     _PAUSE_N = j
@@ -2384,14 +2687,22 @@ def _pause_line():
 
 
 def _pause_maybe_print():
-    """After the brk line. A full CDC keeps the queue and changes nothing else."""
-    if _PAUSE_N <= 0 and _PAUSE_DROP <= 0:
-        return
-    if not _stdout_can_write():
-        return
-    line = _pause_line()
-    if line:
+    """After the brk line. A full CDC keeps the queue and changes nothing else.
+
+    Up to four short lines, so a burst of stalls is not dropped. Each line
+    stays inside the 139 character cap.
+    """
+    n = 0
+    while n < 4:
+        if _PAUSE_N <= 0 and _PAUSE_DROP <= 0:
+            return
+        if not _stdout_can_write():
+            return
+        line = _pause_line()
+        if not line:
+            return
         print(line)
+        n += 1
 
 
 def _install_pause_gc():
