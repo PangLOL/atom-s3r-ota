@@ -109,19 +109,33 @@ GC_CRITICAL_FREE = 24 * 1024
 GC_MOVE_MIN_MS = 15000
 # C gc_alloc collects by itself when bytes allocated since the last
 # collection reach gc.threshold. The stock 57,344-byte value fired about
-# twice a second inside a present (~137 ms, ~119 KB/s). One frame is only
-# a few KB, so 1.2 MB cannot be crossed during a present. Automatic
-# collection is also turned off; this value is the safety net if that
-# call is missing.
-GC_AUTO_BYTES = 1200 * 1024
+# twice a second inside a present (~137 ms, ~119 KB/s). Automatic
+# collection stays off; this value is the safety net if that call is
+# missing. One frame is only a few KB. The ceiling is above the
+# between-frame trigger, one mem_alloc check of slack, and the full
+# deferral, so waiting for a stop or a gap between boosts cannot let C
+# collect mid-present. At the measured settled rate (512 KiB in about
+# 10 s, ~51 KiB/s) the worst wait is about 1.25 MiB + ~90 KiB + 10 s,
+# under 2 MiB. 3 MiB still covers a faster ~100 KiB/s burst of that
+# same shape. The old mid-present thrash rate is not this path.
+GC_AUTO_BYTES = 3072 * 1024
 # Explicit collect after a finished present, once the heap has grown by
-# this much since the last collect. At ~119 KB/s that is about four
-# seconds, and it stays under GC_AUTO_BYTES for the next frame. Not every
-# frame: a full collect scans the PSRAM heap and costs ~137 ms.
-GC_BETWEEN_BYTES = 512 * 1024
+# this much since the last collect. On the 1.0 build, 512 KiB of growth
+# landed about every 10 s once the listen settled (the first gap was
+# shorter). 2.5× that gap is 1.25 MiB, about 25 s at that rate, inside
+# the 20–30 s window. Trimming present-path garbage makes the heap grow
+# more slowly, so the same byte gap waits longer. Not every frame: a
+# full collect scans the PSRAM heap and costs ~157 ms.
+GC_BETWEEN_BYTES = 1280 * 1024
 # How many completed presents between mem_alloc samples. The sample walks
-# the heap (~13 ms), so it is not done on every frame.
+# the heap (~13 ms), so it is not done on every frame. Once a collect is
+# due, the stop / boost-gap check does not sample again.
 GC_CHECK_FRAMES = 30
+# After growth crosses GC_BETWEEN_BYTES, wait this long for a stop or a
+# gap between boosts, then collect anyway. The wait is checked on later
+# presents without another heap walk. 10 s at the measured rate is about
+# 0.5 MiB, which still fits under GC_AUTO_BYTES.
+GC_DEFER_MS = 10000
 # A full 128x103 RGB565 push is about 26 KB. 800 ms is well past a slow
 # SPI transfer and still shorter than the 30 s watchdog. The driver call
 # itself has no timeout; this bound is the one the handoff waits on.
@@ -491,6 +505,9 @@ RING_FPS_MS = 1000 // 30  # 33
 # World-x of mid-ground ring centres. First group matches the after still
 # (centres 66, 82, 97 at y 78). Second group of 5 after a long gap.
 FIELD_RING_X = (66, 82, 97, 866, 882, 898, 914, 930)
+# Stable place keys. Formatting "r%d" on every present was garbage.
+_RING_PLACE_KEYS = tuple("r%d" % i for i in range(len(FIELD_RING_X)))
+_SPARK_PLACE_KEYS = tuple("k%d" % i for i in range(12))
 FIELD_RING_Y = 78
 
 # Scenery is baked into the 384x103 backdrop. These are kept as a fallback
@@ -1012,7 +1029,8 @@ def _call_panel(fn):
     call is reported as slow, and the budget the next method is still
     allowed to use. The edge latch is armed only around fn itself.
     """
-    before = (0, 0, 0)
+    global _PANEL_ERR, _PANEL_MS, _PANEL_US, _PANEL_BEFORE, _PANEL_LO
+    before = _PANEL_IDLE
     lo = 0
     mem = None
     if FRAME_TRACE:
@@ -1048,7 +1066,29 @@ def _call_panel(fn):
             _edge_finish(mem)
         after_cs = _gpio_level(_LCD_CS)
         lo = 1 if (before[0] == 0 or after_cs == 0) else 0
-    return err, ms, raw_us, before, lo
+    _PANEL_ERR = err
+    _PANEL_MS = ms
+    _PANEL_US = raw_us
+    _PANEL_BEFORE = before
+    _PANEL_LO = lo
+
+
+# Reused across pushes. A new tuple here would be garbage every present.
+_PANEL_IDLE = (0, 0, 0)
+_PANEL_ERR = None
+_PANEL_MS = 0
+_PANEL_US = 0
+_PANEL_BEFORE = _PANEL_IDLE
+_PANEL_LO = 0
+# Driver that succeeded last time. The steady path calls it directly
+# instead of building a methods list and a closure every present.
+_PUSH_HOW = None
+_PUSH_LCD = None
+_PUSH_WIN = None
+_PUSH_VW = 0
+_PUSH_TH = 0
+_PUSH_LABEL = None
+_PANEL_FAIL = ""
 
 
 _STRIP = None
@@ -1168,14 +1208,117 @@ def push_rgb565_window(lcd, window, vw, th):
         _brk_exit()
 
 
+def _invoke_push(lcd, window, vw, th, how):
+    """One driver call. No closure: the same function serves every present."""
+    if how == "image":
+        lcd.pushImage(0, 0, vw, th, window)
+        return
+    if how == "raw":
+        # swap=True: the buffer is host-endian RGB565. len is a pixel count.
+        lcd.drawRawBuf(window, 0, 0, vw, th, vw * th, True)
+        return
+    if how == "strip":
+        _push_strips(lcd, window, vw, th, "image")
+        return
+    if how == "rawstrip":
+        _push_strips(lcd, window, vw, th, "raw")
+        return
+    if how == "pix":
+        if hasattr(lcd, "setAddrWindow"):
+            lcd.setAddrWindow(0, 0, vw - 1, th - 1)
+        lcd.writePixels(window)
+        return
+    raise RuntimeError("push")
+
+
+def _push_bound():
+    """Stable callable for _call_panel. Arguments live in the _PUSH_* slots."""
+    _invoke_push(_PUSH_LCD, _PUSH_WIN, _PUSH_VW, _PUSH_TH, _PUSH_LABEL)
+
+
+def _push_candidates(lcd):
+    """Driver order. Built only until one way sticks, not every present."""
+    found = []
+    if hasattr(lcd, "pushImage"):
+        found.append("image")
+    if hasattr(lcd, "drawRawBuf"):
+        found.append("raw")
+    if hasattr(lcd, "pushImage"):
+        found.append("strip")
+    if hasattr(lcd, "drawRawBuf"):
+        found.append("rawstrip")
+    if hasattr(lcd, "writePixels"):
+        found.append("pix")
+    return found
+
+
+def _push_attempt(lcd, window, vw, th, how, t_enter):
+    """Try one driver. 1 accepted, 0 failed, -1 failed and the budget is spent.
+
+    A slow success is still 1. The failure text is left in _PANEL_FAIL.
+    """
+    global _PUSH_HOW, _PUSH_LCD, _PUSH_WIN, _PUSH_VW, _PUSH_TH, _PUSH_LABEL
+    global _PANEL_FAIL
+    _PUSH_LCD = lcd
+    _PUSH_WIN = window
+    _PUSH_VW = vw
+    _PUSH_TH = th
+    _PUSH_LABEL = how
+    _call_panel(_push_bound)
+    err = _PANEL_ERR
+    ms = _PANEL_MS
+    raw_us = _PANEL_US
+    before = _PANEL_BEFORE
+    lo = _PANEL_LO
+    t_mid = _mono_us()
+    pre = _us_diff(t_mid, t_enter) - raw_us
+    if pre < 0:
+        pre = 0
+    parts = _PUSH_PARTS
+    if err is None:
+        _service()
+        if FRAME_TRACE:
+            _bus_print(before, lo)
+            print("push-ms %d %s" % (ms, how))
+        if ms >= PUSH_TIMEOUT_MS:
+            print("push-slow %d" % ms)
+        post = _us_diff(_mono_us(), t_mid)
+        if post < 0:
+            post = 0
+        parts["pre"] = pre
+        parts["raw"] = raw_us
+        parts["post"] = post
+        parts["how"] = how
+        _PUSH_HOW = how
+        return 1
+    _PANEL_FAIL = how + ":" + _exc_name(err)
+    if FRAME_TRACE:
+        _bus_print(before, lo)
+    post = _us_diff(_mono_us(), t_mid)
+    if post < 0:
+        post = 0
+    parts["pre"] = parts["pre"] + pre
+    parts["raw"] = parts["raw"] + raw_us
+    parts["post"] = parts["post"] + post
+    parts["how"] = how
+    if ms >= PUSH_TIMEOUT_MS:
+        print("push-slow %d" % ms)
+        # The driver already used the long budget. Do not start another
+        # transfer in the same frame.
+        return -1
+    return 0
+
+
 def _push_rgb565_window(lcd, window, vw, th):
     """Hand a finished RGB565 buffer to the panel.
 
     The caller copies into this buffer only after compose, stamp, fx and
     digits have returned. pushImage is the older binding. Current UiFlow2
     exports drawRawBuf instead, and that len argument is the number of
-    pixels. present-ok is not printed here.
+    pixels. present-ok is not printed here. After one driver succeeds,
+    later presents call that driver only.
     """
+    global _PUSH_HOW
     if vw <= 0 or th <= 0:
         return False
     t_enter = _mono_us()
@@ -1185,77 +1328,61 @@ def _push_rgb565_window(lcd, window, vw, th):
             _note_c("push_in")
         except Exception:
             pass
-    pixels = vw * th
-    fails = []
-    methods = []
-    if hasattr(lcd, "pushImage"):
-        methods.append(("image", lambda: lcd.pushImage(0, 0, vw, th, window)))
-    if hasattr(lcd, "drawRawBuf"):
-        # swap=True: the buffer is host-endian RGB565. writePixels then
-        # converts it to the panel's byte order. len is a pixel count.
-        methods.append(("raw", lambda: lcd.drawRawBuf(window, 0, 0, vw, th, pixels, True)))
-    if hasattr(lcd, "pushImage"):
-        methods.append(("strip", lambda: _push_strips(lcd, window, vw, th, "image")))
-    if hasattr(lcd, "drawRawBuf"):
-        methods.append(("rawstrip", lambda: _push_strips(lcd, window, vw, th, "raw")))
-    if hasattr(lcd, "writePixels"):
-        def _pix():
-            if hasattr(lcd, "setAddrWindow"):
-                lcd.setAddrWindow(0, 0, vw - 1, th - 1)
-            lcd.writePixels(window)
-        methods.append(("pix", _pix))
     parts = _PUSH_PARTS
     parts["pre"] = 0
     parts["raw"] = 0
     parts["post"] = 0
     parts["how"] = ""
+    how = _PUSH_HOW
+    failed_how = None
+    fails = None
+    if how:
+        status = _push_attempt(lcd, window, vw, th, how, t_enter)
+        if status == 1:
+            return True
+        fails = [_PANEL_FAIL]
+        _PUSH_HOW = None
+        if status < 0:
+            print("push-fail " + fails[0])
+            return False
+        # Try the other drivers once. Skip the name that just failed.
+        failed_how = how
+        t_enter = _mono_us()
+    methods = _push_candidates(lcd)
     if not methods:
+        if fails:
+            print("push-fail " + " ".join(fails))
+        else:
+            if FRAME_TRACE:
+                before = _bus_levels()
+                _BUS["edges"] = (-1, -1, -1)
+                _bus_print(before, 1 if before[0] == 0 else 0)
+            print("push-fail none")
+            parts["pre"] = _us_diff(_mono_us(), t_enter)
+        return False
+    if fails is None:
+        fails = []
+    tried = False
+    for label in methods:
+        if label == failed_how:
+            continue
+        tried = True
+        status = _push_attempt(lcd, window, vw, th, label, t_enter)
+        if status == 1:
+            return True
+        fails.append(_PANEL_FAIL)
+        if status < 0:
+            break
+        t_enter = _mono_us()
+    if fails:
+        print("push-fail " + " ".join(fails))
+    elif not tried:
         if FRAME_TRACE:
             before = _bus_levels()
             _BUS["edges"] = (-1, -1, -1)
             _bus_print(before, 1 if before[0] == 0 else 0)
         print("push-fail none")
         parts["pre"] = _us_diff(_mono_us(), t_enter)
-        return False
-    for label, fn in methods:
-        err, ms, raw_us, before, lo = _call_panel(fn)
-        t_mid = _mono_us()
-        pre = _us_diff(t_mid, t_enter) - raw_us
-        if pre < 0:
-            pre = 0
-        if err is None:
-            _service()
-            if FRAME_TRACE:
-                _bus_print(before, lo)
-                print("push-ms %d %s" % (ms, label))
-            if ms >= PUSH_TIMEOUT_MS:
-                print("push-slow %d" % ms)
-            post = _us_diff(_mono_us(), t_mid)
-            if post < 0:
-                post = 0
-            parts["pre"] = pre
-            parts["raw"] = raw_us
-            parts["post"] = post
-            parts["how"] = label
-            return True
-        fails.append(label + ":" + _exc_name(err))
-        if FRAME_TRACE:
-            _bus_print(before, lo)
-        post = _us_diff(_mono_us(), t_mid)
-        if post < 0:
-            post = 0
-        parts["pre"] = parts["pre"] + pre
-        parts["raw"] = parts["raw"] + raw_us
-        parts["post"] = parts["post"] + post
-        parts["how"] = label
-        t_enter = _mono_us()
-        if ms >= PUSH_TIMEOUT_MS:
-            print("push-slow %d" % ms)
-            # The driver already used the long budget. Do not start another
-            # transfer in the same frame.
-            break
-    if fails:
-        print("push-fail " + " ".join(fails))
     return False
 
 
@@ -2401,6 +2528,12 @@ def _pause_piece(i):
         return "gcthresh %db" % a
     if cause == "gcauto":
         return "gcauto %s" % ("off" if a == 0 else "on")
+    if cause == "gcdefer":
+        # a is the bound, in milliseconds. One line when a due collect waits.
+        return "gcdefer %dms" % a
+    if cause == "gcwait":
+        # dur is how long the wait actually ran before the bound expired.
+        return "gcwait %dms" % dur
     if cause == "gcwake":
         # where is no, yes, or run. dur is the microsecond span.
         # a is the threshold, b is gc.mem_alloc, C is free, D is t0.
@@ -2560,17 +2693,75 @@ _install_pause_gc()
 
 _GC_ALLOC_MARK = None
 _GC_CHECK_N = 0
+# ticks_ms when growth first crossed GC_BETWEEN_BYTES, or None if not due.
+_GC_DUE_AT = None
 
 
-def _gc_after_present():
+def gc_moment(speed, boost_phase):
+    """True when a between-frame collect can sit on a stop or a cruise gap.
+
+    Stopped is under 1 km/h, the same threshold as the idle cycle.
+    A gap between boosts is the aura sequence back to idle while speed
+    is under BOOST_SPEED: the 2 s below 100 km/h has already left the
+    run, and the end shockwave and barrier have finished. Mid-boost
+    (phase run, end_sw, or barrier, or speed still at BOOST_SPEED or
+    above) waits. Chao, item boxes, and enemy hits are not in this
+    dashboard, so they are not moments.
+    """
+    if speed is None:
+        speed = 0.0
+    if speed < 1.0:
+        return True
+    # Boost itself is speed above BOOST_SPEED. 100 km/h is already a gap
+    # once the aura sequence has returned to idle.
+    if boost_phase == "idle" and speed <= BOOST_SPEED:
+        return True
+    return False
+
+
+def _gc_collect_between():
+    """One explicit collect. The caller is already after a finished present."""
+    global _GC_ALLOC_MARK, _GC_CHECK_N, _GC_DUE_AT
+    _brk_enter("gc")
+    try:
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+    finally:
+        _brk_exit()
+    try:
+        import gc
+        alloc2 = _gc_int(getattr(gc, "mem_alloc", None))
+    except ImportError:
+        alloc2 = -1
+    if alloc2 >= 0:
+        _GC_ALLOC_MARK = alloc2
+    _GC_DUE_AT = None
+    _GC_CHECK_N = 0
+
+
+def _gc_after_present(now, speed, boost_phase):
     """Collect only after a present, and only after a large allocation gap.
 
     Called once ui.tick has returned, so compose, stamp, and the display
     push are already finished. mem_alloc is sampled every GC_CHECK_FRAMES
-    presents, not every frame. A collect here goes through gc.collect, so
-    the existing gcwake / collect lines still record it.
+    presents, not every frame. A due collect waits for gc_moment, and
+    runs anyway after GC_DEFER_MS. The collect goes through gc.collect,
+    so the existing gcwake / collect lines still record it.
     """
-    global _GC_ALLOC_MARK, _GC_CHECK_N
+    global _GC_ALLOC_MARK, _GC_CHECK_N, _GC_DUE_AT
+    due = _GC_DUE_AT
+    if due is not None:
+        if gc_moment(speed, boost_phase):
+            _gc_collect_between()
+            return
+        waited = _ms_diff(now, due)
+        if waited < 0 or waited >= GC_DEFER_MS:
+            _pause_push("gcwait", "gc", waited if waited > 0 else 0, 0, 0)
+            _gc_collect_between()
+        return
     _GC_CHECK_N += 1
     if _GC_CHECK_N < GC_CHECK_FRAMES:
         return
@@ -2588,15 +2779,11 @@ def _gc_after_present():
         return
     if alloc - mark < GC_BETWEEN_BYTES:
         return
-    _brk_enter("gc")
-    try:
-        gc.collect()
-    except Exception:
-        pass
-    finally:
-        _brk_exit()
-    alloc2 = _gc_int(getattr(gc, "mem_alloc", None))
-    _GC_ALLOC_MARK = alloc2 if alloc2 >= 0 else alloc
+    if gc_moment(speed, boost_phase):
+        _gc_collect_between()
+        return
+    _GC_DUE_AT = now
+    _pause_push("gcdefer", "gc", 0, GC_DEFER_MS, 0)
 
 
 def draw_due(now, next_draw):
@@ -4169,6 +4356,7 @@ class Sprite:
 
     def __init__(self, pack=None):
         self.scroll = 0.0
+        self._scroll_period = float(PERIOD)
         self.phase = 0.0
         self.ground_y = GAUGE_Y - 2
         self.body_col = COL_SONIC
@@ -4231,6 +4419,11 @@ class Sprite:
         self._play_valid = False
         self._placed = []
         self._planned = []
+        self._place_pool = {}
+        self._paint_us = [0, 0, 0, 0, 0, 0, 0]
+        self._off_c = 0
+        self._off_w = 0
+        self._off_g = 0
         self._bd_mode = 0
         self._bd_clips = []
         self._part_hud = 0
@@ -4276,6 +4469,7 @@ class Sprite:
     def _sync_ground(self):
         pack = self.pack
         if pack is None:
+            self._scroll_period = float(PERIOD)
             self._ground_top = GAUGE_Y - 2
             self._surface = GAUGE_Y - 2
             self.ground_y = self._surface
@@ -4289,6 +4483,7 @@ class Sprite:
             self._drop_sprite_cache()
             return
         # Locked after-preview feet dest, independent of the ground tile.
+        self._scroll_period = float(RING_PERIOD)
         self._surface = SONIC_FEET_DEST_Y
         self._ground_top = GAUGE_Y - 15
         self.ground_y = self._surface
@@ -4491,7 +4686,7 @@ class Sprite:
     def advance(self, speed, dt_ms):
         if speed is None:
             speed = 0.0
-        period = float(RING_PERIOD if self.pack is not None else PERIOD)
+        period = self._scroll_period
         self.scroll = (self.scroll + speed * dt_ms * 0.012) % period
         if speed < 1.0:
             self.phase = 0.0
@@ -4553,21 +4748,31 @@ class Sprite:
         self.ring_i = (self.ring_i + 1) & 7
 
     def _step_sparkles(self, dt_ms):
-        if not self.sparkles:
+        sp = self.sparkles
+        if not sp:
             return
         pack = self.pack
         frames = self._cycle_frames("rings_sparkle") if pack is not None else None
         n = len(frames) if frames else 0
-        kept = []
-        for item in self.sparkles:
-            x, y, i, acc = item
-            acc += dt_ms
+        w = 0
+        i = 0
+        nsp = len(sp)
+        while i < nsp:
+            item = sp[i]
+            acc = item[3] + dt_ms
+            frame = item[2]
             while acc >= RING_FPS_MS:
                 acc -= RING_FPS_MS
-                i += 1
-            if n and i < n:
-                kept.append([x, y, i, acc])
-        self.sparkles = kept
+                frame += 1
+            if n and frame < n:
+                item[2] = frame
+                item[3] = acc
+                if w != i:
+                    sp[w] = item
+                w += 1
+            i += 1
+        if w != nsp:
+            del sp[w:]
 
 
     def _collect_rings(self):
@@ -4577,10 +4782,14 @@ class Sprite:
         if self.pack is not None:
             mid = SONIC_FRONT_X
             period = RING_PERIOD
-            for i, rx in enumerate(FIELD_RING_X):
-                x = (rx - off) % period
+            xs = FIELD_RING_X
+            i = 0
+            n = len(xs)
+            while i < n:
+                x = (xs[i] - off) % period
                 if x <= mid:
                     mask |= 1 << i
+                i += 1
         else:
             mid = AURA_TIP_X
             period = PERIOD
@@ -4598,10 +4807,14 @@ class Sprite:
             self.rings = (self.rings + n) % 1000
             if self.pack is not None:
                 period = RING_PERIOD
-                for i, rx in enumerate(FIELD_RING_X):
+                xs = FIELD_RING_X
+                i = 0
+                n = len(xs)
+                while i < n:
                     if (gained >> i) & 1:
-                        x = (rx - off) % period
+                        x = (xs[i] - off) % period
                         self.sparkles.append([x, FIELD_RING_Y, 0, 0])
+                    i += 1
         self._ring_seen = mask
 
     def _draw_hud_digits(self, lcd, bx, by):
@@ -5281,44 +5494,77 @@ class Sprite:
         if ring_frames:
             fr = ring_frames[self.ring_i % len(ring_frames)]
             period = RING_PERIOD
+            xs = FIELD_RING_X
+            keys = _RING_PLACE_KEYS
             idx = 0
-            for wx in FIELD_RING_X:
-                x = (wx - off) % period
+            n = len(xs)
+            while idx < n:
+                x = (xs[idx] - off) % period
                 if x > W + 40:
                     x -= period
                 if -40 < x < W + 40:
                     x0 = int(x - fr.origin_x)
                     y0 = int(FIELD_RING_Y - fr.origin_y)
-                    out.append(("r%d" % idx, x0, y0, fr.w, fr.h, fr, 0, "rings"))
+                    self._emit_place(out, keys[idx], x0, y0, fr.w, fr.h, fr, 0, "rings")
                 idx += 1
         spark_frames = pack.cycles.get("rings_sparkle")
         if spark_frames:
             si = 0
+            keys = _SPARK_PLACE_KEYS
+            nkeys = len(keys)
             for item in self.sparkles:
                 x, y, i, _acc = item
                 if i < len(spark_frames):
                     fr = spark_frames[i]
                     x0 = int(int(x) - fr.origin_x)
                     y0 = int(int(y) - fr.origin_y)
-                    out.append(("k%d" % si, x0, y0, fr.w, fr.h, fr, 0, "rings"))
+                    if si < nkeys:
+                        key = keys[si]
+                    else:
+                        key = "k%d" % si
+                    self._emit_place(out, key, x0, y0, fr.w, fr.h, fr, 0, "rings")
                 si += 1
         frames = self._cycle_frames(self.anim_tag)
         if frames:
             fr = frames[self.anim_i % len(frames)]
             x0 = int(SONIC_FEET_DEST_X - fr.origin_x)
             y0 = int(SONIC_FEET_DEST_Y - fr.origin_y)
-            out.append(("sonic", x0, y0, fr.w, fr.h, fr, amount, "sonic"))
+            self._emit_place(out, "sonic", x0, y0, fr.w, fr.h, fr, amount, "sonic")
         bar = pack.by_name.get("hud_bar")
         if bar is not None:
-            out.append((
-                "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
-            ))
+            self._emit_place(
+                out, "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
+            )
         ring = pack.by_name.get("hud_ring")
         if ring is not None:
-            out.append((
-                "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
-            ))
+            self._emit_place(
+                out, "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
+            )
         return out
+
+    def _emit_place(self, out, key, x, y, w, h, fr, extra, kind):
+        """Reuse one slot per key. The retain path snapshots before the next plan."""
+        pool = self._place_pool
+        slot = pool.get(key)
+        if slot is None:
+            slot = [key, x, y, w, h, fr, extra, kind]
+            pool[key] = slot
+        else:
+            slot[1] = x
+            slot[2] = y
+            slot[3] = w
+            slot[4] = h
+            slot[5] = fr
+            slot[6] = extra
+            slot[7] = kind
+        out.append(slot)
+
+    def _snapshot_places(self, places):
+        """Copy slot values. The live slots are rewritten on the next plan."""
+        saved = []
+        for p in places:
+            saved.append((p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]))
+        return saved
 
     def _places_same(self, places):
         old = self._placed
@@ -5523,7 +5769,7 @@ class Sprite:
         if (not self._play_valid) or mode == 2:
             self._copy_full_play()
             self._stamp_places(places, self.play_window, None)
-            self._placed = places[:]
+            self._placed = self._snapshot_places(places)
             self._play_valid = True
             return
         if mode == 0 and self._places_same(places):
@@ -5569,7 +5815,7 @@ class Sprite:
             self._copy_rect(self.ocean_window, self.play_window, rect)
         if marked:
             self._stamp_places(places, self.play_window, marked)
-        self._placed = places[:]
+        self._placed = self._snapshot_places(places)
         self._play_valid = True
 
     def _stamp_playfield_sprites(self, amount, save_under=False, window=None):
@@ -5801,12 +6047,15 @@ class Sprite:
             _brk_exit()
 
     def _fill_native_offs_at(self, scroll):
-        """Write stamp offsets into _off_buf. Returns cloud, water, ground."""
+        """Write stamp offsets into _off_buf and _off_c / _off_w / _off_g."""
         tw = self.ocean_tw
         offs = self._off_buf
         del offs[:]
         if not self._parallax:
-            return _norm_off(scroll, tw), 0, 0
+            self._off_c = _norm_off(scroll, tw)
+            self._off_w = 0
+            self._off_g = 0
+            return
         off_c = _norm_off(scroll * PARALLAX_CLOUDS, tw)
         off_w = _norm_off(scroll * PARALLAX_WATER, tw)
         off_g = _norm_off(scroll * PARALLAX_GROUND, tw)
@@ -5816,7 +6065,9 @@ class Sprite:
         while i < n:
             offs.append(_norm_off(scroll * stamps[i][0], tw))
             i += 1
-        return off_c, off_w, off_g
+        self._off_c = off_c
+        self._off_w = off_w
+        self._off_g = off_g
 
     def _native_same(self, off_c, off_w, off_g, amount):
         _brk_enter("plan")
@@ -5877,7 +6128,17 @@ class Sprite:
         self._nat_w = off_w
         self._nat_g = off_g
         if self._parallax:
-            self._nat_stamp = self._off_buf[:]
+            cur = self._off_buf
+            prev = self._nat_stamp
+            n = len(cur)
+            if len(prev) != n:
+                # Stamp count changes when the pack loads, not per present.
+                self._nat_stamp = cur[:]
+            else:
+                i = 0
+                while i < n:
+                    prev[i] = cur[i]
+                    i += 1
         else:
             self._nat_flat = off_c
             del self._nat_stamp[:]
@@ -5897,7 +6158,7 @@ class Sprite:
         self._native_ready = True
 
     def _paint_native(self, amount, with_fx):
-        """Fill play_window. Returns compose, stamp, hud, sonic, rings microseconds.
+        """Fill play_window. Fills _paint_us: compose, stamp, hud, sonic, rings, fx, digits.
 
         with_fx draws boost and the ring digits into the same buffer. The
         playfield underneath matches a full V15 compose plus stamp.
@@ -5909,7 +6170,10 @@ class Sprite:
         vh = self._playfield_vh()
         tw = self.ocean_tw
         tile = self.ocean_rgb565
-        off_c, off_w, off_g = self._fill_native_offs(self.scroll)
+        self._fill_native_offs(self.scroll)
+        off_c = self._off_c
+        off_w = self._off_w
+        off_g = self._off_g
         t0 = _mono_us()
         _brk_enter("compose")
         try:
@@ -5999,7 +6263,15 @@ class Sprite:
         compose_us = _us_diff(t1, t0)
         if compose_us < 0:
             compose_us = 0
-        return compose_us, stamp_us, hud_us, sonic_us, rings_us, fx_us, dig_us
+        times = self._paint_us
+        times[0] = compose_us
+        times[1] = stamp_us
+        times[2] = hud_us
+        times[3] = sonic_us
+        times[4] = rings_us
+        times[5] = fx_us
+        times[6] = dig_us
+        return times
 
     def _present_copy(self, src):
         """Copy a finished playfield into the buffer the panel will read."""
@@ -6025,7 +6297,10 @@ class Sprite:
         ):
             return False
         _FLOW["gap_printed"] = 0
-        off_c, off_w, off_g = self._fill_native_offs(self.scroll)
+        self._fill_native_offs(self.scroll)
+        off_c = self._off_c
+        off_w = self._off_w
+        off_g = self._off_g
         held = 0
         compose_us = 0
         stamp_us = 0
@@ -6040,7 +6315,14 @@ class Sprite:
         if self._native_same(off_c, off_w, off_g, amount):
             held = 1
         else:
-            compose_us, stamp_us, hud_us, sonic_us, rings_us, fx_us, dig_us = self._paint_native(amount, True)
+            times = self._paint_native(amount, True)
+            compose_us = times[0]
+            stamp_us = times[1]
+            hud_us = times[2]
+            sonic_us = times[3]
+            rings_us = times[4]
+            fx_us = times[5]
+            dig_us = times[6]
             self._remember_native(off_c, off_w, off_g, amount)
             sprite_us = hud_us + sonic_us + rings_us - dig_us
             if sprite_us < 0:
@@ -6573,7 +6855,11 @@ class Dashboard:
         self.lcd, self._use_push = make_canvas(lcd)
         self.sprite = Sprite(pack)
         self.button = button
-        self._last_fill = {g[0]: -1 for g in GAUGES}
+        self._last_fill = {}
+        for g in GAUGES:
+            # width, color. width -1 means the bar has not been painted.
+            # A reused pair: assigning a fresh tuple every change was garbage.
+            self._last_fill[g[0]] = [-1, 0]
         self._gauge_bg = False
         self._fault_shown = None
         self._last_ms = time.ticks_ms()
@@ -6632,7 +6918,7 @@ class Dashboard:
                 fill_us = 0
             self._gauge_bg = False
             for key in self._last_fill:
-                self._last_fill[key] = -1
+                self._last_fill[key][0] = -1
             _service()
         noted = self.sprite._tim_n
         self.sprite.draw(surface, values, now, fault)
@@ -6687,7 +6973,7 @@ class Dashboard:
             lcd.fillRect(0, GAUGE_Y, W, GAUGE_H, 0x101012)
             self._gauge_bg = True
             for key in self._last_fill:
-                self._last_fill[key] = -1
+                self._last_fill[key][0] = -1
         for key, lo, hi, x, y, w, h, mode in GAUGES:
             raw = values.get(key)
             if raw is None:
@@ -6700,12 +6986,12 @@ class Dashboard:
                 fill_w = int(frac * w)
             color = COL_ORANGE if mode == "orange" else value_rgb(frac)
             prev = self._last_fill[key]
-            if prev == -1:
+            old_w = prev[0]
+            if old_w == -1:
                 lcd.fillRect(x, y, w, h, COL_TRACK)
                 if fill_w > 0:
                     lcd.fillRect(x, y, fill_w, h, color)
             else:
-                old_w = prev[0]
                 old_color = prev[1]
                 if old_w == fill_w and old_color == color:
                     continue
@@ -6715,7 +7001,8 @@ class Dashboard:
                     lcd.fillRect(x + fill_w, y, old_w - fill_w, h, COL_TRACK)
                 elif fill_w > old_w:
                     lcd.fillRect(x + old_w, y, fill_w - old_w, h, color)
-            self._last_fill[key] = (fill_w, color)
+            prev[0] = fill_w
+            prev[1] = color
 
     def _draw_fault(self, fault):
         if fault:
@@ -6907,8 +7194,9 @@ def main():
         _flow_add("loop", _us_diff(_mono_us(), loop_mark))
         ui.tick(values, fault, now)
         # The present has already been pushed. Collect here, never inside
-        # compose, stamp, or the display push.
-        _gc_after_present()
+        # compose, stamp, or the display push. A due collect may wait for
+        # a stop or a gap between boosts.
+        _gc_after_present(now, values.get("spd"), ui.sprite.boost.phase)
         _brk_enter("pace")
         try:
             next_draw = pace_after(frame_started, _mono_us())

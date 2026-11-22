@@ -269,6 +269,239 @@ def main():
     assert fw._BRK_NAME is None and fw._BRK_STN == 0
     fw._brk_reset_all()
 
+    # Between-frame collect: rarer byte gap, after the present, with a
+    # bounded wait for a stop or a gap between boosts.
+    settled = 512 * 1024
+    guess_s = 10.0 * fw.GC_BETWEEN_BYTES / settled
+    assert fw.GC_BETWEEN_BYTES == 1280 * 1024
+    assert 20.0 <= guess_s <= 30.0, guess_s
+    assert fw.GC_CHECK_FRAMES == 30
+    assert fw.GC_DEFER_MS == 10000
+    assert fw.GC_AUTO_BYTES == 3072 * 1024
+    assert fw.GC_AUTO_BYTES > fw.GC_BETWEEN_BYTES
+    import inspect
+    main_src = inspect.getsource(fw.main)
+    tick_src = inspect.getsource(fw.Dashboard._tick_body)
+    paint_src = inspect.getsource(fw.Sprite._paint_native)
+    assert "_gc_after_present" not in tick_src
+    assert "_gc_after_present" not in paint_src
+    assert main_src.index("ui.tick") < main_src.index("_gc_after_present")
+    assert fw.gc_moment(0.0, "run") is True
+    assert fw.gc_moment(0.4, "end_sw") is True
+    assert fw.gc_moment(80.0, "idle") is True
+    assert fw.gc_moment(100.0, "idle") is True
+    assert fw.gc_moment(80.0, "run") is False
+    assert fw.gc_moment(80.0, "end_sw") is False
+    assert fw.gc_moment(80.0, "barrier") is False
+    assert fw.gc_moment(120.0, "idle") is False
+    assert fw.gc_moment(120.0, "run") is False
+    assert fw.gc_moment(None, "run") is True
+
+    import gc
+    calls = {"n": 0}
+    saved = {
+        "collect": gc.collect,
+        "disable": getattr(gc, "disable", None),
+        "isenabled": getattr(gc, "isenabled", None),
+        "threshold": getattr(gc, "threshold", None),
+        "mem_alloc": getattr(gc, "mem_alloc", None),
+        "mem_free": getattr(gc, "mem_free", None),
+    }
+    state = {"disabled": False, "enabled": True, "th": None, "alloc": 0}
+
+    def _collect():
+        calls["n"] += 1
+
+    def _disable():
+        state["disabled"] = True
+        state["enabled"] = False
+
+    def _isenabled():
+        return state["enabled"]
+
+    def _threshold(*args):
+        if args:
+            state["th"] = args[0]
+            return None
+        return state["th"]
+
+    def _mem_alloc():
+        return state["alloc"]
+
+    def _mem_free():
+        return 7 * 1024 * 1024
+
+    gc.collect = _collect
+    gc.disable = _disable
+    gc.isenabled = _isenabled
+    gc.threshold = _threshold
+    gc.mem_alloc = _mem_alloc
+    gc.mem_free = _mem_free
+    try:
+        state["disabled"] = False
+        state["enabled"] = True
+        fw._PAUSE_N = 0
+        fw._install_pause_gc()
+        assert state["th"] == fw.GC_AUTO_BYTES
+        assert state["disabled"] is True
+        assert state["enabled"] is False
+        # The live read is what the gcthresh line records.
+        piece = None
+        i = 0
+        while i < fw._PAUSE_N:
+            if fw._PAUSE_CAUSE[i] == "gcthresh":
+                piece = fw._pause_piece(i)
+            i += 1
+        assert piece == "gcthresh %db" % fw.GC_AUTO_BYTES, piece
+        saw_off = False
+        i = 0
+        while i < fw._PAUSE_N:
+            if fw._PAUSE_CAUSE[i] == "gcauto" and fw._pause_piece(i) == "gcauto off":
+                saw_off = True
+            i += 1
+        assert saw_off
+
+        def _reset(mark, alloc):
+            calls["n"] = 0
+            fw._GC_ALLOC_MARK = mark
+            fw._GC_CHECK_N = 0
+            fw._GC_DUE_AT = None
+            fw._PAUSE_N = 0
+            state["alloc"] = alloc
+
+        # Not due yet: a full check interval under the byte gap does not collect.
+        _reset(1000, 1000 + fw.GC_BETWEEN_BYTES - 1)
+        n = 0
+        while n < fw.GC_CHECK_FRAMES:
+            fw._gc_after_present(1000, 0.0, "idle")
+            n += 1
+        assert calls["n"] == 0, calls
+        # The next presents still do not collect. The sample already ran.
+        fw._gc_after_present(1100, 0.0, "idle")
+        assert calls["n"] == 0
+
+        # Crossing the gap on a stop collects once, on that sample, not every frame.
+        _reset(1000, 1000 + fw.GC_BETWEEN_BYTES)
+        n = 0
+        while n < fw.GC_CHECK_FRAMES - 1:
+            fw._gc_after_present(2000, 0.0, "idle")
+            n += 1
+        assert calls["n"] == 0
+        fw._gc_after_present(2000, 0.0, "idle")
+        assert calls["n"] == 1
+        fw._gc_after_present(2016, 0.0, "idle")
+        fw._gc_after_present(2032, 0.0, "idle")
+        assert calls["n"] == 1
+
+        # Mid-boost defers. A stop ends the wait. The bound collects anyway.
+        _reset(0, fw.GC_BETWEEN_BYTES)
+        n = 0
+        while n < fw.GC_CHECK_FRAMES:
+            fw._gc_after_present(5000, 140.0, "run")
+            n += 1
+        assert calls["n"] == 0
+        assert fw._GC_DUE_AT == 5000
+        saw_defer = False
+        i = 0
+        while i < fw._PAUSE_N:
+            if fw._PAUSE_CAUSE[i] == "gcdefer":
+                saw_defer = fw._pause_piece(i) == "gcdefer %dms" % fw.GC_DEFER_MS
+            i += 1
+        assert saw_defer
+        fw._gc_after_present(5000 + fw.GC_DEFER_MS - 1, 140.0, "run")
+        assert calls["n"] == 0
+        fw._gc_after_present(5000 + fw.GC_DEFER_MS - 1, 80.0, "run")
+        assert calls["n"] == 0, "aura still up"
+        fw._gc_after_present(7000, 0.0, "run")
+        assert calls["n"] == 1
+        assert fw._GC_DUE_AT is None
+
+        _reset(0, fw.GC_BETWEEN_BYTES + 50)
+        n = 0
+        while n < fw.GC_CHECK_FRAMES:
+            fw._gc_after_present(8000, 130.0, "run")
+            n += 1
+        assert calls["n"] == 0
+        fw._gc_after_present(8000 + fw.GC_DEFER_MS, 130.0, "run")
+        assert calls["n"] == 1
+        saw_wait = False
+        i = 0
+        while i < fw._PAUSE_N:
+            if fw._PAUSE_CAUSE[i] == "gcwait":
+                saw_wait = True
+            i += 1
+        assert saw_wait
+
+        # Cruise after the aura sequence is a moment, so the sample collects.
+        _reset(0, fw.GC_BETWEEN_BYTES + 8)
+        n = 0
+        while n < fw.GC_CHECK_FRAMES:
+            fw._gc_after_present(9000, 80.0, "idle")
+            n += 1
+        assert calls["n"] == 1
+    finally:
+        gc.collect = saved["collect"]
+        if saved["disable"] is None:
+            del gc.disable
+        else:
+            gc.disable = saved["disable"]
+        if saved["isenabled"] is None:
+            del gc.isenabled
+        else:
+            gc.isenabled = saved["isenabled"]
+        if saved["threshold"] is None:
+            del gc.threshold
+        else:
+            gc.threshold = saved["threshold"]
+        if saved["mem_alloc"] is None:
+            del gc.mem_alloc
+        else:
+            gc.mem_alloc = saved["mem_alloc"]
+        if saved["mem_free"] is None:
+            del gc.mem_free
+        else:
+            gc.mem_free = saved["mem_free"]
+        try:
+            gc.enable()
+        except Exception:
+            pass
+
+    # A remembered driver is called on the next present. No second probe.
+    fw._PUSH_HOW = None
+
+    class _Raw(object):
+        def __init__(self):
+            self.n = 0
+            self.image = 0
+
+        def drawRawBuf(self, *args):
+            self.n += 1
+
+    raw = _Raw()
+    buf = bytearray(8)
+    assert fw.push_rgb565_window(raw, buf, 2, 2) is True
+    assert raw.n == 1 and fw._PUSH_HOW == "raw"
+    raw.pushImage = lambda *args: (_ for _ in ()).throw(AssertionError("image"))
+    assert fw.push_rgb565_window(raw, buf, 2, 2) is True
+    assert raw.n == 2
+
+    fw._PUSH_HOW = None
+
+    class _Image(object):
+        def __init__(self):
+            self.how = None
+
+        def pushImage(self, *args):
+            self.how = "image"
+
+        def drawRawBuf(self, *args):
+            raise AssertionError("raw")
+
+    img = _Image()
+    assert fw.push_rgb565_window(img, buf, 2, 2) is True
+    assert img.how == "image" and fw._PUSH_HOW == "image"
+    fw._PUSH_HOW = None
+
     print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped)
 
 
