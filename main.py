@@ -2265,7 +2265,7 @@ _PAUSE_N = 0
 _PAUSE_DROP = 0
 _PAUSE_FREE = -1
 # Sub-steps of the draw-to-plan calls only. Copied onto a stall or autogc.
-_DP_CAP = 6
+_DP_CAP = 8
 _DP_WHICH = None
 _DP_T = 0
 _DP_N = 0
@@ -5230,9 +5230,11 @@ class Sprite:
 
     def _plan_places(self, amount):
         _brk_enter("plan")
+        _dp_begin("places")
         try:
             return self._plan_places_at(amount)
         finally:
+            _dp_step("tail")
             _brk_exit()
 
     def _plan_places_at(self, amount):
@@ -5241,9 +5243,10 @@ class Sprite:
         Order matches _stamp_playfield_sprites: rings, sparkles, Sonic,
         HUD bar, HUD ring. extra is the tint for Sonic and 0 otherwise.
         """
-        _dp_begin("places")
-        seg = "clr"
+        seg = "pre"
         try:
+            _dp_step("pre")
+            seg = "clr"
             out = self._planned
             del out[:]
             pack = self.pack
@@ -5775,16 +5778,19 @@ class Sprite:
 
     def _fill_native_offs(self, scroll):
         _brk_enter("plan")
+        _dp_begin("offs")
         try:
             return self._fill_native_offs_at(scroll)
         finally:
+            _dp_step("tail")
             _brk_exit()
 
     def _fill_native_offs_at(self, scroll):
         """Write stamp offsets into _off_buf. Returns cloud, water, ground."""
-        _dp_begin("offs")
-        seg = "clr"
+        seg = "pre"
         try:
+            _dp_step("pre")
+            seg = "clr"
             tw = self.ocean_tw
             offs = self._off_buf
             del offs[:]
@@ -5809,15 +5815,18 @@ class Sprite:
 
     def _native_same(self, off_c, off_w, off_g, amount):
         _brk_enter("plan")
+        _dp_begin("same")
         try:
             return self._native_same_at(off_c, off_w, off_g, amount)
         finally:
+            _dp_step("tail")
             _brk_exit()
 
     def _native_same_at(self, off_c, off_w, off_g, amount):
-        _dp_begin("same")
-        seg = "gate"
+        seg = "pre"
         try:
+            _dp_step("pre")
+            seg = "gate"
             if not self._native_ready:
                 return False
             _dp_step("gate")
