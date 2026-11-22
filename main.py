@@ -102,12 +102,26 @@ FRAME_MIN_MS = 16
 # Present on the ring quantum so each paint advances the rings by one
 # step. 16 ms would alias against this 33 ms cycle (fast, then slow).
 # The loop waits out the remainder instead of drawing again early.
-# Full gc.collect on the two-second timing line was the idle and cruise
-# hitch. The same rule applies at rest and in motion: collect only when
-# the heap is actually low.
+# The two-second timing line still collects only when the heap is low.
+# The same rule applies at rest and in motion.
 GC_LOW_FREE = 64 * 1024
 GC_CRITICAL_FREE = 24 * 1024
 GC_MOVE_MIN_MS = 15000
+# C gc_alloc collects by itself when bytes allocated since the last
+# collection reach gc.threshold. The stock 57,344-byte value fired about
+# twice a second inside a present (~137 ms, ~119 KB/s). One frame is only
+# a few KB, so 1.2 MB cannot be crossed during a present. Automatic
+# collection is also turned off; this value is the safety net if that
+# call is missing.
+GC_AUTO_BYTES = 1200 * 1024
+# Explicit collect after a finished present, once the heap has grown by
+# this much since the last collect. At ~119 KB/s that is about four
+# seconds, and it stays under GC_AUTO_BYTES for the next frame. Not every
+# frame: a full collect scans the PSRAM heap and costs ~137 ms.
+GC_BETWEEN_BYTES = 512 * 1024
+# How many completed presents between mem_alloc samples. The sample walks
+# the heap (~13 ms), so it is not done on every frame.
+GC_CHECK_FRAMES = 30
 # A full 128x103 RGB565 push is about 26 KB. 800 ms is well past a slow
 # SPI transfer and still shorter than the 30 s watchdog. The driver call
 # itself has no timeout; this bound is the one the handoff waits on.
@@ -2252,7 +2266,7 @@ def _brk_maybe_print(now):
 
 
 # A bucket at least this long is a hitch, not steady draw or push work.
-# Logged only. collect_due and gc.collect stay on their old rules.
+# Logged only. It does not itself collect.
 _PAUSE_HITCH_US = 80000
 _PAUSE_RISE = 1024
 _PAUSE_CAP = 8
@@ -2385,6 +2399,8 @@ def _pause_piece(i):
         return "collect %s %sms %s>%s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
     if cause == "gcthresh":
         return "gcthresh %db" % a
+    if cause == "gcauto":
+        return "gcauto %s" % ("off" if a == 0 else "on")
     if cause == "gcwake":
         # where is no, yes, or run. dur is the microsecond span.
         # a is the threshold, b is gc.mem_alloc, C is free, D is t0.
@@ -2496,7 +2512,7 @@ def _install_pause_gc():
     if fn is None:
         return
     try:
-        fn(57344)
+        fn(GC_AUTO_BYTES)
     except Exception:
         # The write failed, so the previous threshold is unchanged.
         # The read below still runs, and that live value is what we log.
@@ -2516,13 +2532,71 @@ def _install_pause_gc():
     except Exception:
         val = None
     if val is None:
-        # Do not claim 57344. -1 means the live value could not be read.
+        # Do not claim GC_AUTO_BYTES. -1 means the live value could not be read.
         _pause_push("gcthresh", "gc", 0, -1, 0)
-        return
-    _pause_push("gcthresh", "gc", 0, val, 0)
+    else:
+        _pause_push("gcthresh", "gc", 0, val, 0)
+    # Stop C from calling gc_collect inside gc_alloc. An explicit collect
+    # still runs, and only after a finished present.
+    dis = getattr(gc, "disable", None)
+    off = False
+    if dis is not None:
+        try:
+            dis()
+            off = True
+        except Exception:
+            off = False
+    isen = getattr(gc, "isenabled", None)
+    if isen is not None:
+        try:
+            off = not bool(isen())
+        except Exception:
+            pass
+    _pause_push("gcauto", "gc", 0, 0 if off else 1, 0)
 
 
 _install_pause_gc()
+
+
+_GC_ALLOC_MARK = None
+_GC_CHECK_N = 0
+
+
+def _gc_after_present():
+    """Collect only after a present, and only after a large allocation gap.
+
+    Called once ui.tick has returned, so compose, stamp, and the display
+    push are already finished. mem_alloc is sampled every GC_CHECK_FRAMES
+    presents, not every frame. A collect here goes through gc.collect, so
+    the existing gcwake / collect lines still record it.
+    """
+    global _GC_ALLOC_MARK, _GC_CHECK_N
+    _GC_CHECK_N += 1
+    if _GC_CHECK_N < GC_CHECK_FRAMES:
+        return
+    _GC_CHECK_N = 0
+    try:
+        import gc
+    except ImportError:
+        return
+    alloc = _gc_int(getattr(gc, "mem_alloc", None))
+    if alloc < 0:
+        return
+    mark = _GC_ALLOC_MARK
+    if mark is None or alloc < mark:
+        _GC_ALLOC_MARK = alloc
+        return
+    if alloc - mark < GC_BETWEEN_BYTES:
+        return
+    _brk_enter("gc")
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    finally:
+        _brk_exit()
+    alloc2 = _gc_int(getattr(gc, "mem_alloc", None))
+    _GC_ALLOC_MARK = alloc2 if alloc2 >= 0 else alloc
 
 
 def draw_due(now, next_draw):
@@ -6832,6 +6906,9 @@ def main():
 
         _flow_add("loop", _us_diff(_mono_us(), loop_mark))
         ui.tick(values, fault, now)
+        # The present has already been pushed. Collect here, never inside
+        # compose, stamp, or the display push.
+        _gc_after_present()
         _brk_enter("pace")
         try:
             next_draw = pace_after(frame_started, _mono_us())
