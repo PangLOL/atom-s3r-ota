@@ -167,8 +167,17 @@ OTA_HTTP_TIMEOUT_MS = 3000
 # 90s fetch. Calling it on every frame was on the present path.
 OTA_POLL_MS = 1000
 BREATH_MS = 1600
+# Retired as the aura gate. Scroll, the mouth, and the bench speed
+# curve still follow vehicle speed on their own.
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
+# Honda GE8 L15A7 i-VTEC high-lift intake cam, about 5400 rpm at wide
+# open throttle. The CAN frame is id 0x17C and we do not decode a
+# solenoid bit, so the aura follows rpm only. Light throttle at high
+# rpm still starts it. OFF sits under ON so a noisy 5400 edge does not
+# flicker the sequence or skip the end shockwave.
+VTEC_ON_RPM = 5400.0
+VTEC_OFF_RPM = 5100.0
 FX_FRAME_MS = 1000 // 15  # 15 fps, same as S3Vec run_fast
 SONIC_MID_Y = 72
 AURA_TIP_X = 66
@@ -2695,33 +2704,35 @@ _GC_ALLOC_MARK = None
 _GC_CHECK_N = 0
 # ticks_ms when growth first crossed GC_BETWEEN_BYTES, or None if not due.
 _GC_DUE_AT = None
+# Last mem_free sample and the last explicit collect, in the caller's
+# ticks_ms. A sample suppresses another walk for GC_MOVE_MIN_MS so a
+# heap that stays critical does not collect on every present.
+_GC_FREE_AT = None
+_GC_COLLECT_AT = None
 
 
 def gc_moment(speed, boost_phase):
-    """True when a between-frame collect can sit on a stop or a cruise gap.
+    """True when a between-frame collect can sit after the aura sequence.
 
-    Stopped is under 1 km/h, the same threshold as the idle cycle.
-    A gap between boosts is the aura sequence back to idle while speed
-    is under BOOST_SPEED: the 2 s below 100 km/h has already left the
-    run, and the end shockwave and barrier have finished. Mid-boost
-    (phase run, end_sw, or barrier, or speed still at BOOST_SPEED or
-    above) waits. Chao, item boxes, and enemy hits are not in this
-    dashboard, so they are not moments.
+    Mid-aura (run), the end shockwave, and the sound barrier are not
+    moments, including when the car has already stopped, so a collect
+    does not land on those frames. Stopped with the sequence idle, and
+    any speed once the sequence is idle, are moments. 100 km/h is not
+    the gap: the aura follows rpm, so a cruise above that with the
+    sequence finished is still a place to collect. Chao, item boxes,
+    and enemy hits are not in this dashboard, so they are not moments.
+    `speed` stays in the signature for the caller. It does not open or
+    close the gap.
     """
-    if speed is None:
-        speed = 0.0
-    if speed < 1.0:
-        return True
-    # Boost itself is speed above BOOST_SPEED. 100 km/h is already a gap
-    # once the aura sequence has returned to idle.
-    if boost_phase == "idle" and speed <= BOOST_SPEED:
-        return True
-    return False
+    if boost_phase in ("run", "end_sw", "barrier"):
+        return False
+    return True
 
 
-def _gc_collect_between():
+def _gc_collect_between(now=None):
     """One explicit collect. The caller is already after a finished present."""
     global _GC_ALLOC_MARK, _GC_CHECK_N, _GC_DUE_AT
+    global _GC_COLLECT_AT, _GC_FREE_AT
     _brk_enter("gc")
     try:
         try:
@@ -2740,6 +2751,55 @@ def _gc_collect_between():
         _GC_ALLOC_MARK = alloc2
     _GC_DUE_AT = None
     _GC_CHECK_N = 0
+    if now is not None:
+        _GC_COLLECT_AT = now
+        _GC_FREE_AT = now
+
+
+def _gc_low_free(now):
+    """True when the after-present low-free rule says to collect.
+
+    gc.mem_free scans the heap. The timing line used to do that, plus
+    gc.mem_alloc, every two seconds inside ui.tick. On the PR #13 listen
+    the pair grew from ~55 ms to ~118 ms once a split-heap area doubled
+    the scan, and that was the `timing` max. Any sample, high or low,
+    waits GC_MOVE_MIN_MS before the next walk, so a heap that stays
+    critical does not collect on every following present. The walk and
+    the collect are after the push, not on the timing line.
+    """
+    global _GC_FREE_AT, _PAUSE_FREE
+    if _GC_FREE_AT is not None:
+        age = _ms_diff(now, _GC_FREE_AT)
+        if 0 <= age < GC_MOVE_MIN_MS:
+            return False
+    t0 = _mono_us()
+    free = _mem_free()
+    dur = _us_diff(_mono_us(), t0)
+    if dur < 0:
+        dur = 0
+    if free >= 0:
+        _PAUSE_FREE = free
+    _GC_FREE_AT = now
+    if _GC_COLLECT_AT is None:
+        since = GC_MOVE_MIN_MS
+        age = -1
+    else:
+        since = _ms_diff(now, _GC_COLLECT_AT)
+        if since < 0:
+            since = 0
+        age = since
+    if free < 0:
+        why = "unk"
+    elif free < GC_CRITICAL_FREE:
+        why = "crit"
+    elif free < GC_LOW_FREE and since >= GC_MOVE_MIN_MS:
+        why = "low"
+    elif free < GC_LOW_FREE:
+        why = "wait"
+    else:
+        why = "skip"
+    _pause_push("thresh", why, dur, free, age)
+    return collect_due(free, since)
 
 
 def _gc_after_present(now, speed, boost_phase):
@@ -2747,20 +2807,28 @@ def _gc_after_present(now, speed, boost_phase):
 
     Called once ui.tick has returned, so compose, stamp, and the display
     push are already finished. mem_alloc is sampled every GC_CHECK_FRAMES
-    presents, not every frame. A due collect waits for gc_moment, and
-    runs anyway after GC_DEFER_MS. The collect goes through gc.collect,
-    so the existing gcwake / collect lines still record it.
+    presents, not every frame. A due collect waits out the aura, and
+    runs anyway after GC_DEFER_MS. It can still run when the sequence is
+    idle, including at a stop. The collect goes through gc.collect, so
+    the existing gcwake / collect lines still record it. A separate
+    low-free walk is not on the two-second timing line.
     """
     global _GC_ALLOC_MARK, _GC_CHECK_N, _GC_DUE_AT
+    # The growth sample is its own heap walk. Do not stack a mem_free
+    # walk on that same present; the next one is soon enough.
+    growth_sample = _GC_DUE_AT is None and (_GC_CHECK_N + 1) >= GC_CHECK_FRAMES
+    if not growth_sample and _gc_low_free(now):
+        _gc_collect_between(now)
+        return
     due = _GC_DUE_AT
     if due is not None:
         if gc_moment(speed, boost_phase):
-            _gc_collect_between()
+            _gc_collect_between(now)
             return
         waited = _ms_diff(now, due)
         if waited < 0 or waited >= GC_DEFER_MS:
             _pause_push("gcwait", "gc", waited if waited > 0 else 0, 0, 0)
-            _gc_collect_between()
+            _gc_collect_between(now)
         return
     _GC_CHECK_N += 1
     if _GC_CHECK_N < GC_CHECK_FRAMES:
@@ -2780,7 +2848,7 @@ def _gc_after_present(now, speed, boost_phase):
     if alloc - mark < GC_BETWEEN_BYTES:
         return
     if gc_moment(speed, boost_phase):
-        _gc_collect_between()
+        _gc_collect_between(now)
         return
     _GC_DUE_AT = now
     _pause_push("gcdefer", "gc", 0, GC_DEFER_MS, 0)
@@ -3521,7 +3589,13 @@ def _note_presented():
     # The gap clock starts after those prints, so their serial stall shows
     # up in the next frame's `other`, not inside raw.
     _FLOW["present"] = _mono_us()
-    _FLOW["mem"] = _mem_free()
+    # gc.mem_free scans every GC block. On the PR #13 listen that scan was
+    # the whole per-frame `draw` bucket (~32 ms, then ~65 ms after a
+    # split-heap area doubled the scan) and it is what dropped the panel
+    # from ~17 fps to ~10 fps. The gap line is the only reader, and it
+    # runs only while FRAME_TRACE is on.
+    if FRAME_TRACE:
+        _FLOW["mem"] = _mem_free()
     _FLOW["gap_printed"] = 0
     _FLOW["gauge"] = 0
     _FLOW["loop"] = 0
@@ -4031,7 +4105,13 @@ def tint_blue_palette(base, amount):
 # --- end PIX6 interpreter --------------------------------------------------
 
 class Sweep:
-    """Speed 0 → 100 → 80 → 0, with matching RPM / throttle / coolant."""
+    """Speed 0 → 120 → 80 → 0, with matching RPM / throttle / coolant.
+
+    The climb and the 120 km/h hold take rpm through VTEC_ON_RPM. The
+    settle stage is already under VTEC_OFF_RPM, so the aura drops out
+    and plays the end sequence on the way back to rest. Speed, throttle,
+    and coolant staging are unchanged.
+    """
 
     # (duration_ms, start_speed, end_speed, kind)
     STAGES = (
@@ -4071,11 +4151,12 @@ class Sweep:
     def _values(self, speed, kind):
         if kind == "accel":
             tps = 50.0 + 1.7 * speed
-            rpm = 800.0 + 32.0 * speed
+            # 5400 rpm at 109.5 km/h, 5840 at the 120 km/h peak.
+            rpm = 800.0 + 42.0 * speed
             clt = 78.0 + 0.24 * speed
         elif kind == "boost_hold":
             tps = 220.0
-            rpm = 800.0 + 36.0 * speed
+            rpm = 800.0 + 42.0 * speed
             clt = 86.0
         elif kind == "settle" or kind == "hold":
             tps = 36.0 + 0.4 * (speed - 80.0)
@@ -4272,8 +4353,11 @@ class BoostFX:
         self.start_sw_done = False
         self.ticks = 0
 
-    def tick(self, speed, dt_ms):
-        if speed > BOOST_SPEED:
+    def tick(self, speed, dt_ms, rpm=None):
+        # `speed` stays for callers. The aura follows rpm, not km/h.
+        if rpm is None:
+            rpm = 0.0
+        if self._vtec_on(rpm):
             self.below_ms = 0
             if not self.initiated or self.phase in ("end_sw", "barrier", "idle"):
                 # (Re)initiate: aura 1 + shockwave once on top.
@@ -4311,6 +4395,20 @@ class BoostFX:
             steps += 1
         if self.accum > FX_FRAME_MS * 3:
             self.accum = FX_FRAME_MS * 2
+
+    def _vtec_on(self, rpm):
+        """True while the run should stay up.
+
+        Engage at VTEC_ON_RPM. Once the run is up, hold it down to
+        VTEC_OFF_RPM so the edge does not flicker. The end shockwave
+        and the barrier are not held here; a later crossing of
+        VTEC_ON_RPM can re-initiate.
+        """
+        if rpm >= VTEC_ON_RPM:
+            return True
+        if self.phase == "run" and rpm >= VTEC_OFF_RPM:
+            return True
+        return False
 
     def _step_frame(self):
         self.ticks += 1
@@ -4442,8 +4540,6 @@ class Sprite:
         self._tim_shift = 0
         self._tim_full = 0
         self._tim_t0 = 0
-        self._tim_gc_at = 0
-        self._gc_pending = 0
         self._fx_in_buffer = False
         self._corner_pushed = False
         self._dot_on_play = False
@@ -4683,16 +4779,18 @@ class Sprite:
         del self._under_spans[:]
         self._retain = True
 
-    def advance(self, speed, dt_ms):
+    def advance(self, speed, dt_ms, rpm=None):
         if speed is None:
             speed = 0.0
+        if rpm is None:
+            rpm = 0.0
         period = self._scroll_period
         self.scroll = (self.scroll + speed * dt_ms * 0.012) % period
         if speed < 1.0:
             self.phase = 0.0
         else:
             self.phase = (self.phase + dt_ms * (0.002 + 0.00035 * speed)) % 4.0
-        self.boost.tick(speed, dt_ms)
+        self.boost.tick(speed, dt_ms, rpm)
         self._step_anim(speed, dt_ms)
         self._collect_rings()
         self._step_sparkles(dt_ms)
@@ -5885,59 +5983,6 @@ class Sprite:
         self._tim_fill += fill_us
         self._tim_flush += flush_us
 
-    def _timing_gc(self):
-        """One collect. Not a multi-second sweep, and not once per frame."""
-        try:
-            import gc
-            g0 = _mono_us()
-            gc.collect()
-            gc_us = _us_diff(_mono_us(), g0)
-            if gc_us < 0:
-                gc_us = 0
-            _flow_add("gc", gc_us)
-            return gc_us
-        except Exception:
-            return 0
-
-    def _collect_since(self, now):
-        if self._tim_gc_at == 0:
-            return GC_MOVE_MIN_MS
-        since = _ms_diff(now, self._tim_gc_at)
-        if since < 0:
-            return 0
-        return since
-
-    def _collect_due(self, speed, now):
-        # speed is unused. Idle and motion share collect_due.
-        # The check is logged even when it does not collect.
-        global _PAUSE_FREE
-        t0 = _mono_us()
-        th, alloc, free = _gc_sample()
-        since = self._collect_since(now)
-        due = collect_due(free, since)
-        dur = _us_diff(_mono_us(), t0)
-        if dur < 0:
-            dur = 0
-        if self._tim_gc_at == 0:
-            age = -1
-        else:
-            age = since
-        if free < 0:
-            why = "unk"
-        elif free < GC_CRITICAL_FREE:
-            why = "crit"
-        elif free < GC_LOW_FREE and since >= GC_MOVE_MIN_MS:
-            why = "low"
-        elif free < GC_LOW_FREE:
-            why = "wait"
-        else:
-            why = "skip"
-        if free >= 0:
-            _PAUSE_FREE = free
-        _pause_push("thresh", why, dur, free, age)
-        _gcwake_push("yes" if due else "no", t0, dur, th, alloc, free)
-        return due
-
     def report_timing(self, now, speed=0.0):
         """One serial line per 2 seconds. Does not rebuild caches.
 
@@ -5945,8 +5990,10 @@ class Sprite:
         and rings are the stamp split (they sit inside stamp, along with
         the playfield shift and the backdrop copies). shift and full count
         backdrop updates. A USB CDC that has not drained the previous line
-        skips the print; the counters stay. gc is the collect in this
-        window, or 0 when the heap is not low, including at 0 km/h.
+        skips the print; the counters stay. gc stays 0 here. A heap walk
+        or a collect on this line was inside the frame: on the PR #13
+        listen the walk alone was the 55 ms, then 118 ms, timing hitch.
+        Low-free and growth collects run after ui.tick returns.
         """
         n = self._tim_n
         if n <= 0 or self._tim_t0 == 0:
@@ -5954,22 +6001,11 @@ class Sprite:
         elapsed = _ms_diff(now, self._tim_t0)
         if elapsed < 2000:
             return
+        # speed is unused. The aura and the collect no longer read it here.
         gc_us = 0
-        if self._collect_due(speed, now):
-            _brk_enter("gc")
-            try:
-                gc_us = self._timing_gc()
-            finally:
-                _brk_exit()
-            self._tim_gc_at = now
-            self._gc_pending = gc_us
-            _service()
         if not _stdout_can_write():
             return
         _service()
-        if gc_us == 0:
-            gc_us = self._gc_pending
-        self._gc_pending = 0
         total_us = self._tim_compose + self._tim_stamp + self._tim_push
         fps_tenths = 0
         if elapsed > 0:
@@ -6890,10 +6926,13 @@ class Dashboard:
         dt = anim_dt(time.ticks_diff(now, self._last_ms))
         self._last_ms = now
         speed = values.get("spd") or 0.0
+        rpm = values.get("rpm")
+        if rpm is None:
+            rpm = 0.0
         t_adv = _mono_us()
         _brk_enter("adv")
         try:
-            self.sprite.advance(speed, dt)
+            self.sprite.advance(speed, dt, rpm)
         finally:
             _brk_exit()
         _flow_add("adv", _us_diff(_mono_us(), t_adv))
@@ -7194,8 +7233,8 @@ def main():
         _flow_add("loop", _us_diff(_mono_us(), loop_mark))
         ui.tick(values, fault, now)
         # The present has already been pushed. Collect here, never inside
-        # compose, stamp, or the display push. A due collect may wait for
-        # a stop or a gap between boosts.
+        # compose, stamp, or the display push. A due collect waits out the
+        # aura and still runs when that sequence is idle, including a stop.
         _gc_after_present(now, values.get("spd"), ui.sprite.boost.phase)
         _brk_enter("pace")
         try:

@@ -199,37 +199,31 @@ def main():
     calls = {"n": 0}
     saved_collect = gc.collect
     saved_free = getattr(gc, "mem_free", None)
+    walks = {"n": 0}
+
+    def _free_count():
+        walks["n"] += 1
+        return 2000000
+
     gc.collect = lambda: calls.__setitem__("n", calls["n"] + 1)
-    gc.mem_free = lambda: 2000000
+    gc.mem_free = _free_count
     try:
         sprite = fw.Sprite(None)
         sprite._tim_n = 4
         sprite._tim_t0 = 1000
-        sprite._tim_gc_at = 0
         sprite.report_timing(3500, 80.0)
         assert calls["n"] == 0, calls
         sprite._tim_n = 4
         sprite._tim_t0 = 1000
-        sprite._tim_gc_at = 0
         sprite.report_timing(3500, 0.0)
         assert calls["n"] == 0, calls
+        # Critical free must not collect or walk inside the timing line.
         gc.mem_free = lambda: fw.GC_CRITICAL_FREE - 1
         sprite._tim_n = 4
         sprite._tim_t0 = 1000
-        sprite._tim_gc_at = 3500
         sprite.report_timing(3600, 0.0)
-        assert calls["n"] == 1, calls
-        gc.mem_free = lambda: 40 * 1024
-        sprite._tim_n = 4
-        sprite._tim_t0 = 1000
-        sprite._tim_gc_at = 3600
-        sprite.report_timing(4000, 0.0)
-        assert calls["n"] == 1, calls
-        sprite._tim_n = 4
-        sprite._tim_t0 = 1000
-        sprite._tim_gc_at = 0
-        sprite.report_timing(3500, 80.0)
-        assert calls["n"] == 2, calls
+        assert calls["n"] == 0, calls
+        assert walks["n"] == 0, walks
     finally:
         gc.collect = saved_collect
         if saved_free is None:
@@ -286,16 +280,19 @@ def main():
     assert "_gc_after_present" not in tick_src
     assert "_gc_after_present" not in paint_src
     assert main_src.index("ui.tick") < main_src.index("_gc_after_present")
-    assert fw.gc_moment(0.0, "run") is True
-    assert fw.gc_moment(0.4, "end_sw") is True
+    assert fw.gc_moment(0.0, "run") is False
+    assert fw.gc_moment(0.4, "end_sw") is False
+    assert fw.gc_moment(0.0, "barrier") is False
+    assert fw.gc_moment(0.0, "idle") is True
     assert fw.gc_moment(80.0, "idle") is True
     assert fw.gc_moment(100.0, "idle") is True
     assert fw.gc_moment(80.0, "run") is False
     assert fw.gc_moment(80.0, "end_sw") is False
     assert fw.gc_moment(80.0, "barrier") is False
-    assert fw.gc_moment(120.0, "idle") is False
+    assert fw.gc_moment(120.0, "idle") is True
     assert fw.gc_moment(120.0, "run") is False
-    assert fw.gc_moment(None, "run") is True
+    assert fw.gc_moment(None, "run") is False
+    assert fw.gc_moment(None, "idle") is True
 
     import gc
     calls = {"n": 0}
@@ -413,6 +410,8 @@ def main():
         fw._gc_after_present(5000 + fw.GC_DEFER_MS - 1, 80.0, "run")
         assert calls["n"] == 0, "aura still up"
         fw._gc_after_present(7000, 0.0, "run")
+        assert calls["n"] == 0, "end sequence still playing"
+        fw._gc_after_present(7000, 0.0, "idle")
         assert calls["n"] == 1
         assert fw._GC_DUE_AT is None
 
@@ -439,6 +438,42 @@ def main():
             fw._gc_after_present(9000, 80.0, "idle")
             n += 1
         assert calls["n"] == 1
+
+        # A cruise above 100 km/h is a gap once the aura is idle.
+        # Stopped mid-barrier is not, until the defer cap.
+        _reset(0, fw.GC_BETWEEN_BYTES + 8)
+        n = 0
+        while n < fw.GC_CHECK_FRAMES:
+            fw._gc_after_present(12000, 160.0, "idle")
+            n += 1
+        assert calls["n"] == 1
+        _reset(0, fw.GC_BETWEEN_BYTES + 8)
+        n = 0
+        while n < fw.GC_CHECK_FRAMES:
+            fw._gc_after_present(13000, 0.0, "barrier")
+            n += 1
+        assert calls["n"] == 0
+        assert fw._GC_DUE_AT == 13000
+        fw._gc_after_present(13000 + fw.GC_DEFER_MS - 1, 0.0, "barrier")
+        assert calls["n"] == 0
+        fw._gc_after_present(13000 + fw.GC_DEFER_MS, 0.0, "barrier")
+        assert calls["n"] == 1
+
+        # Low-free still collects after the present, not on the timing line.
+        _reset(0, 0)
+        fw._GC_FREE_AT = None
+        fw._GC_COLLECT_AT = None
+        state["alloc"] = 0
+
+        def _crit_free():
+            return fw.GC_CRITICAL_FREE - 1
+
+        gc.mem_free = _crit_free
+        fw._gc_after_present(14000, 0.0, "run")
+        assert calls["n"] == 1, "critical free collects during the aura"
+        fw._gc_after_present(14100, 0.0, "run")
+        assert calls["n"] == 1, "critical does not collect every frame"
+        gc.mem_free = _mem_free
     finally:
         gc.collect = saved["collect"]
         if saved["disable"] is None:
@@ -502,7 +537,110 @@ def main():
     assert img.how == "image" and fw._PUSH_HOW == "image"
     fw._PUSH_HOW = None
 
-    print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped)
+    # Aura follows CAN rpm (VTEC), not 100 km/h. Light throttle is accepted.
+    assert fw.VTEC_ON_RPM == 5400.0
+    assert fw.VTEC_OFF_RPM < fw.VTEC_ON_RPM
+    assert fw.VTEC_ON_RPM - fw.VTEC_OFF_RPM <= 400.0
+    fx = fw.BoostFX()
+    fx.tick(130.0, 2000, 4000.0)
+    assert fx.phase == "idle" and fx.aura_i < 0
+    fx.tick(100.0, fw.BOOST_END_MS, 5399.0)
+    assert fx.phase == "idle", "100 km/h under 5400 rpm does not start the aura"
+    fx.tick(20.0, 50, fw.VTEC_ON_RPM)
+    assert fx.phase == "run" and fx.aura_i == 0 and fx.initiated
+    fx.tick(20.0, 800, fw.VTEC_OFF_RPM)
+    assert fx.phase == "run" and fx.below_ms == 0
+    fx.tick(20.0, fw.BOOST_END_MS - 1, fw.VTEC_OFF_RPM - 1)
+    assert fx.phase == "run"
+    fx.tick(20.0, 1, fw.VTEC_OFF_RPM - 1)
+    assert fx.phase == "end_sw" and fx.aura_i < 0
+    fx.tick(10.0, 50, fw.VTEC_ON_RPM)
+    assert fx.phase == "run" and fx.aura_i == 0
+    fx.tick(0.0, fw.BOOST_END_MS, 800.0)
+    assert fx.phase == "end_sw"
+    guard = 0
+    while fx.phase != "idle" and guard < 40:
+        fx.tick(0.0, fw.FX_FRAME_MS, 800.0)
+        guard += 1
+    assert fx.phase == "idle" and fx.aura_i < 0 and not fx.initiated, fx.phase
+
+    sw = fw.Sweep()
+    hold = sw._values(120.0, "boost_hold")
+    assert hold["spd"] == 120.0
+    assert hold["tps"] == 220.0 and hold["clt"] == 86.0
+    assert hold["rpm"] >= fw.VTEC_ON_RPM + 400.0
+    accel = sw._values(120.0, "accel")
+    assert accel["tps"] == 50.0 + 1.7 * 120.0
+    assert accel["clt"] == 78.0 + 0.24 * 120.0
+    assert accel["rpm"] >= fw.VTEC_ON_RPM
+    under = sw._values(100.0, "accel")
+    assert under["spd"] == 100.0 and under["rpm"] < fw.VTEC_ON_RPM
+    settle = sw._values(120.0, "settle")
+    assert settle["rpm"] < fw.VTEC_OFF_RPM
+    assert settle["clt"] == 96.0
+    assert sum(stage[0] for stage in fw.Sweep.STAGES) == 9900
+
+    sw.start(0)
+    fx = fw.BoostFX()
+    t = 0
+    saw_on = False
+    saw_fast_under = False
+    peak_rpm = 0.0
+    peak_spd = 0.0
+    while sw.active and t <= 12000:
+        vals = sw.step(t)
+        assert vals is not None
+        if vals["rpm"] > peak_rpm:
+            peak_rpm = vals["rpm"]
+        if vals["spd"] > peak_spd:
+            peak_spd = vals["spd"]
+        if vals["spd"] >= 100.0 and vals["rpm"] < fw.VTEC_ON_RPM:
+            saw_fast_under = True
+            if not saw_on:
+                assert fx.phase == "idle"
+        if vals["rpm"] >= fw.VTEC_ON_RPM:
+            saw_on = True
+        fx.tick(vals["spd"], 50, vals["rpm"])
+        if saw_on and fx.phase == "run":
+            pass
+        t += 50
+    assert not sw.active
+    assert sw.step(t) is None
+    assert saw_fast_under
+    assert saw_on and peak_rpm >= fw.VTEC_ON_RPM + 400.0
+    assert peak_spd == 120.0
+    guard = 0
+    while fx.phase != "idle" and guard < 80:
+        fx.tick(0.0, fw.FX_FRAME_MS, 800.0)
+        guard += 1
+    assert fx.phase == "idle" and fx.aura_i < 0, fx.phase
+
+    # A present must not walk the heap unless frame tracing is on.
+    import gc
+    walks = {"n": 0}
+    saved_free = getattr(gc, "mem_free", None)
+
+    def _count_free():
+        walks["n"] += 1
+        return 1234
+
+    gc.mem_free = _count_free
+    try:
+        assert fw.FRAME_TRACE is False
+        fw._note_presented()
+        fw._note_presented()
+        assert walks["n"] == 0, walks
+        fw.FRAME_TRACE = True
+        fw._note_presented()
+        assert walks["n"] == 1, walks
+    finally:
+        fw.FRAME_TRACE = False
+        if saved_free is None:
+            del gc.mem_free
+        else:
+            gc.mem_free = saved_free
+
+    print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped, "vtec", int(peak_rpm))
 
 
 if __name__ == "__main__":
