@@ -2739,7 +2739,7 @@ def _install_pause_gc():
     if fn is None:
         return
     try:
-        fn(24576)
+        fn(57344)
     except Exception:
         # The write failed, so the previous threshold is unchanged.
         # The read below still runs, and that live value is what we log.
@@ -2759,7 +2759,7 @@ def _install_pause_gc():
     except Exception:
         val = None
     if val is None:
-        # Do not claim 24576. -1 means the live value could not be read.
+        # Do not claim 57344. -1 means the live value could not be read.
         _pause_push("gcthresh", "gc", 0, -1, 0)
         return
     _pause_push("gcthresh", "gc", 0, val, 0)
