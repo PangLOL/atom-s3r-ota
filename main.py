@@ -2067,8 +2067,12 @@ def _brk_exit():
     global _BRK_NAME, _BRK_AT, _BRK_STN
     now = _mono_us()
     cur = _BRK_NAME
+    dur = 0
     if cur is not None:
-        _brk_add(cur, _us_diff(now, _BRK_AT))
+        dur = _us_diff(now, _BRK_AT)
+        if dur < 0:
+            dur = 0
+        _brk_add(cur, dur)
     if _BRK_STN > 0:
         _BRK_STN -= 1
         _BRK_NAME = _BRK_ST[_BRK_STN]
@@ -2076,6 +2080,8 @@ def _brk_exit():
         _BRK_AT = now
     else:
         _BRK_NAME = None
+    if cur is not None and dur >= _PAUSE_HITCH_US:
+        _pause_on_slow(cur, dur)
 
 
 def _brk_reset_sums():
@@ -2136,6 +2142,8 @@ def _brk_commit(wall):
         _BRK_WALL_MAX = wall
     _BRK_WALL += wall
     _BRK_N += 1
+    if left >= _PAUSE_HITCH_US:
+        _pause_on_slow("left", left)
 
 
 def _brk_field(name, total, n, peak):
@@ -2240,6 +2248,203 @@ def _brk_maybe_print(now):
     print(_brk_cdc_line())
     _brk_reset_sums()
     _BRK_T0 = now
+    _pause_maybe_print()
+
+
+# A bucket at least this long is a hitch, not steady draw or push work.
+# Logged only. collect_due and gc.collect stay on their old rules.
+_PAUSE_HITCH_US = 80000
+_PAUSE_RISE = 1024
+_PAUSE_CAP = 8
+_PAUSE_CAUSE = [None] * _PAUSE_CAP
+_PAUSE_WHERE = [None] * _PAUSE_CAP
+_PAUSE_US = [0] * _PAUSE_CAP
+_PAUSE_A = [0] * _PAUSE_CAP
+_PAUSE_B = [0] * _PAUSE_CAP
+_PAUSE_N = 0
+_PAUSE_DROP = 0
+_PAUSE_FREE = -1
+
+
+def _pause_push(cause, where, dur, a, b):
+    """Queue one pause. The print happens later, and only if CDC is free."""
+    global _PAUSE_N, _PAUSE_DROP
+    if _PAUSE_N >= _PAUSE_CAP:
+        _PAUSE_DROP += 1
+        return
+    i = _PAUSE_N
+    _PAUSE_CAUSE[i] = cause
+    _PAUSE_WHERE[i] = where
+    _PAUSE_US[i] = dur
+    _PAUSE_A[i] = a
+    _PAUSE_B[i] = b
+    _PAUSE_N = i + 1
+
+
+def _pause_k(n):
+    if n is None or n < 0:
+        return "na"
+    if n >= 1000:
+        return "%dk" % (n // 1000)
+    return "%d" % n
+
+
+def _pause_ms(us):
+    if us < 0:
+        us = 0
+    return _fmt_tenths(_avg_tenths_ms(us, 1))
+
+
+def _pause_on_slow(where, dur):
+    """A long span. autogc if the heap grew since the last sample, else stall.
+
+    The milliseconds are the whole span. They are not a clock around the
+    collector. An explicit gc.collect in this same span is already queued.
+    """
+    global _PAUSE_FREE
+    if (
+        _PAUSE_N > 0
+        and _PAUSE_CAUSE[_PAUSE_N - 1] == "collect"
+        and _PAUSE_WHERE[_PAUSE_N - 1] == where
+    ):
+        return
+    free = _mem_free()
+    prev = _PAUSE_FREE
+    if free >= 0:
+        _PAUSE_FREE = free
+    if prev >= 0 and free > prev + _PAUSE_RISE:
+        _pause_push("autogc", where, dur, prev, free)
+    else:
+        _pause_push("stall", where, dur, free, prev)
+
+
+def _pause_piece(i):
+    cause = _PAUSE_CAUSE[i]
+    where = _PAUSE_WHERE[i]
+    dur = _PAUSE_US[i]
+    a = _PAUSE_A[i]
+    b = _PAUSE_B[i]
+    if cause == "thresh":
+        if b < 0:
+            age = "none"
+        else:
+            age = "%ds" % (b // 1000)
+        return "thresh %s %sms free %s age %s" % (where, _pause_ms(dur), _pause_k(a), age)
+    if cause == "autogc":
+        return "autogc %s %sms %s>%s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
+    if cause == "collect":
+        return "collect %s %sms %s>%s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
+    if cause == "gcthresh":
+        return "gcthresh %db" % a
+    return "stall %s %sms free %s was %s" % (where, _pause_ms(dur), _pause_k(a), _pause_k(b))
+
+
+def _pause_shift(keep_from):
+    global _PAUSE_N
+    j = 0
+    i = keep_from
+    while i < _PAUSE_N:
+        _PAUSE_CAUSE[j] = _PAUSE_CAUSE[i]
+        _PAUSE_WHERE[j] = _PAUSE_WHERE[i]
+        _PAUSE_US[j] = _PAUSE_US[i]
+        _PAUSE_A[j] = _PAUSE_A[i]
+        _PAUSE_B[j] = _PAUSE_B[i]
+        j += 1
+        i += 1
+    _PAUSE_N = j
+
+
+def _pause_line():
+    """One CDC-sized line, or None. Unprinted events stay queued."""
+    global _PAUSE_DROP
+    if _PAUSE_N <= 0 and _PAUSE_DROP <= 0:
+        return None
+    parts = []
+    used = 6
+    i = 0
+    while i < _PAUSE_N:
+        piece = _pause_piece(i)
+        add = len(piece) + (0 if not parts else 1)
+        if used + add > _BRK_CDC:
+            break
+        parts.append(piece)
+        used += add
+        i += 1
+    if _PAUSE_DROP > 0:
+        tail = "drop %d" % _PAUSE_DROP
+        add = len(tail) + (0 if not parts else 1)
+        if used + add <= _BRK_CDC:
+            parts.append(tail)
+            _PAUSE_DROP = 0
+    if not parts:
+        return None
+    if i > 0:
+        _pause_shift(i)
+    return "pause " + " ".join(parts)
+
+
+def _pause_maybe_print():
+    """After the brk line. A full CDC keeps the queue and changes nothing else."""
+    if _PAUSE_N <= 0 and _PAUSE_DROP <= 0:
+        return
+    if not _stdout_can_write():
+        return
+    line = _pause_line()
+    if line:
+        print(line)
+
+
+def _install_pause_gc():
+    """Time every gc.collect. Read the auto threshold once. Do not set it."""
+    try:
+        import gc
+    except ImportError:
+        return
+    orig = getattr(gc, "collect", None)
+    if orig is not None and not getattr(orig, "_pause_wrapped", False):
+        def _wrapped():
+            free0 = _mem_free()
+            t0 = _mono_us()
+            try:
+                return orig()
+            finally:
+                dur = _us_diff(_mono_us(), t0)
+                if dur < 0:
+                    dur = 0
+                free1 = _mem_free()
+                global _PAUSE_FREE
+                if free1 >= 0:
+                    _PAUSE_FREE = free1
+                where = _BRK_NAME
+                if not where:
+                    where = "boot"
+                _pause_push("collect", where, dur, free0, free1)
+        _wrapped._pause_wrapped = True
+        try:
+            gc.collect = _wrapped
+        except Exception:
+            pass
+    fn = getattr(gc, "threshold", None)
+    if fn is None:
+        return
+    try:
+        val = fn()
+    except TypeError:
+        return
+    except Exception:
+        return
+    if isinstance(val, tuple):
+        if not val:
+            return
+        val = val[0]
+    try:
+        val = int(val)
+    except Exception:
+        return
+    _pause_push("gcthresh", "gc", 0, val, 0)
+
+
+_install_pause_gc()
 
 
 def draw_due(now, next_draw):
@@ -5306,7 +5511,33 @@ class Sprite:
 
     def _collect_due(self, speed, now):
         # speed is unused. Idle and motion share collect_due.
-        return collect_due(_mem_free(), self._collect_since(now))
+        # The check is logged even when it does not collect.
+        global _PAUSE_FREE
+        t0 = _mono_us()
+        free = _mem_free()
+        since = self._collect_since(now)
+        due = collect_due(free, since)
+        dur = _us_diff(_mono_us(), t0)
+        if dur < 0:
+            dur = 0
+        if self._tim_gc_at == 0:
+            age = -1
+        else:
+            age = since
+        if free < 0:
+            why = "unk"
+        elif free < GC_CRITICAL_FREE:
+            why = "crit"
+        elif free < GC_LOW_FREE and since >= GC_MOVE_MIN_MS:
+            why = "low"
+        elif free < GC_LOW_FREE:
+            why = "wait"
+        else:
+            why = "skip"
+        if free >= 0:
+            _PAUSE_FREE = free
+        _pause_push("thresh", why, dur, free, age)
+        return due
 
     def report_timing(self, now, speed=0.0):
         """One serial line per 2 seconds. Does not rebuild caches.
