@@ -186,14 +186,23 @@ def main():
     assert stepped == cruise * fw.REFRESH_MS * 0.012
     assert stepped < stalled
 
-    # Healthy heap: no periodic collect at rest or in motion.
-    assert fw.collect_due(2000000, 2000) is False
-    assert fw.collect_due(2000000, 20000) is False
-    # Under 64 KB, wait out the 15 s gap. Under 24 KB, collect now.
-    assert fw.collect_due(40 * 1024, 2000) is False
-    assert fw.collect_due(40 * 1024, fw.GC_MOVE_MIN_MS) is True
-    assert fw.collect_due(fw.GC_CRITICAL_FREE - 1, 0) is True
-    assert fw.collect_due(-1, 20000) is False
+    # One ~3 ms slice fits in the leftover of a 33 ms frame, plus a margin.
+    # A late frame, and a leftover under that bar, skips. No heap read.
+    quantum = fw.RING_FPS_MS * 1000
+    need = fw.GC_SLICE_US + fw.GC_SLICE_MARGIN_US
+    assert fw.GC_SLICE_US == 3000
+    assert fw.GC_SLICE_MARGIN_US == 2000
+    assert fw.GC_SLICE_STALL_US > fw.GC_SLICE_US
+    assert quantum == 33000
+    assert need == 5000
+    assert fw.gc_slice_room(16000) is True
+    assert fw.gc_slice_room(0) is True
+    assert fw.gc_slice_room(quantum - need) is True
+    assert fw.gc_slice_room(quantum - need + 1) is False
+    assert fw.gc_slice_room(quantum - 1) is False
+    assert fw.gc_slice_room(quantum) is False
+    assert fw.gc_slice_room(quantum + 8000) is False
+    assert fw.gc_slice_room(-1) is False
 
     import gc
     calls = {"n": 0}
@@ -217,8 +226,8 @@ def main():
         sprite._tim_t0 = 1000
         sprite.report_timing(3500, 0.0)
         assert calls["n"] == 0, calls
-        # Critical free must not collect or walk inside the timing line.
-        gc.mem_free = lambda: fw.GC_CRITICAL_FREE - 1
+        # A low free value must not collect or walk inside the timing line.
+        gc.mem_free = lambda: 1024
         sprite._tim_n = 4
         sprite._tim_t0 = 1000
         sprite.report_timing(3600, 0.0)
@@ -263,39 +272,29 @@ def main():
     assert fw._BRK_NAME is None and fw._BRK_STN == 0
     fw._brk_reset_all()
 
-    # Between-frame collect: rarer byte gap, after the present, with a
-    # bounded wait for a stop or a gap between boosts.
-    settled = 512 * 1024
-    guess_s = 10.0 * fw.GC_BETWEEN_BYTES / settled
-    assert fw.GC_BETWEEN_BYTES == 1280 * 1024
-    assert 20.0 <= guess_s <= 30.0, guess_s
-    assert fw.GC_CHECK_FRAMES == 30
-    assert fw.GC_DEFER_MS == 10000
+    # One slice after the present, only when the 33 ms frame has room.
+    # Auto-GC stays off and the high threshold stays. The version stamp stays.
     assert fw.GC_AUTO_BYTES == 3072 * 1024
-    assert fw.GC_AUTO_BYTES > fw.GC_BETWEEN_BYTES
+    assert fw.APP_VERSION == 16
+    assert fw.APP_VERSION_NAME == "2026.11.21-v16"
+    assert fw.VTEC_ON_RPM == 5400.0
+    assert fw.VTEC_OFF_RPM == 5100.0
     import inspect
     main_src = inspect.getsource(fw.main)
     tick_src = inspect.getsource(fw.Dashboard._tick_body)
     paint_src = inspect.getsource(fw.Sprite._paint_native)
+    after_src = inspect.getsource(fw._gc_after_present)
     assert "_gc_after_present" not in tick_src
     assert "_gc_after_present" not in paint_src
     assert main_src.index("ui.tick") < main_src.index("_gc_after_present")
-    assert fw.gc_moment(0.0, "run") is False
-    assert fw.gc_moment(0.4, "end_sw") is False
-    assert fw.gc_moment(0.0, "barrier") is False
-    assert fw.gc_moment(0.0, "idle") is True
-    assert fw.gc_moment(80.0, "idle") is True
-    assert fw.gc_moment(100.0, "idle") is True
-    assert fw.gc_moment(80.0, "run") is False
-    assert fw.gc_moment(80.0, "end_sw") is False
-    assert fw.gc_moment(80.0, "barrier") is False
-    assert fw.gc_moment(120.0, "idle") is True
-    assert fw.gc_moment(120.0, "run") is False
-    assert fw.gc_moment(None, "run") is False
-    assert fw.gc_moment(None, "idle") is True
+    assert main_src.index("_gc_after_present") < main_src.index("pace_after")
+    assert after_src.count("gc.collect(") == 1
+    assert "while" not in after_src
+    assert "for " not in after_src
 
     import gc
     calls = {"n": 0}
+    walks = {"n": 0}
     saved = {
         "collect": gc.collect,
         "disable": getattr(gc, "disable", None),
@@ -304,10 +303,13 @@ def main():
         "mem_alloc": getattr(gc, "mem_alloc", None),
         "mem_free": getattr(gc, "mem_free", None),
     }
-    state = {"disabled": False, "enabled": True, "th": None, "alloc": 0}
+    state = {"disabled": False, "enabled": True, "th": None}
+    clock = {"t": 5000000, "dur": 0}
+    saved_mono = fw._mono_us
 
     def _collect():
         calls["n"] += 1
+        clock["t"] += clock["dur"]
 
     def _disable():
         state["disabled"] = True
@@ -323,10 +325,15 @@ def main():
         return state["th"]
 
     def _mem_alloc():
-        return state["alloc"]
+        walks["n"] += 1
+        return 1000
 
     def _mem_free():
+        walks["n"] += 1
         return 7 * 1024 * 1024
+
+    def _mono():
+        return clock["t"]
 
     gc.collect = _collect
     gc.disable = _disable
@@ -342,6 +349,7 @@ def main():
         assert state["th"] == fw.GC_AUTO_BYTES
         assert state["disabled"] is True
         assert state["enabled"] is False
+        assert walks["n"] == 0, walks
         # The live read is what the gcthresh line records.
         piece = None
         i = 0
@@ -358,123 +366,63 @@ def main():
             i += 1
         assert saw_off
 
-        def _reset(mark, alloc):
-            calls["n"] = 0
-            fw._GC_ALLOC_MARK = mark
-            fw._GC_CHECK_N = 0
-            fw._GC_DUE_AT = None
-            fw._PAUSE_N = 0
-            state["alloc"] = alloc
-
-        # Not due yet: a full check interval under the byte gap does not collect.
-        _reset(1000, 1000 + fw.GC_BETWEEN_BYTES - 1)
-        n = 0
-        while n < fw.GC_CHECK_FRAMES:
-            fw._gc_after_present(1000, 0.0, "idle")
-            n += 1
-        assert calls["n"] == 0, calls
-        # The next presents still do not collect. The sample already ran.
-        fw._gc_after_present(1100, 0.0, "idle")
-        assert calls["n"] == 0
-
-        # Crossing the gap on a stop collects once, on that sample, not every frame.
-        _reset(1000, 1000 + fw.GC_BETWEEN_BYTES)
-        n = 0
-        while n < fw.GC_CHECK_FRAMES - 1:
-            fw._gc_after_present(2000, 0.0, "idle")
-            n += 1
-        assert calls["n"] == 0
-        fw._gc_after_present(2000, 0.0, "idle")
+        # A slice is not a pause line and does not walk the heap.
+        # A finish longer than one slice is logged without a walk.
+        fw._mono_us = _mono
+        clock["dur"] = 3000
+        held = fw._PAUSE_N
+        gc.collect()
         assert calls["n"] == 1
-        fw._gc_after_present(2016, 0.0, "idle")
-        fw._gc_after_present(2032, 0.0, "idle")
-        assert calls["n"] == 1
-
-        # Mid-boost defers. A stop ends the wait. The bound collects anyway.
-        _reset(0, fw.GC_BETWEEN_BYTES)
-        n = 0
-        while n < fw.GC_CHECK_FRAMES:
-            fw._gc_after_present(5000, 140.0, "run")
-            n += 1
-        assert calls["n"] == 0
-        assert fw._GC_DUE_AT == 5000
-        saw_defer = False
+        assert fw._PAUSE_N == held
+        assert walks["n"] == 0, walks
+        clock["dur"] = 180000
+        fw._PAUSE_N = 0
+        gc.collect()
+        assert calls["n"] == 2
+        assert walks["n"] == 0, walks
+        saw_full = False
         i = 0
         while i < fw._PAUSE_N:
-            if fw._PAUSE_CAUSE[i] == "gcdefer":
-                saw_defer = fw._pause_piece(i) == "gcdefer %dms" % fw.GC_DEFER_MS
+            if fw._PAUSE_CAUSE[i] == "collect":
+                saw_full = "na>na" in fw._pause_piece(i)
             i += 1
-        assert saw_defer
-        fw._gc_after_present(5000 + fw.GC_DEFER_MS - 1, 140.0, "run")
-        assert calls["n"] == 0
-        fw._gc_after_present(5000 + fw.GC_DEFER_MS - 1, 80.0, "run")
-        assert calls["n"] == 0, "aura still up"
-        fw._gc_after_present(7000, 0.0, "run")
-        assert calls["n"] == 0, "end sequence still playing"
-        fw._gc_after_present(7000, 0.0, "idle")
-        assert calls["n"] == 1
-        assert fw._GC_DUE_AT is None
+        assert saw_full
+        fw._mono_us = saved_mono
+        clock["dur"] = 0
 
-        _reset(0, fw.GC_BETWEEN_BYTES + 50)
+        # Room for one slice: exactly one call. The next frame is another
+        # single call, not a burst left over from the first. A late frame
+        # and a leftover under the margin skip. Heap counters stay put.
+        calls["n"] = 0
+        fw._gc_after_present(16000)
+        assert calls["n"] == 1 and walks["n"] == 0
+        fw._gc_after_present(16000)
+        assert calls["n"] == 2
+        fw._gc_after_present(quantum)
+        fw._gc_after_present(quantum - need + 1)
+        fw._gc_after_present(-5)
+        assert calls["n"] == 2
+        fw._gc_after_present(quantum - need)
+        assert calls["n"] == 3
+        n0 = calls["n"]
         n = 0
-        while n < fw.GC_CHECK_FRAMES:
-            fw._gc_after_present(8000, 130.0, "run")
+        while n < 10:
+            fw._gc_after_present(15000)
             n += 1
-        assert calls["n"] == 0
-        fw._gc_after_present(8000 + fw.GC_DEFER_MS, 130.0, "run")
-        assert calls["n"] == 1
-        saw_wait = False
-        i = 0
-        while i < fw._PAUSE_N:
-            if fw._PAUSE_CAUSE[i] == "gcwait":
-                saw_wait = True
-            i += 1
-        assert saw_wait
+        assert calls["n"] == n0 + 10
+        assert walks["n"] == 0, walks
 
-        # Cruise after the aura sequence is a moment, so the sample collects.
-        _reset(0, fw.GC_BETWEEN_BYTES + 8)
-        n = 0
-        while n < fw.GC_CHECK_FRAMES:
-            fw._gc_after_present(9000, 80.0, "idle")
-            n += 1
-        assert calls["n"] == 1
-
-        # A cruise above 100 km/h is a gap once the aura is idle.
-        # Stopped mid-barrier is not, until the defer cap.
-        _reset(0, fw.GC_BETWEEN_BYTES + 8)
-        n = 0
-        while n < fw.GC_CHECK_FRAMES:
-            fw._gc_after_present(12000, 160.0, "idle")
-            n += 1
-        assert calls["n"] == 1
-        _reset(0, fw.GC_BETWEEN_BYTES + 8)
-        n = 0
-        while n < fw.GC_CHECK_FRAMES:
-            fw._gc_after_present(13000, 0.0, "barrier")
-            n += 1
-        assert calls["n"] == 0
-        assert fw._GC_DUE_AT == 13000
-        fw._gc_after_present(13000 + fw.GC_DEFER_MS - 1, 0.0, "barrier")
-        assert calls["n"] == 0
-        fw._gc_after_present(13000 + fw.GC_DEFER_MS, 0.0, "barrier")
-        assert calls["n"] == 1
-
-        # Low-free still collects after the present, not on the timing line.
-        _reset(0, 0)
-        fw._GC_FREE_AT = None
-        fw._GC_COLLECT_AT = None
-        state["alloc"] = 0
-
-        def _crit_free():
-            return fw.GC_CRITICAL_FREE - 1
-
-        gc.mem_free = _crit_free
-        fw._gc_after_present(14000, 0.0, "run")
-        assert calls["n"] == 1, "critical free collects during the aura"
-        fw._gc_after_present(14100, 0.0, "run")
-        assert calls["n"] == 1, "critical does not collect every frame"
-        gc.mem_free = _mem_free
+        # Hitch lines used to print free= by walking the heap.
+        fw._PAUSE_N = 0
+        fw._pause_on_slow("left", 121100)
+        fw._pause_on_slow("sonic", 88400)
+        assert walks["n"] == 0, walks
+        assert fw._pause_piece(0).startswith("stall left ")
+        assert "free na" in fw._pause_piece(0)
+        assert fw._pause_piece(1).startswith("stall sonic ")
+        assert "free na" in fw._pause_piece(1)
     finally:
+        fw._mono_us = saved_mono
         gc.collect = saved["collect"]
         if saved["disable"] is None:
             del gc.disable
@@ -639,6 +587,176 @@ def main():
             del gc.mem_free
         else:
             gc.mem_free = saved_free
+
+    # Boot mark matches splash_128.png pixel for pixel, and the panel is
+    # not cleared before that paint or before the cache build.
+    import splash_mark
+    assert splash_mark.W == 128 and splash_mark.H == 128
+    assert len(splash_mark.BITS) == 2048
+    assert splash_mark.white_count() == 2512
+    png = open(os.path.join(ROOT, "splash_128.png"), "rb").read()
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    import struct
+    import zlib
+    pos = 8
+    idat = b""
+    while pos < len(png):
+        ln = struct.unpack(">I", png[pos:pos + 4])[0]
+        typ = png[pos + 4:pos + 8]
+        chunk = png[pos + 8:pos + 8 + ln]
+        if typ == b"IHDR":
+            assert struct.unpack(">IIBB", chunk[:10])[:4] == (128, 128, 8, 2)
+        elif typ == b"IDAT":
+            idat += chunk
+        pos += 12 + ln
+    raw = zlib.decompress(idat)
+    stride = 128 * 3
+    prev = bytearray(stride)
+    at = 0
+    y = 0
+    while y < 128:
+        filt = raw[at]
+        at += 1
+        row = bytearray(raw[at:at + stride])
+        at += stride
+        x = 0
+        if filt == 1 or filt == 3 or filt == 4:
+            pass
+        if filt == 0:
+            pass
+        elif filt == 1:
+            x = 0
+            while x < stride:
+                left = row[x - 3] if x >= 3 else 0
+                row[x] = (row[x] + left) & 255
+                x += 1
+        elif filt == 2:
+            x = 0
+            while x < stride:
+                row[x] = (row[x] + prev[x]) & 255
+                x += 1
+        elif filt == 3:
+            x = 0
+            while x < stride:
+                left = row[x - 3] if x >= 3 else 0
+                row[x] = (row[x] + ((left + prev[x]) // 2)) & 255
+                x += 1
+        elif filt == 4:
+            x = 0
+            while x < stride:
+                a = row[x - 3] if x >= 3 else 0
+                b = prev[x]
+                c = prev[x - 3] if x >= 3 else 0
+                p = a + b - c
+                pa = abs(p - a)
+                pb = abs(p - b)
+                pc = abs(p - c)
+                if pa <= pb and pa <= pc:
+                    pr = a
+                elif pb <= pc:
+                    pr = b
+                else:
+                    pr = c
+                row[x] = (row[x] + pr) & 255
+                x += 1
+        else:
+            raise AssertionError(filt)
+        x = 0
+        while x < 128:
+            px = row[x * 3:x * 3 + 3]
+            white = px == b"\xff\xff\xff"
+            assert px == b"\x00\x00\x00" or white
+            assert splash_mark._bit(x, y) is white
+            x += 1
+        prev = row
+        y += 1
+
+    class _Panel(object):
+        def __init__(self):
+            self.calls = []
+
+        def drawRawBuf(self, buf, x, y, w, h, n, swap):
+            self.calls.append((x, y, w, h, n, swap, bytes(buf[:w * h * 2])))
+
+        def fillScreen(self, color):
+            raise AssertionError("splash must not clear")
+
+    panel = _Panel()
+    assert splash_mark.show(panel) is True
+    assert len(panel.calls) == 16
+    y = 0
+    covered = 0
+    for call in panel.calls:
+        assert call[0] == 0 and call[1] == y and call[2] == 128 and call[3] == 8
+        assert call[4] == 128 * 8 and call[5] is True
+        covered += call[3]
+        y += 8
+    assert covered == 128
+    # Top-left of the mark is black. A white pixel expands to 0xFFFF.
+    assert panel.calls[0][6][0:2] == b"\x00\x00"
+    saw_white = False
+    for call in panel.calls:
+        if b"\xff\xff" in call[6]:
+            saw_white = True
+    assert saw_white
+
+    boot = open(os.path.join(ROOT, "boot.py"), "r").read()
+    assert boot.index("splash_mark.show") < boot.index("boot_check")
+    assert "import main" not in boot
+    assert "clear_display" in boot
+    begin_src = inspect.getsource(fw._begin_keep_splash)
+    assert "clear_display" in begin_src and "False" in begin_src
+    main_src = inspect.getsource(fw.main)
+    assert main_src.index("_begin_keep_splash") < main_src.index("_show_boot_splash")
+    assert main_src.index("_show_boot_splash") < main_src.index("try_load_pixidx")
+    assert main_src.index("try_load_pixidx") < main_src.index("Dashboard(")
+    assert fw.APP_VERSION == 16
+    assert fw.FACE_ENABLED is False
+
+    # Cruise was ~36 ms because a 26 KB present copy and a mid-paint
+    # yield sat on top of the paint. The push blocks, so the copy is
+    # skipped. The yield is not between compose and the stamp plan.
+    sp = fw.Sprite(None)
+    src = bytearray(b"\x11\x22")
+    sp.present_buf = bytearray(b"\x00\x00")
+    assert sp._present_copy(src) is src
+    assert sp.present_buf == bytearray(b"\x00\x00")
+    paint_src = inspect.getsource(fw.Sprite._paint_native)
+    assert "offs_ready" in paint_src
+    assert "_service(" not in paint_src
+    draw_src = inspect.getsource(fw.Sprite._draw_native_frame)
+    assert draw_src.index("_fill_native_offs") < draw_src.index("_paint_native")
+
+    # A sparkle slot that is an int used to fail the native paint, then
+    # the fallback blit raised again and rebooted. It is dropped instead.
+    sp.sparkles = [[3, 78, 1, 0], 9, "nope", [1, 2]]
+    fw._PAUSE_N = 0
+    sp._purge_sparkles()
+    assert sp.sparkles == [[3, 78, 1, 0]]
+    assert fw._pause_piece(0) == "spark drop 3"
+    sp.pack = None
+    sp.sparkles = [9, [8, 78, 0, 0]]
+    sp._step_sparkles(16)
+    assert sp.sparkles == []
+
+    class _SparkPack(object):
+        def __init__(self):
+            self.cycles = {"rings_sparkle": [object()]}
+            self.by_name = {}
+
+    sp.pack = _SparkPack()
+    sp.sparkles = [4]
+    sp._blit_playfield_sprites(None, None, None, 0)
+    assert sp.sparkles == []
+    sp.sparkles = [5]
+    sp._planned = []
+    sp._plan_places_at(0)
+    assert sp.sparkles == []
+    sp._native_ready = False
+    sp.sparkles = [6]
+    assert sp._native_same_at(0, 0, 0, 0) is False
+    assert sp.sparkles == []
+    assert fw._BRK_PRINT_MS == 2000
 
     print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped, "vtec", int(peak_rpm))
 
