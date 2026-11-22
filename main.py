@@ -2395,7 +2395,7 @@ def _pause_maybe_print():
 
 
 def _install_pause_gc():
-    """Time every gc.collect. Read the auto threshold once. Do not set it."""
+    """Time every gc.collect. Set the auto threshold, then log the live value."""
     try:
         import gc
     except ImportError:
@@ -2428,18 +2428,28 @@ def _install_pause_gc():
     if fn is None:
         return
     try:
-        val = fn()
-    except TypeError:
-        return
+        fn(24576)
     except Exception:
-        return
+        # The write failed, so the previous threshold is unchanged.
+        # The read below still runs, and that live value is what we log.
+        pass
+    val = None
+    try:
+        val = fn()
+    except Exception:
+        val = None
     if isinstance(val, tuple):
         if not val:
-            return
-        val = val[0]
+            val = None
+        else:
+            val = val[0]
     try:
         val = int(val)
     except Exception:
+        val = None
+    if val is None:
+        # Do not claim 24576. -1 means the live value could not be read.
+        _pause_push("gcthresh", "gc", 0, -1, 0)
         return
     _pause_push("gcthresh", "gc", 0, val, 0)
 
