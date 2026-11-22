@@ -713,6 +713,20 @@ def main():
     assert fw.APP_VERSION == 16
     assert fw.FACE_ENABLED is False
 
+    # Cruise was ~36 ms because a 26 KB present copy and a mid-paint
+    # yield sat on top of the paint. The push blocks, so the copy is
+    # skipped. The yield is not between compose and the stamp plan.
+    sp = fw.Sprite(None)
+    src = bytearray(b"\x11\x22")
+    sp.present_buf = bytearray(b"\x00\x00")
+    assert sp._present_copy(src) is src
+    assert sp.present_buf == bytearray(b"\x00\x00")
+    paint_src = inspect.getsource(fw.Sprite._paint_native)
+    assert "offs_ready" in paint_src
+    assert "_service(" not in paint_src
+    draw_src = inspect.getsource(fw.Sprite._draw_native_frame)
+    assert draw_src.index("_fill_native_offs") < draw_src.index("_paint_native")
+
     print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped, "vtec", int(peak_rpm))
 
 

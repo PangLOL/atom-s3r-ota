@@ -5997,11 +5997,12 @@ class Sprite:
             prev.append((item[0], item[1], item[2]))
         self._native_ready = True
 
-    def _paint_native(self, amount, with_fx):
+    def _paint_native(self, amount, with_fx, offs_ready=False):
         """Fill play_window. Fills _paint_us: compose, stamp, hud, sonic, rings, fx, digits.
 
         with_fx draws boost and the ring digits into the same buffer. The
         playfield underneath matches a full V15 compose plus stamp.
+        offs_ready means the caller already wrote the scroll offsets.
         """
         gh = _GH
         window = self.play_window
@@ -6010,7 +6011,8 @@ class Sprite:
         vh = self._playfield_vh()
         tw = self.ocean_tw
         tile = self.ocean_rgb565
-        self._fill_native_offs(self.scroll)
+        if not offs_ready:
+            self._fill_native_offs(self.scroll)
         off_c = self._off_c
         off_w = self._off_w
         off_g = self._off_g
@@ -6027,7 +6029,9 @@ class Sprite:
         finally:
             _brk_exit()
         t1 = _mono_us()
-        _service()
+        # No yield here. A service call is a VM safe point, and the sliced
+        # collector takes another ~3 ms slice once 12 ms have passed. The
+        # tick already polls the button around this paint.
         places = self._plan_places(amount)
         hud_us = 0
         sonic_us = 0
@@ -6114,18 +6118,13 @@ class Sprite:
         return times
 
     def _present_copy(self, src):
-        """Copy a finished playfield into the buffer the panel will read."""
-        _brk_enter("copy")
-        try:
-            dst = self.present_buf
-            if src is None:
-                return src
-            if dst is None or len(dst) != len(src):
-                return src
-            dst[:] = src
-            return dst
-        finally:
-            _brk_exit()
+        """Hand the playfield to the push. The driver blocks until SPI is done.
+
+        A 26 KB copy was ~2.3 ms on every cruise frame and still left the
+        next compose waiting, because drawRawBuf does not return early.
+        The next compose overwrites this buffer only after that return.
+        """
+        return src
 
     def _draw_native_frame(self, lcd, amount, fault=False):
         """Compose, stamp, and push through C. False falls back to Python."""
@@ -6155,7 +6154,7 @@ class Sprite:
         if self._native_same(off_c, off_w, off_g, amount):
             held = 1
         else:
-            times = self._paint_native(amount, True)
+            times = self._paint_native(amount, True, True)
             compose_us = times[0]
             stamp_us = times[1]
             hud_us = times[2]
