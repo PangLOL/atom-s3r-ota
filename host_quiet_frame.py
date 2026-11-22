@@ -588,6 +588,131 @@ def main():
         else:
             gc.mem_free = saved_free
 
+    # Boot mark matches splash_128.png pixel for pixel, and the panel is
+    # not cleared before that paint or before the cache build.
+    import splash_mark
+    assert splash_mark.W == 128 and splash_mark.H == 128
+    assert len(splash_mark.BITS) == 2048
+    assert splash_mark.white_count() == 2512
+    png = open(os.path.join(ROOT, "splash_128.png"), "rb").read()
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    import struct
+    import zlib
+    pos = 8
+    idat = b""
+    while pos < len(png):
+        ln = struct.unpack(">I", png[pos:pos + 4])[0]
+        typ = png[pos + 4:pos + 8]
+        chunk = png[pos + 8:pos + 8 + ln]
+        if typ == b"IHDR":
+            assert struct.unpack(">IIBB", chunk[:10])[:4] == (128, 128, 8, 2)
+        elif typ == b"IDAT":
+            idat += chunk
+        pos += 12 + ln
+    raw = zlib.decompress(idat)
+    stride = 128 * 3
+    prev = bytearray(stride)
+    at = 0
+    y = 0
+    while y < 128:
+        filt = raw[at]
+        at += 1
+        row = bytearray(raw[at:at + stride])
+        at += stride
+        x = 0
+        if filt == 1 or filt == 3 or filt == 4:
+            pass
+        if filt == 0:
+            pass
+        elif filt == 1:
+            x = 0
+            while x < stride:
+                left = row[x - 3] if x >= 3 else 0
+                row[x] = (row[x] + left) & 255
+                x += 1
+        elif filt == 2:
+            x = 0
+            while x < stride:
+                row[x] = (row[x] + prev[x]) & 255
+                x += 1
+        elif filt == 3:
+            x = 0
+            while x < stride:
+                left = row[x - 3] if x >= 3 else 0
+                row[x] = (row[x] + ((left + prev[x]) // 2)) & 255
+                x += 1
+        elif filt == 4:
+            x = 0
+            while x < stride:
+                a = row[x - 3] if x >= 3 else 0
+                b = prev[x]
+                c = prev[x - 3] if x >= 3 else 0
+                p = a + b - c
+                pa = abs(p - a)
+                pb = abs(p - b)
+                pc = abs(p - c)
+                if pa <= pb and pa <= pc:
+                    pr = a
+                elif pb <= pc:
+                    pr = b
+                else:
+                    pr = c
+                row[x] = (row[x] + pr) & 255
+                x += 1
+        else:
+            raise AssertionError(filt)
+        x = 0
+        while x < 128:
+            px = row[x * 3:x * 3 + 3]
+            white = px == b"\xff\xff\xff"
+            assert px == b"\x00\x00\x00" or white
+            assert splash_mark._bit(x, y) is white
+            x += 1
+        prev = row
+        y += 1
+
+    class _Panel(object):
+        def __init__(self):
+            self.calls = []
+
+        def drawRawBuf(self, buf, x, y, w, h, n, swap):
+            self.calls.append((x, y, w, h, n, swap, bytes(buf[:w * h * 2])))
+
+        def fillScreen(self, color):
+            raise AssertionError("splash must not clear")
+
+    panel = _Panel()
+    assert splash_mark.show(panel) is True
+    assert len(panel.calls) == 16
+    y = 0
+    covered = 0
+    for call in panel.calls:
+        assert call[0] == 0 and call[1] == y and call[2] == 128 and call[3] == 8
+        assert call[4] == 128 * 8 and call[5] is True
+        covered += call[3]
+        y += 8
+    assert covered == 128
+    # Top-left of the mark is black. A white pixel expands to 0xFFFF.
+    assert panel.calls[0][6][0:2] == b"\x00\x00"
+    saw_white = False
+    for call in panel.calls:
+        if b"\xff\xff" in call[6]:
+            saw_white = True
+    assert saw_white
+
+    boot = open(os.path.join(ROOT, "boot.py"), "r").read()
+    assert boot.index("splash_mark.show") < boot.index("boot_check")
+    assert "import main" not in boot
+    assert "clear_display" in boot
+    begin_src = inspect.getsource(fw._begin_keep_splash)
+    assert "clear_display" in begin_src and "False" in begin_src
+    main_src = inspect.getsource(fw.main)
+    assert main_src.index("_begin_keep_splash") < main_src.index("_show_boot_splash")
+    assert main_src.index("_show_boot_splash") < main_src.index("try_load_pixidx")
+    assert main_src.index("try_load_pixidx") < main_src.index("Dashboard(")
+    assert fw.APP_VERSION == 16
+    assert fw.FACE_ENABLED is False
+
     print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped, "vtec", int(peak_rpm))
 
 

@@ -6895,10 +6895,35 @@ def pull_frames(bus, values):
     return n
 
 
+def _begin_keep_splash():
+    """Start M5 without clearing the panel.
+
+    board_init already called M5.begin before Python, and the UiFlow
+    wrapper clears again when clear_display stays at its default. That
+    clear is the black hold through the ocean and sprite caches. The
+    boot mark stays up until the first playfield push covers it.
+    """
+    try:
+        M5.begin({"clear_display": False})
+    except Exception:
+        pass
+
+
+def _show_boot_splash(lcd):
+    try:
+        import splash_mark
+        splash_mark.show(lcd)
+    except Exception:
+        pass
+
+
 def main():
     global _BTN_HOOK
-    M5.begin()
+    _begin_keep_splash()
     lcd = Lcd
+    # Paint again in case this boot did not come through boot.py. The
+    # mark then stays through pixidx load and the sprite cache.
+    _show_boot_splash(lcd)
     pack = try_load_pixidx()
     sweep = Sweep()
     button = ButtonWatch(find_btn(), sweep.start)
