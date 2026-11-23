@@ -1766,9 +1766,91 @@ def _make_stamp(tile, tw, pts, factor):
             sbuf[di * 2] = val & 0xFF
             sbuf[di * 2 + 1] = (val >> 8) & 0xFF
             mask[di >> 3] |= 1 << (di & 7)
+        _drop_stamp_palms(mask, sw, sh)
         spans = _opaque_spans(mask, sw, sh)
         stamps.append((factor, x0, y0, sw, sh, sbuf, mask, spans))
     return stamps
+
+
+def _drop_stamp_palms(mask, sw, sh):
+    """Clear a palm that was lifted with the loop hill.
+
+    The island is the widest run of columns that reach the bottom of the
+    stamp. A narrow run beside it is a trunk, and the columns outside
+    that island on the trunk's side are fronds. Those columns stay in
+    the bitmap so the hill does not move, but they no longer draw.
+    """
+    if sw < 16 or sh < 16:
+        return
+    ground = sh - 3
+    grounded = []
+    x = 0
+    while x < sw:
+        bot = False
+        y = ground
+        while y < sh:
+            di = y * sw + x
+            if mask[di >> 3] & (1 << (di & 7)):
+                bot = True
+                break
+            y += 1
+        grounded.append(1 if bot else 0)
+        x += 1
+    runs = []
+    x = 0
+    while x < sw:
+        if not grounded[x]:
+            x += 1
+            continue
+        a = x
+        while x < sw and grounded[x]:
+            x += 1
+        runs.append((a, x - 1))
+    if not runs:
+        return
+    island = runs[0]
+    best = island[1] - island[0]
+    i = 1
+    while i < len(runs):
+        run = runs[i]
+        w = run[1] - run[0]
+        if w > best:
+            island = run
+            best = w
+        i += 1
+    drop = []
+    x = 0
+    while x < sw:
+        drop.append(0)
+        x += 1
+    for a, b in runs:
+        if a == island[0] and b == island[1]:
+            continue
+        if (b - a) > 8:
+            continue
+        if b < island[0]:
+            x = a
+            end = island[0]
+        else:
+            x = island[1] + 1
+            end = b + 1
+        while x < end:
+            drop[x] = 1
+            x += 1
+    x = sw - 1
+    while x > island[1]:
+        drop[x] = 1
+        x -= 1
+    x = 0
+    while x < sw:
+        if drop[x]:
+            y = 0
+            while y < sh:
+                di = y * sw + x
+                bit = 1 << (di & 7)
+                mask[di >> 3] = mask[di >> 3] & (255 ^ bit)
+                y += 1
+        x += 1
 
 
 def _opaque_spans(mask, sw, sh):
@@ -2363,6 +2445,7 @@ def finish_ocean_background(tile, tw, th):
     sea_top = HORIZON_Y + 4
     if sea_top < grass_y:
         _replace_distant_echoes(tile, tw, sea_top, grass_y)
+        _close_sea_seams(tile, tw, sea_top, grass_y)
     # Dirt rows 100-102 stay on the 12px checker. Only the grass above them
     # is closed, so a tuft join cannot open a hole.
     grass_bot = grass_y + 12
@@ -2414,6 +2497,160 @@ def _replace_distant_echoes(tile, tw, y0, y1):
         while y < y1:
             _set_565(tile, tw, x, y, _565_at(tile, tw, src, y))
             y += 1
+
+
+def _sea_dist(a, b):
+    ar = (a >> 11) & 31
+    ag = (a >> 5) & 63
+    ab = a & 31
+    br = (b >> 11) & 31
+    bg = (b >> 5) & 63
+    bb = b & 31
+    dr = ar - br
+    dg = ag - bg
+    db = ab - bb
+    if dr < 0:
+        dr = -dr
+    if dg < 0:
+        dg = -dg
+    if db < 0:
+        db = -db
+    return dr + dg + db
+
+
+def _sea_lerp(a, b, t):
+    ar = (a >> 11) & 31
+    ag = (a >> 5) & 63
+    ab = a & 31
+    br = (b >> 11) & 31
+    bg = (b >> 5) & 63
+    bb = b & 31
+    r = int(ar + (br - ar) * t + 0.5)
+    g = int(ag + (bg - ag) * t + 0.5)
+    bl = int(ab + (bb - ab) * t + 0.5)
+    if r < 0:
+        r = 0
+    elif r > 31:
+        r = 31
+    if g < 0:
+        g = 0
+    elif g > 63:
+        g = 63
+    if bl < 0:
+        bl = 0
+    elif bl > 31:
+        bl = 31
+    return (r << 11) | (g << 5) | bl
+
+
+def _sea_boundary(tile, tw, y0, y1):
+    scores = []
+    x = 0
+    while x < tw:
+        d = 0
+        y = y0
+        while y < y1:
+            d += _sea_dist(
+                _565_at(tile, tw, x, y),
+                _565_at(tile, tw, (x + 1) % tw, y),
+            )
+            y += 1
+        scores.append(d)
+        x += 1
+    return scores
+
+
+def _close_sea_seams(tile, tw, y0, y1):
+    """Join the sea across an echoed column and across a hard vertical cut.
+
+    A long run of identical columns is an echo left by the copy pass. It
+    is repainted as a ramp from the water beside it, so the copy and the
+    cut at its edge are gone. Any cut that is still much harder than the
+    waves, including the tile wrap, is spread across a few columns. The
+    grass is not touched. The join lives in the tile, so a faster scroll
+    does not open it again.
+    """
+    if y1 <= y0 or tw < 8:
+        return
+    scores = _sea_boundary(tile, tw, y0, y1)
+    flat = []
+    x = 0
+    while x < tw:
+        if scores[x] >= 40:
+            x += 1
+            continue
+        a = x
+        while x < tw and scores[x] < 40:
+            x += 1
+        if x - a >= 6:
+            flat.append((a, x - 1))
+    for a, b in flat:
+        left = (a - 1) % tw
+        right = (b + 2) % tw
+        n = (b + 1) - a + 1
+        i = 0
+        col = a
+        while i < n:
+            t = (i + 1) / float(n)
+            y = y0
+            while y < y1:
+                c = _sea_lerp(
+                    _565_at(tile, tw, left, y),
+                    _565_at(tile, tw, right, y),
+                    t,
+                )
+                _set_565(tile, tw, col, y, c)
+                y += 1
+            col = (col + 1) % tw
+            i += 1
+    scores = _sea_boundary(tile, tw, y0, y1)
+    order = sorted(scores)
+    med = order[len(order) // 2]
+    limit = med * 2
+    if limit < 560:
+        limit = 560
+    seams = []
+    x = 0
+    while x < tw:
+        if scores[x] >= limit:
+            seams.append(x)
+        x += 1
+    if not seams:
+        return
+    height = y1 - y0
+    band = bytearray(tw * height * 2)
+    y = y0
+    while y < y1:
+        x = 0
+        while x < tw:
+            v = _565_at(tile, tw, x, y)
+            i = ((y - y0) * tw + x) * 2
+            band[i] = v & 255
+            band[i + 1] = (v >> 8) & 255
+            x += 1
+        y += 1
+    half = 6
+    for bseam in seams:
+        left = (bseam - half) % tw
+        right = (bseam + 1 + half) % tw
+        span = (right - left) % tw
+        if span < 2:
+            continue
+        i = 1
+        while i < span:
+            col = (left + i) % tw
+            t = i / float(span)
+            k = 0
+            y = y0
+            while y < y1:
+                si = (k * tw + left) * 2
+                di = (k * tw + right) * 2
+                la = band[si] | (band[si + 1] << 8)
+                ra = band[di] | (band[di + 1] << 8)
+                _set_565(tile, tw, col, y, _sea_lerp(la, ra, t))
+                k += 1
+                y += 1
+            i += 1
 
 
 def _keep_hill_loop(pts, tw):
@@ -3089,26 +3326,31 @@ def gc_slice_room(spent_us, quantum_us=None):
 
 
 def _gc_after_present(spent_us):
-    """One sliced collect after the present, when this frame has room.
+    """One sliced collect after the present.
 
-    The panel already has this frame. When the leftover of the 33 ms
-    budget covers one slice plus a small margin, this calls collect
-    once with no arguments and returns. On the flashed Atom S3R VM that
-    call is one slice of about 3 ms. Later bytecode and the event poll
-    continue that cycle, at least 12 ms apart. A late frame skips.
-    This does not loop, and it does not wait out a deferral and then
-    start a cycle. It does not read the heap: a free or alloc sample
-    walks every block, and the sweep may not have finished.
+    The panel already has this frame. On the flashed Atom S3R VM,
+    collect() with no argument is one slice of about 3 ms. Later
+    bytecode and the event poll continue that cycle, at least 12 ms
+    apart. A frame that already used the 33 ms budget used to skip the
+    slice. On a drive every frame can be late, so nothing collects
+    until an allocation finishes the rest of the cycle in one stall.
+    That stall freezes the picture and the task watchdog resets the
+    board: the last frame holds, the panel goes dark, the boot splash
+    returns, and the ring count starts over. One slice still runs.
+    A negative spent means the clock wrapped, and that call is skipped.
+    This does not loop, and it does not read the heap.
     """
-    if not gc_slice_room(spent_us):
+    if spent_us < 0:
         return
     _brk_enter("gc")
     try:
+        _feed_wdt()
         try:
             import gc
             gc.collect()
         except Exception:
             pass
+        _feed_wdt()
     finally:
         _brk_exit()
 
@@ -8077,127 +8319,139 @@ def main():
     except Exception:
         bus = None
 
+    loop_err_ms = 0
     while True:
-        iter_us = _mono_us()
-        _feed_wdt()
-        if next_draw is not None:
-            # Sleep the microsecond leftover once. Do not come back and
-            # sleep_ms a remainder smaller than the 10 ms tick.
-            remain = _us_diff(next_draw, _mono_us())
-            if remain > 0:
-                _feed_wdt()
-                _brk_enter("sleep")
+        try:
+            iter_us = _mono_us()
+            _feed_wdt()
+            if next_draw is not None:
+                # Sleep the microsecond leftover once. Do not come back and
+                # sleep_ms a remainder smaller than the 10 ms tick.
+                remain = _us_diff(next_draw, _mono_us())
+                if remain > 0:
+                    _feed_wdt()
+                    _brk_enter("sleep")
+                    try:
+                        _sleep_us(remain)
+                    finally:
+                        _brk_exit()
+            now = time.ticks_ms()
+            if present_t0 is None:
+                present_t0 = now
+            frame_started = _mono_us()
+            _report_presented(now)
+            button.poll(now)
+            _poll_flash_quiet()
+
+            if sweep.active:
+                _brk_enter("sweep")
                 try:
-                    _sleep_us(remain)
+                    swept = sweep.step(now)
+                    if swept is not None:
+                        values.update(swept)
+                    fault = False
                 finally:
                     _brk_exit()
-        now = time.ticks_ms()
-        if present_t0 is None:
-            present_t0 = now
-        frame_started = _mono_us()
-        _report_presented(now)
-        button.poll(now)
-        _poll_flash_quiet()
-
-        if sweep.active:
-            _brk_enter("sweep")
-            try:
-                swept = sweep.step(now)
-                if swept is not None:
-                    values.update(swept)
-                fault = False
-            finally:
-                _brk_exit()
-        else:
-            _brk_enter("can")
-            try:
-                if bus is not None:
-                    if pull_frames(bus, values):
-                        last_rx_ms = now
-                fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
-            finally:
-                _brk_exit()
-
-        _brk_enter("auto")
-        try:
-            start_auto, boot_sweep_armed, sweep_idle_since = auto_sweep_due(
-                now,
-                present_t0,
-                sweep.active,
-                live_can(bus, last_rx_ms, now),
-                boot_sweep_armed,
-                sweep_idle_since,
-                _auto_sweep_enabled,
-            )
-            if start_auto:
-                sweep.start(now)
-                swept = sweep.step(now)
-                if swept is not None:
-                    values.update(swept)
-                fault = False
-                _brk_enter("serial")
+            else:
+                _brk_enter("can")
                 try:
-                    print("auto-sweep")
+                    if bus is not None:
+                        if pull_frames(bus, values):
+                            last_rx_ms = now
+                    fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
                 finally:
                     _brk_exit()
-        finally:
-            _brk_exit()
 
-        if OTA_ENABLED and ota_client is not None and (
-            last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
-        ):
-            _brk_enter("ota")
+            _brk_enter("auto")
             try:
-                last_ota_ms = now
-                _service()
+                start_auto, boot_sweep_armed, sweep_idle_since = auto_sweep_due(
+                    now,
+                    present_t0,
+                    sweep.active,
+                    live_can(bus, last_rx_ms, now),
+                    boot_sweep_armed,
+                    sweep_idle_since,
+                    _auto_sweep_enabled,
+                )
+                if start_auto:
+                    sweep.start(now)
+                    swept = sweep.step(now)
+                    if swept is not None:
+                        values.update(swept)
+                    fault = False
+                    _brk_enter("serial")
+                    try:
+                        print("auto-sweep")
+                    finally:
+                        _brk_exit()
+            finally:
+                _brk_exit()
+
+            if OTA_ENABLED and ota_client is not None and (
+                last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
+            ):
+                _brk_enter("ota")
                 try:
-                    ota_client.poll(now)
-                except Exception:
-                    pass
-            finally:
-                _brk_exit()
+                    last_ota_ms = now
+                    _service()
+                    try:
+                        ota_client.poll(now)
+                    except Exception:
+                        pass
+                finally:
+                    _brk_exit()
 
-        if OTA_ENABLED and ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
-            # Keep retrying while the current pack is missing or was rejected
-            # (a leftover V6 file must not block the download).
-            _brk_enter("pix")
+            if OTA_ENABLED and ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
+                # Keep retrying while the current pack is missing or was rejected
+                # (a leftover V6 file must not block the download).
+                _brk_enter("pix")
+                try:
+                    wifi_ok = False
+                    if ota_client is not None and hasattr(ota_client, "wifi_connected"):
+                        try:
+                            wifi_ok = bool(ota_client.wifi_connected())
+                        except Exception:
+                            wifi_ok = False
+                    if wifi_ok or ota_client is None:
+                        _last_fetch_ms = now
+                        try:
+                            fetched = try_fetch_pixidx()
+                        except Exception:
+                            fetched = None
+                        if fetched is not None:
+                            ui.sprite.pack = fetched
+                            ui.sprite._sync_ground()
+                finally:
+                    _brk_exit()
+
+            _flow_add("loop", _us_diff(_mono_us(), loop_mark))
+            ui.tick(values, fault, now)
+            # The panel has this frame. One slice, including when this frame
+            # already ran long, so a drive cannot fill the heap and stall.
+            _gc_after_present(_us_diff(_mono_us(), frame_started))
+            _brk_enter("pace")
             try:
-                wifi_ok = False
-                if ota_client is not None and hasattr(ota_client, "wifi_connected"):
-                    try:
-                        wifi_ok = bool(ota_client.wifi_connected())
-                    except Exception:
-                        wifi_ok = False
-                if wifi_ok or ota_client is None:
-                    _last_fetch_ms = now
-                    try:
-                        fetched = try_fetch_pixidx()
-                    except Exception:
-                        fetched = None
-                    if fetched is not None:
-                        ui.sprite.pack = fetched
-                        ui.sprite._sync_ground()
+                next_draw = pace_after(frame_started, _mono_us())
             finally:
                 _brk_exit()
-
-        _flow_add("loop", _us_diff(_mono_us(), loop_mark))
-        ui.tick(values, fault, now)
-        # The panel has this frame. One slice only if this 33 ms budget
-        # still has room. The pace below sleeps what remains.
-        _gc_after_present(_us_diff(_mono_us(), frame_started))
-        _brk_enter("pace")
-        try:
-            next_draw = pace_after(frame_started, _mono_us())
-        finally:
-            _brk_exit()
-        loop_mark = _mono_us()
-        _brk_enter("serial")
-        try:
-            _brk_maybe_print(now)
-        finally:
-            _brk_exit()
-        _brk_commit(_us_diff(_mono_us(), iter_us))
-
+            loop_mark = _mono_us()
+            _brk_enter("serial")
+            try:
+                _brk_maybe_print(now)
+            finally:
+                _brk_exit()
+            _brk_commit(_us_diff(_mono_us(), iter_us))
+        except Exception as e:
+            _feed_wdt()
+            try:
+                err_now = time.ticks_ms()
+                if loop_err_ms == 0 or time.ticks_diff(err_now, loop_err_ms) >= 1000:
+                    loop_err_ms = err_now
+                    if _stdout_can_write():
+                        print("loop", e)
+            except Exception:
+                pass
+            _sleep_us(20000)
 
 if __name__ == "__main__":
     try:

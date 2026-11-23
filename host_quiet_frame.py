@@ -485,9 +485,9 @@ def main():
         fw._mono_us = saved_mono
         clock["dur"] = 0
 
-        # Room for one slice: exactly one call. The next frame is another
-        # single call, not a burst left over from the first. A late frame
-        # and a leftover under the margin skip. Heap counters stay put.
+        # One slice per present, including a late frame. Skipping those
+        # let a drive fill the heap until one alloc stalled into a reset.
+        # A negative spent still skips. Heap counters stay put.
         calls["n"] = 0
         fw._gc_after_present(16000)
         assert calls["n"] == 1 and walks["n"] == 0
@@ -496,9 +496,9 @@ def main():
         fw._gc_after_present(quantum)
         fw._gc_after_present(quantum - need + 1)
         fw._gc_after_present(-5)
-        assert calls["n"] == 2
+        assert calls["n"] == 4
         fw._gc_after_present(quantum - need)
-        assert calls["n"] == 3
+        assert calls["n"] == 5
         n0 = calls["n"]
         n = 0
         while n < 10:
@@ -839,7 +839,38 @@ def main():
         assert not (stamp_w <= 28 and stamp_h >= 40)
         if stamp_w >= 40 and stamp_h >= 20:
             wide += 1
+            mask = st[6]
+            # The palm used to occupy the right edge. Those columns are clear.
+            x = stamp_w - 1
+            empty = 0
+            while x >= 0:
+                y = 0
+                hit = False
+                while y < stamp_h:
+                    di = y * stamp_w + x
+                    if mask[di >> 3] & (1 << (di & 7)):
+                        hit = True
+                        break
+                    y += 1
+                if hit:
+                    break
+                empty += 1
+                x -= 1
+            assert empty >= 3, (stamp_w, empty)
+            mid = stamp_w // 2
+            body = 0
+            y = 0
+            while y < stamp_h:
+                di = y * stamp_w + mid
+                if mask[di >> 3] & (1 << (di & 7)):
+                    body += 1
+                y += 1
+            assert body >= 8
     assert wide >= 1
+    sea_top = fw.HORIZON_Y + 4
+    sea_scores = fw._sea_boundary(obuf, otw, sea_top, fw.GRASS_Y)
+    assert sea_scores[otw - 1] < 200, sea_scores[otw - 1]
+    assert max(sea_scores) < 800, max(sea_scores)
 
     class _Rects(object):
         def __init__(self):
