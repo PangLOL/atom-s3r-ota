@@ -615,29 +615,58 @@ def main():
     assert settle["rpm"] < fw.VTEC_OFF_RPM
     assert settle["clt"] == 96.0
     assert sum(stage[0] for stage in fw.Sweep.STAGES) == 9900
-    assert fw.SEAM_STEP_FRAMES == 30 and fw.SEAM_MAX == 10
-    assert fw.SEAM_DIGIT_SCALE == 1
-    assert fw.seam_nudge_for_frame(0) == 0
-    assert fw.seam_nudge_for_frame(29) == 0
-    assert fw.seam_nudge_for_frame(30) == 1
-    assert fw.seam_nudge_for_frame(270) == 9
-    assert fw.seam_nudge_for_frame(300) == 10
-    assert fw.seam_nudge_for_frame(330) == 10
-    assert fw.seam_nudge_for_frame(-1) == 0
-    # 300 presents at the 33 ms pace is the 9900 ms sweep. The last one is index 299.
-    assert fw.seam_nudge_for_frame(299) == 9
-    digit = bytearray(fw.W * fw.H * 2)
-    fw.stamp_seam_digit(digit, fw.W, fw.H, 0)
-    # Top row of "0" lights columns 1..3. Scale 1 is the 7x9 outlined glyph.
-    dx = (fw.W - 5 * fw.SEAM_DIGIT_SCALE) // 2
-    dy = (fw.H - 7 * fw.SEAM_DIGIT_SCALE) // 2
-    on = fw._rgb888_to_565(fw.COL_HUD_DIGIT)
-    pix = digit[(dy * fw.W + dx + fw.SEAM_DIGIT_SCALE) * 2]
-    pix |= digit[(dy * fw.W + dx + fw.SEAM_DIGIT_SCALE) * 2 + 1] << 8
-    assert pix == on
-    blank = bytearray(fw.W * fw.H * 2)
-    fw.stamp_seam_digit(blank, fw.W, fw.H, -1)
-    assert blank == bytearray(len(blank))
+    parked = fw.Sprite(None)
+    parked.advance(0.0, 500, 800.0, 0.0)
+    assert parked.chao_phase == "off"
+    fast = fw.Sprite(None)
+    fast.advance(80.0, 200, 5000.0, 0.0)
+    assert fast.chao_phase == "off"
+    pet = fw.Sprite(None)
+    pet.advance(50.0, 16, 2000.0, 0.0)
+    assert pet.chao_phase == "join" and pet.chao_type == 0
+    assert pet._chao_stamp() is None
+    pet.advance(50.0, fw.CHAO_TRAVEL_MS, 2000.0, 0.0)
+    assert pet.chao_phase == "follow" and int(pet.chao_x) == fw.CHAO_FOLLOW_X
+    pet.chao_i = 0
+    pet.chao_accum = 0
+    pet.advance(50.0, fw.CHAO_FRAME_MS - 1, 2000.0, 0.0)
+    assert pet.chao_i == 0
+    pet.advance(50.0, 1, 2000.0, 0.0)
+    assert pet.chao_i == 1 and pet.chao_phase == "follow"
+    pet.advance(80.0, 16, 5000.0, 0.0)
+    assert pet.chao_phase == "leave"
+    pet.advance(80.0, fw.CHAO_TRAVEL_MS, 5000.0, 0.0)
+    assert pet.chao_phase == "off"
+    pet.advance(40.0, 16, 2000.0, 0.0)
+    assert pet.chao_phase == "join" and pet.chao_type == 1
+
+    class _ChaoFr(object):
+        def __init__(self, name):
+            self.name = name
+            self.w = 17
+            self.h = 21
+            self.origin_x = 8
+            self.origin_y = 11
+
+    class _ChaoPack(object):
+        def __init__(self):
+            self.cycles = {
+                "normal_chao": [_ChaoFr("normal_chao_%d" % i) for i in range(4)],
+            }
+            self.by_name = {}
+
+    drawn = fw.Sprite(_ChaoPack())
+    drawn.chao_phase = "join"
+    drawn.chao_type = 0
+    drawn.chao_i = 1
+    drawn.chao_x = fw.CHAO_FOLLOW_X
+    joined = drawn._chao_stamp()
+    assert joined[0].name == "normal_chao_1"
+    drawn.chao_phase = "follow"
+    drawn.chao_i = 0
+    hovering = drawn._chao_stamp()
+    assert hovering[0].name == "normal_chao_2"
+    assert hovering[2] == fw.CHAO_HEAD_Y - 11
 
     class _Rects(object):
         def __init__(self):

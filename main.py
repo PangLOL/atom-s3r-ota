@@ -35,7 +35,8 @@ It is not the published Pages payload.
 Official mouths and boost rips are not packed yet, packing is allowed.
 The three hockey-stop frames are packed and face right.
 Chao cycles are normal_chao, amy_chao, knuckles_chao, sonic_chao, and
-tails_chao. Frames 0 and 1 chase. Frames 2 and 3 hover.
+tails_chao. Frames 0 and 1 are the join and leave. Frames 2 and 3 hover
+at Sonic's head while speed is under 80 km/h. One Chao, at 2 fps.
 Aura, shockwave, sound barrier, and full-speed sparks are V2 primitives
 drawn on top of Sonic. The native path saturating-adds them in RGB565.
 FACE_ENABLED stays off.
@@ -492,6 +493,26 @@ SONIC_H = 36
 SONIC_FEET_Y = 90
 SONIC_HEAD_Y = 63
 SONIC_FRONT_X = 54
+# One Chao at a time, cruise only (moving, and under 80 km/h). The pack
+# has four frames per type. 0 and 1 are the side-view chase pair used to
+# join from behind and leave forward. 2 and 3 are the front hover pair.
+# The sheet has no frames 4-7.
+CHAO_TYPES = (
+    "normal_chao",
+    "amy_chao",
+    "knuckles_chao",
+    "sonic_chao",
+    "tails_chao",
+)
+CHAO_MOVE = (0, 1)
+CHAO_HOVER = (2, 3)
+CHAO_FRAME_MS = 500  # 2 fps
+CHAO_TRAVEL_MS = 1000
+# Body centre sits just behind the sprite, level with the head.
+CHAO_FOLLOW_X = SONIC_X - 10
+CHAO_HEAD_Y = SONIC_HEAD_Y
+CHAO_OFF_LEFT = -20
+CHAO_OFF_RIGHT = W + 20
 SONIC_FEET_DEST_X = SONIC_X + SONIC_W // 2  # 35
 SONIC_FEET_DEST_Y = SONIC_Y + SONIC_H       # 91
 AURA_TIP_Y = SONIC_MID_Y  # 72
@@ -513,25 +534,6 @@ HORIZON_Y = 32   # sky/clouds above; water and the horizon line from here
 GRASS_Y = 88     # near ground (grass, dirt, planted palms) from here
 RING_PERIOD = 1536  # long gaps between groups of 3-8
 RING_FPS_MS = 1000 // 30  # 33
-# Sea-sky seam check, only while the face-button speed sweep is running.
-# One pixel up every 30 presents. At this 33 ms pace that is 990 ms.
-SEAM_STEP_FRAMES = 30
-SEAM_MAX = 10
-SEAM_DIGIT_SCALE = 1  # 5x7 glyph plus the 1px outline, a 7x9 box
-
-
-def seam_nudge_for_frame(frame_index):
-    """Pixels the sea band sits above the normal horizon during the sweep.
-
-    Present 0 is 0. Each SEAM_STEP_FRAMES presents add one pixel, and the
-    count stops at SEAM_MAX.
-    """
-    if frame_index < 0:
-        return 0
-    n = frame_index // SEAM_STEP_FRAMES
-    if n > SEAM_MAX:
-        return SEAM_MAX
-    return n
 
 # World-x of mid-ground ring centres. First group matches the after still
 # (centres 66, 82, 97 at y 78). Second group of 5 after a long gap.
@@ -2913,6 +2915,9 @@ def _underlay_budget(pack):
     sonic = 0
     for key in ("idle", "idle_trigger", "run_slow", "run_medium", "run_fast", "hockey"):
         sonic = max(sonic, max_bytes(pack.cycles.get(key)))
+    chao = 0
+    for key in CHAO_TYPES:
+        chao = max(chao, max_bytes(pack.cycles.get(key)))
     rings = max_bytes(pack.cycles.get("rings"))
     spark = max_bytes(pack.cycles.get("rings_sparkle"))
     extra = 0
@@ -2922,7 +2927,7 @@ def _underlay_budget(pack):
         extra += bar.w * bar.h * 2
     if hud is not None:
         extra += hud.w * hud.h * 2
-    return sonic + extra + _UNDER_RINGS * rings + _UNDER_SPARKS * spark + 64
+    return sonic + chao + extra + _UNDER_RINGS * rings + _UNDER_SPARKS * spark + 64
 
 
 def _copy_partial_row(tile, tw, src_y, off, window, x0, x1, vw=W):
@@ -3194,6 +3199,10 @@ def _bake_frame_list(pack):
     hockey = pack.cycles.get("hockey")
     if hockey:
         frames.extend(hockey)
+    for key in CHAO_TYPES:
+        cyc = pack.cycles.get(key)
+        if cyc:
+            frames.extend(cyc)
     return frames
 
 
@@ -4213,26 +4222,6 @@ def _stamp_digit565(buf, vw, vh, x, y, n, scale):
         row += 1
 
 
-def stamp_seam_digit(buf, vw, vh, nudge):
-    """Center the seam count on the 128x128 panel. 10 uses two HUD digits."""
-    if buf is None or nudge < 0:
-        return
-    scale = SEAM_DIGIT_SCALE
-    pitch = 7 * scale
-    glyph_w = 5 * scale
-    glyph_h = 7 * scale
-    if nudge >= 10:
-        width = pitch + glyph_w
-        x = (W - width) // 2
-        y = (H - glyph_h) // 2
-        _stamp_digit565(buf, vw, vh, x, y, 1, scale)
-        _stamp_digit565(buf, vw, vh, x + pitch, y, 0, scale)
-        return
-    x = (W - glyph_w) // 2
-    y = (H - glyph_h) // 2
-    _stamp_digit565(buf, vw, vh, x, y, nudge, scale)
-
-
 def draw_ring_glyph(lcd, cx, cy, rx, ry):
     outlined_ellipse(lcd, cx, cy, rx, ry, COL_RING, COL_RING_DK, 1)
     fill_ellipse(lcd, cx, cy, max(1, rx - 2), max(1, ry - 2), COL_BG)
@@ -4512,6 +4501,14 @@ class Sprite:
         self.hockey_i = -1
         self._hockey_arm = 0
         self._hockey_accum = 0
+        self.chao_phase = "off"
+        self.chao_type = 0
+        self.chao_joined = False
+        self.chao_i = 0
+        self.chao_accum = 0
+        self.chao_x = 0
+        self.chao_x0 = 0
+        self.chao_travel = 0
         self._spd_prev = None
         self.decel = 0.0
         self.ring_i = 0
@@ -4549,6 +4546,7 @@ class Sprite:
         self._sig_ring_i = -1
         self._sig_anim_tag = None
         self._sig_anim_i = -1
+        self._sig_chao = None
         self._sig_scroll_i = -999999
         self._sig_amount = None
         self._sig_spark = []
@@ -4588,8 +4586,6 @@ class Sprite:
         self._tim_full = 0
         self._tim_t0 = 0
         self._fx_in_buffer = False
-        self.seam_show = False
-        self.seam_nudge = 0
         self._corner_pushed = False
         self._dot_on_play = False
         self._native_ready = False
@@ -4608,7 +4604,7 @@ class Sprite:
         self._nat_sw = -999
         self._nat_bar = -999
         self._nat_spk = -999
-        self._nat_seam = -1
+        self._nat_chao = None
         self._nat_spark = []
         self._off_buf = []
         self._sync_ground()
@@ -4845,6 +4841,7 @@ class Sprite:
         else:
             self.phase = (self.phase + dt_ms * (0.002 + 0.00035 * speed)) % 4.0
         self._step_hockey(speed, dt_ms, brk)
+        self._step_chao(speed, dt_ms)
         self.boost.tick(speed, dt_ms, rpm)
         self._step_anim(speed, dt_ms)
         self._collect_rings()
@@ -4888,6 +4885,99 @@ class Sprite:
                 self._hockey_accum = 0
         else:
             self._hockey_arm = 0
+
+    def _chao_start(self, phase):
+        self.chao_phase = phase
+        self.chao_x0 = int(self.chao_x)
+        self.chao_travel = 0
+        self.chao_i = 0
+        self.chao_accum = 0
+
+    def _chao_step_frame(self, dt_ms):
+        self.chao_accum += dt_ms
+        if self.chao_accum >= CHAO_FRAME_MS:
+            self.chao_accum -= CHAO_FRAME_MS
+            if self.chao_accum > CHAO_FRAME_MS:
+                self.chao_accum = CHAO_FRAME_MS
+            self.chao_i = (self.chao_i + 1) & 1
+
+    def _chao_key(self):
+        if self.chao_phase == "off":
+            return None
+        return (self.chao_phase, self.chao_type, self.chao_i, int(self.chao_x))
+
+    def _step_chao(self, speed, dt_ms):
+        """Join from the left under 80 km/h, hover, then leave off the right.
+
+        Stopped and full-speed driving keep the slot empty. A cruise that
+        returns during the exit turns back into a join of the same type.
+        """
+        cruise = speed >= 1.0 and speed < SPEED_FAST
+        phase = self.chao_phase
+        if phase == "off":
+            if not cruise:
+                return
+            if self.chao_joined:
+                self.chao_type = (self.chao_type + 1) % len(CHAO_TYPES)
+            else:
+                self.chao_type = 0
+                self.chao_joined = True
+            self.chao_x = CHAO_OFF_LEFT
+            self._chao_start("join")
+            return
+        if phase == "follow":
+            if not cruise:
+                self._chao_start("leave")
+                phase = "leave"
+            else:
+                self._chao_step_frame(dt_ms)
+                return
+        if phase != "join" and phase != "leave":
+            return
+        self.chao_travel += dt_ms
+        if self.chao_travel > CHAO_TRAVEL_MS:
+            self.chao_travel = CHAO_TRAVEL_MS
+        t = self.chao_travel / float(CHAO_TRAVEL_MS)
+        if self.chao_phase == "join":
+            dest = CHAO_FOLLOW_X
+            self.chao_x = self.chao_x0 + (dest - self.chao_x0) * t
+            if not cruise:
+                self._chao_start("leave")
+                return
+        else:
+            dest = CHAO_OFF_RIGHT
+            self.chao_x = self.chao_x0 + (dest - self.chao_x0) * t
+            if cruise:
+                self._chao_start("join")
+                return
+        if t >= 1.0:
+            if self.chao_phase == "join":
+                self.chao_phase = "follow"
+                self.chao_x = CHAO_FOLLOW_X
+                self.chao_i = 0
+                self.chao_accum = 0
+            else:
+                self.chao_phase = "off"
+            return
+        self._chao_step_frame(dt_ms)
+
+    def _chao_stamp(self):
+        """(frame, top-left x, top-left y), or None when the slot is empty."""
+        if self.chao_phase == "off":
+            return None
+        if self.chao_type < 0 or self.chao_type >= len(CHAO_TYPES):
+            return None
+        frames = self._cycle_frames(CHAO_TYPES[self.chao_type])
+        if not frames:
+            return None
+        if self.chao_phase == "follow":
+            idx = CHAO_HOVER[self.chao_i & 1]
+        else:
+            idx = CHAO_MOVE[self.chao_i & 1]
+        if idx >= len(frames):
+            return None
+        fr = frames[idx]
+        return fr, int(self.chao_x) - fr.origin_x, CHAO_HEAD_Y - fr.origin_y
 
     def _cycle_frames(self, tag):
         pack = self.pack
@@ -5212,6 +5302,10 @@ class Sprite:
         if frames:
             fr = frames[self.anim_i % len(frames)]
             blit_frame(lcd, pack, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, pal_c, 0, GAUGE_Y, True)
+        chao = self._chao_stamp()
+        if chao is not None:
+            fr, x0, y0 = chao
+            blit_frame(lcd, pack, fr, x0, y0, pack.pal(fr.pal_id), 0, GAUGE_Y, False)
 
     def _can_retain(self):
         if not (
@@ -5292,7 +5386,6 @@ class Sprite:
             self.ocean_stamps,
             self.ocean_window,
             W,
-            self.seam_nudge if self.seam_show else 0,
         )
         self._commit_offs()
         self._pf_valid = True
@@ -5562,9 +5655,6 @@ class Sprite:
         """
         self._bd_mode = 0
         del self._bd_clips[:]
-        if self.seam_show:
-            # The sea band is not a horizontal shift. Rebuild it at this nudge.
-            self._pf_valid = False
         if not self._parallax:
             changed = self._update_flat(scroll)
             if changed:
@@ -5617,6 +5707,8 @@ class Sprite:
             return False
         if self._sig_anim_i != self.anim_i or self._sig_anim_tag != self.anim_tag:
             return False
+        if self._sig_chao != self._chao_key():
+            return False
         if self._sig_scroll_i != int(self.scroll):
             return False
         if self._sig_amount != amount:
@@ -5640,6 +5732,7 @@ class Sprite:
         self._sig_ring_i = self.ring_i
         self._sig_anim_tag = self.anim_tag
         self._sig_anim_i = self.anim_i
+        self._sig_chao = self._chao_key()
         self._sig_scroll_i = int(self.scroll)
         self._sig_amount = amount
         prev = self._sig_spark
@@ -5795,6 +5888,10 @@ class Sprite:
             x0 = int(SONIC_FEET_DEST_X - fr.origin_x)
             y0 = int(SONIC_FEET_DEST_Y - fr.origin_y)
             self._emit_place(out, "sonic", x0, y0, fr.w, fr.h, fr, amount, "sonic")
+        chao = self._chao_stamp()
+        if chao is not None:
+            fr, x0, y0 = chao
+            self._emit_place(out, "chao", x0, y0, fr.w, fr.h, fr, 0, "chao")
         bar = pack.by_name.get("hud_bar")
         if bar is not None:
             self._emit_place(
@@ -6111,6 +6208,10 @@ class Sprite:
             self._stamp_frame(
                 window, vw, vh, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, True, amount, save_under
             )
+        chao = self._chao_stamp()
+        if chao is not None:
+            fr, x0, y0 = chao
+            self._stamp_frame(window, vw, vh, fr, x0, y0, False, 0, save_under)
         bar = pack.by_name.get("hud_bar")
         if bar is not None:
             self._stamp_frame(
@@ -6276,26 +6377,6 @@ class Sprite:
         self._off_w = off_w
         self._off_g = off_g
 
-    def _seam_key(self):
-        if not self.seam_show:
-            return -1
-        return self.seam_nudge
-
-    def set_seam(self, show, nudge):
-        """Show or hide the sweep seam nudge. Unchanged calls do no work."""
-        if nudge < 0:
-            nudge = 0
-        if nudge > SEAM_MAX:
-            nudge = SEAM_MAX
-        if not show:
-            nudge = 0
-        if show == self.seam_show and nudge == self.seam_nudge:
-            return
-        self.seam_show = bool(show)
-        self.seam_nudge = nudge
-        self._pf_valid = False
-        self._native_ready = False
-
     def _native_same(self, off_c, off_w, off_g, amount):
         _brk_enter("plan")
         try:
@@ -6336,7 +6417,7 @@ class Sprite:
             or self._nat_sw != boost.sw_i
             or self._nat_bar != boost.bar_i
             or self._nat_spk != boost.spark_i
-            or self._nat_seam != self._seam_key()
+            or self._nat_chao != self._chao_key()
         ):
             return False
         sp = self.sparkles
@@ -6383,7 +6464,7 @@ class Sprite:
         self._nat_sw = boost.sw_i
         self._nat_bar = boost.bar_i
         self._nat_spk = boost.spark_i
-        self._nat_seam = self._seam_key()
+        self._nat_chao = self._chao_key()
         prev = self._nat_spark
         del prev[:]
         for item in self.sparkles:
@@ -6416,16 +6497,10 @@ class Sprite:
                 gh.compose(
                     tile, tw, th, off_c, off_w, off_g, HORIZON_Y, GRASS_Y,
                     self.ocean_stamps, self._off_buf, window,
-                    self.seam_nudge if self.seam_show else 0,
+                    0,
                 )
             else:
                 gh.copy(tile, tw, th, off_c, window, vw)
-                sea_dy = self.seam_nudge if self.seam_show else 0
-                if sea_dy:
-                    _copy_rows(
-                        tile, tw, HORIZON_Y, GRASS_Y, off_c, window, vw,
-                        HORIZON_Y - sea_dy,
-                    )
         finally:
             _brk_exit()
         t1 = _mono_us()
@@ -6516,8 +6591,6 @@ class Sprite:
         times[4] = rings_us
         times[5] = fx_us
         times[6] = dig_us
-        if self.seam_show:
-            stamp_seam_digit(window, vw, vh, self.seam_nudge)
         return times
 
     def _present_copy(self, src):
@@ -6712,7 +6785,6 @@ class Sprite:
                     self.ocean_stamps,
                     self.ocean_window,
                     W,
-                    self.seam_nudge if self.seam_show else 0,
                 )
             else:
                 copy_ocean_window(
@@ -6723,11 +6795,6 @@ class Sprite:
                     self.ocean_window,
                     W,
                 )
-                if self.seam_show and self.seam_nudge:
-                    _copy_rows(
-                        self.ocean_rgb565, self.ocean_tw, HORIZON_Y, GRASS_Y, off,
-                        self.ocean_window, W, HORIZON_Y - self.seam_nudge,
-                    )
             compose_us = _us_diff(_mono_us(), t0)
             window_ready = True
             self._pf_valid = False
@@ -6747,8 +6814,6 @@ class Sprite:
                 stamped = False
                 print("sprite stamp failed:", e)
         if window_ready:
-            if self.seam_show and not self._fx_in_buffer:
-                stamp_seam_digit(push_buf, W, self.ocean_th, self.seam_nudge)
             t0 = _mono_us()
             hand = self._present_copy(push_buf)
             self._stamp_fault(hand, fault)
@@ -7387,7 +7452,6 @@ def main():
     _last_fetch_ms = -PIXIDX_FETCH_EVERY_MS
 
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
-    seam_frames = 0
     last_rx_ms = 0
     next_draw = None
     last_ota_ms = 0
@@ -7465,14 +7529,6 @@ def main():
                     _brk_exit()
         finally:
             _brk_exit()
-
-        if sweep.active:
-            ui.sprite.set_seam(True, seam_nudge_for_frame(seam_frames))
-            seam_frames += 1
-        else:
-            if seam_frames or ui.sprite.seam_show:
-                ui.sprite.set_seam(False, 0)
-            seam_frames = 0
 
         if ota_client is not None and (
             last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
