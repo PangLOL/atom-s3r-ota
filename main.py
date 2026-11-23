@@ -147,6 +147,9 @@ INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 APP_VERSION = 16
 APP_VERSION_NAME = "2026.11.21-v16"
+# Network updates stay off until this build is declared OTA-ready.
+# Flip this to True only then. USB flashing on COM6 does not use it.
+OTA_ENABLED = False
 # Long enough that a main.py / pixidx write is not reset, short enough that
 # a stuck idle loop comes back without a power cycle. Not a routine reboot.
 WDT_TIMEOUT_MS = 30000
@@ -4258,6 +4261,8 @@ def try_fetch_pixidx():
     A leftover local pack is never treated as success; only the current
     sha256 / size / geometry is saved and used.
     """
+    if not OTA_ENABLED:
+        return None
     try:
         import ota_client
         if hasattr(ota_client, "wifi_connected") and not ota_client.wifi_connected():
@@ -4844,6 +4849,7 @@ class Sprite:
         self.pack = pack
         self.rings = 0
         self._ring_seen = 0
+        self._ring_got = 0
         self.anim_tag = "idle"
         self.anim_i = 0
         self.anim_accum = 0
@@ -5647,6 +5653,7 @@ class Sprite:
                         self.sparkles.append([x, FIELD_RING_Y, 0, 0])
                     i += 1
         self._ring_seen = mask
+        self._ring_got |= gained
 
     def _draw_hud_digits(self, lcd, bx, by):
         dx, dy = bx + 22, by + 4
@@ -5756,10 +5763,16 @@ class Sprite:
         finally:
             _brk_exit()
 
+    def _ring_taken(self, idx):
+        """True after the ring's centre has crossed Sonic. Draw skips it."""
+        return ((self._ring_got >> idx) & 1) != 0
+
     def _field_ring_xs(self, off):
         period = RING_PERIOD
         found = []
-        for wx in FIELD_RING_X:
+        for i, wx in enumerate(FIELD_RING_X):
+            if self._ring_taken(i):
+                continue
             x = (wx - off) % period
             if x > W + 40:
                 x -= period
@@ -6375,7 +6388,7 @@ class Sprite:
                 x = (xs[idx] - off) % period
                 if x > W + 40:
                     x -= period
-                if -40 < x < W + 40:
+                if (not self._ring_taken(idx)) and -40 < x < W + 40:
                     x0 = int(x - fr.origin_x)
                     y0 = int(FIELD_RING_Y - fr.origin_y)
                     self._emit_place(out, keys[idx], x0, y0, fr.w, fr.h, fr, 0, "rings")
@@ -7491,7 +7504,9 @@ class Sprite:
             for x in self._wrapped_center(sx, 4, off):
                 self._draw_sunflower(lcd, x, gy - GRASS_H, sh)
 
-        for rx, ry, rrx, rry in FIELD_RINGS:
+        for i, (rx, ry, rrx, rry) in enumerate(FIELD_RINGS):
+            if self._ring_taken(i):
+                continue
             for x in self._wrapped_center(rx, rrx, off):
                 self._draw_field_ring(lcd, x, ry, rrx, rry)
 
@@ -7978,11 +7993,15 @@ def main():
         button.poll(time.ticks_ms())
 
     _BTN_HOOK = _face_hook
-    try:
-        import ota_client
-    except ImportError:
-        ota_client = None
-    _install_ota_fetch_timeout(ota_client)
+    ota_client = None
+    if OTA_ENABLED:
+        try:
+            import ota_client
+        except ImportError:
+            ota_client = None
+        _install_ota_fetch_timeout(ota_client)
+    else:
+        print("ota off")
     _last_fetch_ms = -PIXIDX_FETCH_EVERY_MS
 
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
@@ -8065,7 +8084,7 @@ def main():
         finally:
             _brk_exit()
 
-        if ota_client is not None and (
+        if OTA_ENABLED and ota_client is not None and (
             last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
         ):
             _brk_enter("ota")
@@ -8079,7 +8098,7 @@ def main():
             finally:
                 _brk_exit()
 
-        if ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
+        if OTA_ENABLED and ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
             # Keep retrying while the current pack is missing or was rejected
             # (a leftover V6 file must not block the download).
             _brk_enter("pix")

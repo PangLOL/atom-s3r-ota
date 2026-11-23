@@ -1018,6 +1018,27 @@ def main():
     assert sp.sparkles == []
     assert fw._BRK_PRINT_MS == 2000
 
+    assert fw.OTA_ENABLED is False
+    class _RingPack(object):
+        by_name = {}
+        cycles = {}
+
+    touched = fw.Sprite(_RingPack())
+    touched.scroll = fw.FIELD_RING_X[0] - fw.SONIC_FRONT_X
+    touched._collect_rings()
+    assert touched.rings == 1
+    assert touched._ring_taken(0)
+    touched._collect_rings()
+    assert touched.rings == 1
+    touched.scroll += fw.RING_PERIOD // 2
+    touched._collect_rings()
+    assert touched.rings == 1
+    assert touched._ring_taken(0)
+    assert (fw.FIELD_RING_X[0] - int(touched.scroll - fw.RING_PERIOD // 2)) not in touched._field_ring_xs(int(touched.scroll))
+    waiting = fw.Sprite(_RingPack())
+    waiting.scroll = 0
+    waiting._collect_rings()
+    assert waiting._ring_taken(0) is False
     assert fw.FLASH_PREAMBLE == b"ATOMFLASH\n"
     assert fw.FLASH_ACK == "flash-quiet"
     assert fw._SERIAL_QUIET is False
