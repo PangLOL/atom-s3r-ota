@@ -167,14 +167,21 @@ def main():
     sprite.ring_i = 0
     sprite.idle_wait = 0
     sprite.triggering = False
+    assert fw.RING_FPS_MS == 1000 // 30
+    assert fw.FX_FRAME_MS == 1000 // 15
+    sprite.ring_accum = 0
     sprite._step_anim(0.0, 45)
-    assert sprite.anim_i == 0 and sprite.anim_accum == 45 and sprite.ring_i == 1
+    assert sprite.anim_i == 0 and sprite.anim_accum == 45
+    assert sprite.ring_i == 0 and sprite.ring_accum == 45
     sprite._step_anim(0.0, 30)
-    assert sprite.anim_i == 1 and sprite.anim_accum == 9 and sprite.ring_i == 2
+    assert sprite.anim_i == 1 and sprite.anim_accum == 9
+    assert sprite.ring_i == 1 and sprite.ring_accum == 9
     sprite._step_anim(120.0, 80)
     assert sprite.anim_tag == "run_fast" and sprite.anim_i == 0 and sprite.anim_accum == 0
+    # The speed-band change resets the character clock, not the ring spin.
+    assert sprite.ring_i == 2 and sprite.ring_accum == 23
     sprite._step_anim(120.0, 80)
-    assert sprite.anim_i == 1 and sprite.ring_i == 4
+    assert sprite.anim_i == 1 and sprite.ring_i == 3 and sprite.ring_accum == 37
     # Idle trigger still keys off the same wait. The frame rate does not.
     sprite.pack.cycles["idle_trigger"] = [_Fr(), _Fr(), _Fr()]
     sprite.anim_tag = "idle"

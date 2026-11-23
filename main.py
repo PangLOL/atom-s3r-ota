@@ -4949,7 +4949,15 @@ class Sprite:
                         self.triggering = False
                         self.anim_tag = "idle"
                         self.idle_wait = 0
-        self.ring_i = (self.ring_i + 1) & 7
+        # World-ring spin at 15 fps. Its clock is not the present quantum
+        # and not the character tag change, so a speed-band swap does not
+        # freeze the spin. A late paint still takes one step.
+        self.ring_accum += dt_ms
+        if self.ring_accum >= FX_FRAME_MS:
+            self.ring_accum -= FX_FRAME_MS
+            if self.ring_accum > FX_FRAME_MS:
+                self.ring_accum = FX_FRAME_MS
+            self.ring_i = (self.ring_i + 1) & 7
 
     def _purge_sparkles(self):
         """Drop a sparkle slot that is not [x, y, frame, acc].
