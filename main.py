@@ -32,7 +32,7 @@ The OTA client stays, on its existing schedule; its HTTP fetch cannot
 block forever. A machine.WDT is armed after the first heavy alloc, fed
 from the loop, and not used as a routine reboot. This file is version 15.
 It is not the published Pages payload.
-Chao, official mouths, boost rips, and hockey-stop sheets are not packed yet.
+Chao, official mouths, boost rips, and hockey-stop sheets are not packed yet, packing is allowed.
 Aura, shockwave, sound barrier, and full-speed sparks are V2 primitives
 drawn on top of Sonic. The native path saturating-adds them in RGB565.
 FACE_ENABLED stays off.
@@ -169,7 +169,7 @@ FX_FRAME_MS = 1000 // 15  # 15 fps, same as S3Vec run_fast
 # Enter only while brk is held, decel stays at or above 10 km/h per
 # second, and speed is still above 25 km/h, for HOCKEY_ARM_MS. Leave
 # when the brake releases or decel falls under 6. The pack has no
-# hockey frames; the pose waits for original art facing right.
+# hockey frames; the pose waits for art facing right.
 HOCKEY_MIN_KMH = 25.0
 HOCKEY_ON_DECEL = 10.0
 HOCKEY_OFF_DECEL = 6.0
@@ -4848,7 +4848,7 @@ class Sprite:
 
         The pose faces the way the run faces. Nothing is drawn until a
         `hockey` cycle exists in the pack, and that cycle has to be
-        original art facing right. Ripped sheets stay off the device.
+        facing right.
         """
         prev = self._spd_prev
         self._spd_prev = speed
