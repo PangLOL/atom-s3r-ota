@@ -32,8 +32,10 @@ The OTA client stays, on its existing schedule; its HTTP fetch cannot
 block forever. A machine.WDT is armed after the first heavy alloc, fed
 from the loop, and not used as a routine reboot. This file is version 15.
 It is not the published Pages payload.
-Chao, official mouths, and boost rips are not packed yet, packing is allowed.
+Official mouths and boost rips are not packed yet, packing is allowed.
 The three hockey-stop frames are packed and face right.
+Chao cycles are normal_chao, amy_chao, knuckles_chao, sonic_chao, and
+tails_chao. Frames 0 and 1 chase. Frames 2 and 3 hover.
 Aura, shockwave, sound barrier, and full-speed sparks are V2 primitives
 drawn on top of Sonic. The native path saturating-adds them in RGB565.
 FACE_ENABLED stays off.
@@ -470,8 +472,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "ac3be0a343ecccc8dfd01c9043ec736cd27d267fac23d5fb2d60070a7b2b6b76"
-PIXIDX_SIZE = 225174
+PIXIDX_SHA256 = "8aeeecc3f98b5f3c233dc787ee794440e3e7810e5483a01dd8dac3a49940ab5d"
+PIXIDX_SIZE = 245053
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
