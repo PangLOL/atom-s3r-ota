@@ -20,6 +20,13 @@ void gh_copy_rows(const uint8_t *tile, int tw,
                   int y0, int y1, int off,
                   uint8_t *out, int vw, int out_y);
 
+/* Sky, sea, ground. sea_dy > 0 draws the sea band that many pixels higher.
+   0 matches three plain gh_copy_rows calls. */
+void gh_compose_bands(const uint8_t *tile, int tw, int th,
+                      int off_c, int off_w, int off_g,
+                      int horizon, int grass, int sea_dy,
+                      uint8_t *out, int vw);
+
 void gh_blit_stamp(uint8_t *window, int vw, int vh, int tw,
                    const uint8_t *sbuf, const uint8_t *mask,
                    int sw, int sh, int ox, int oy, int off);

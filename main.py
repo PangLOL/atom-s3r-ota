@@ -510,6 +510,25 @@ HORIZON_Y = 32   # sky/clouds above; water and the horizon line from here
 GRASS_Y = 88     # near ground (grass, dirt, planted palms) from here
 RING_PERIOD = 1536  # long gaps between groups of 3-8
 RING_FPS_MS = 1000 // 30  # 33
+# Sea-sky seam check, only while the face-button speed sweep is running.
+# One pixel up every 30 presents. At this 33 ms pace that is 990 ms.
+SEAM_STEP_FRAMES = 30
+SEAM_MAX = 10
+SEAM_DIGIT_SCALE = 2
+
+
+def seam_nudge_for_frame(frame_index):
+    """Pixels the sea band sits above the normal horizon during the sweep.
+
+    Present 0 is 0. Each SEAM_STEP_FRAMES presents add one pixel, and the
+    count stops at SEAM_MAX.
+    """
+    if frame_index < 0:
+        return 0
+    n = frame_index // SEAM_STEP_FRAMES
+    if n > SEAM_MAX:
+        return SEAM_MAX
+    return n
 
 # World-x of mid-ground ring centres. First group matches the after still
 # (centres 66, 82, 97 at y 78). Second group of 5 after a long gap.
@@ -2061,10 +2080,17 @@ def build_parallax_layers(tile, tw, th):
     return stamps
 
 
-def compose_parallax_window(tile, tw, th, scroll, stamps, window, vw):
+def compose_parallax_window(tile, tw, th, scroll, stamps, window, vw, sea_dy=0):
     _service()
+    if sea_dy < 0:
+        sea_dy = 0
+    if sea_dy > HORIZON_Y:
+        sea_dy = HORIZON_Y
     _copy_rows(tile, tw, 0, HORIZON_Y, scroll * PARALLAX_CLOUDS, window, vw, 0)
-    _copy_rows(tile, tw, HORIZON_Y, GRASS_Y, scroll * PARALLAX_WATER, window, vw, HORIZON_Y)
+    _copy_rows(
+        tile, tw, HORIZON_Y, GRASS_Y, scroll * PARALLAX_WATER,
+        window, vw, HORIZON_Y - sea_dy,
+    )
     _copy_rows(tile, tw, GRASS_Y, th, scroll * PARALLAX_GROUND, window, vw, GRASS_Y)
     for st in stamps:
         _blit_stamp(window, vw, tw, st, scroll)
@@ -4066,6 +4092,90 @@ def draw_digit(lcd, x, y, n, color=None, s=1, outline=None):
                 lcd.fillRect(x + col * s, y + row * s, s, s, color)
 
 
+def _put565(buf, vw, vh, x, y, c):
+    if x < 0 or y < 0 or x >= vw or y >= vh:
+        return
+    i = (y * vw + x) * 2
+    buf[i] = c & 0xFF
+    buf[i + 1] = (c >> 8) & 0xFF
+
+
+def _stamp_digit565(buf, vw, vh, x, y, n, scale):
+    """One HUD digit into an RGB565 buffer. Same 5x7 bitmap as draw_digit."""
+    bits = DIGITS[int(n) % 10]
+    if scale < 1:
+        scale = 1
+    color = _rgb888_to_565(COL_HUD_DIGIT)
+    outline = _rgb888_to_565(COL_HUD_OUTLINE)
+    row = 0
+    while row < 7:
+        rowb = bits[row]
+        col = 0
+        while col < 5:
+            if rowb & (0b10000 >> col):
+                oy = -1
+                while oy <= 1:
+                    ox = -1
+                    while ox <= 1:
+                        if ox != 0 or oy != 0:
+                            py = 0
+                            while py < scale:
+                                px = 0
+                                while px < scale:
+                                    _put565(
+                                        buf, vw, vh,
+                                        x + (col + ox) * scale + px,
+                                        y + (row + oy) * scale + py,
+                                        outline,
+                                    )
+                                    px += 1
+                                py += 1
+                        ox += 1
+                    oy += 1
+            col += 1
+        row += 1
+    row = 0
+    while row < 7:
+        rowb = bits[row]
+        col = 0
+        while col < 5:
+            if rowb & (0b10000 >> col):
+                py = 0
+                while py < scale:
+                    px = 0
+                    while px < scale:
+                        _put565(
+                            buf, vw, vh,
+                            x + col * scale + px,
+                            y + row * scale + py,
+                            color,
+                        )
+                        px += 1
+                    py += 1
+            col += 1
+        row += 1
+
+
+def stamp_seam_digit(buf, vw, vh, nudge):
+    """Center the seam count on the 128x128 panel. 10 uses two HUD digits."""
+    if buf is None or nudge < 0:
+        return
+    scale = SEAM_DIGIT_SCALE
+    pitch = 7 * scale
+    glyph_w = 5 * scale
+    glyph_h = 7 * scale
+    if nudge >= 10:
+        width = pitch + glyph_w
+        x = (W - width) // 2
+        y = (H - glyph_h) // 2
+        _stamp_digit565(buf, vw, vh, x, y, 1, scale)
+        _stamp_digit565(buf, vw, vh, x + pitch, y, 0, scale)
+        return
+    x = (W - glyph_w) // 2
+    y = (H - glyph_h) // 2
+    _stamp_digit565(buf, vw, vh, x, y, nudge, scale)
+
+
 def draw_ring_glyph(lcd, cx, cy, rx, ry):
     outlined_ellipse(lcd, cx, cy, rx, ry, COL_RING, COL_RING_DK, 1)
     fill_ellipse(lcd, cx, cy, max(1, rx - 2), max(1, ry - 2), COL_BG)
@@ -4421,6 +4531,8 @@ class Sprite:
         self._tim_full = 0
         self._tim_t0 = 0
         self._fx_in_buffer = False
+        self.seam_show = False
+        self.seam_nudge = 0
         self._corner_pushed = False
         self._dot_on_play = False
         self._native_ready = False
@@ -4439,6 +4551,7 @@ class Sprite:
         self._nat_sw = -999
         self._nat_bar = -999
         self._nat_spk = -999
+        self._nat_seam = -1
         self._nat_spark = []
         self._off_buf = []
         self._sync_ground()
@@ -5113,6 +5226,7 @@ class Sprite:
             self.ocean_stamps,
             self.ocean_window,
             W,
+            self.seam_nudge if self.seam_show else 0,
         )
         self._commit_offs()
         self._pf_valid = True
@@ -5382,6 +5496,9 @@ class Sprite:
         """
         self._bd_mode = 0
         del self._bd_clips[:]
+        if self.seam_show:
+            # The sea band is not a horizontal shift. Rebuild it at this nudge.
+            self._pf_valid = False
         if not self._parallax:
             changed = self._update_flat(scroll)
             if changed:
@@ -6093,6 +6210,26 @@ class Sprite:
         self._off_w = off_w
         self._off_g = off_g
 
+    def _seam_key(self):
+        if not self.seam_show:
+            return -1
+        return self.seam_nudge
+
+    def set_seam(self, show, nudge):
+        """Show or hide the sweep seam nudge. Unchanged calls do no work."""
+        if nudge < 0:
+            nudge = 0
+        if nudge > SEAM_MAX:
+            nudge = SEAM_MAX
+        if not show:
+            nudge = 0
+        if show == self.seam_show and nudge == self.seam_nudge:
+            return
+        self.seam_show = bool(show)
+        self.seam_nudge = nudge
+        self._pf_valid = False
+        self._native_ready = False
+
     def _native_same(self, off_c, off_w, off_g, amount):
         _brk_enter("plan")
         try:
@@ -6133,6 +6270,7 @@ class Sprite:
             or self._nat_sw != boost.sw_i
             or self._nat_bar != boost.bar_i
             or self._nat_spk != boost.spark_i
+            or self._nat_seam != self._seam_key()
         ):
             return False
         sp = self.sparkles
@@ -6179,6 +6317,7 @@ class Sprite:
         self._nat_sw = boost.sw_i
         self._nat_bar = boost.bar_i
         self._nat_spk = boost.spark_i
+        self._nat_seam = self._seam_key()
         prev = self._nat_spark
         del prev[:]
         for item in self.sparkles:
@@ -6211,9 +6350,16 @@ class Sprite:
                 gh.compose(
                     tile, tw, th, off_c, off_w, off_g, HORIZON_Y, GRASS_Y,
                     self.ocean_stamps, self._off_buf, window,
+                    self.seam_nudge if self.seam_show else 0,
                 )
             else:
                 gh.copy(tile, tw, th, off_c, window, vw)
+                sea_dy = self.seam_nudge if self.seam_show else 0
+                if sea_dy:
+                    _copy_rows(
+                        tile, tw, HORIZON_Y, GRASS_Y, off_c, window, vw,
+                        HORIZON_Y - sea_dy,
+                    )
         finally:
             _brk_exit()
         t1 = _mono_us()
@@ -6304,6 +6450,8 @@ class Sprite:
         times[4] = rings_us
         times[5] = fx_us
         times[6] = dig_us
+        if self.seam_show:
+            stamp_seam_digit(window, vw, vh, self.seam_nudge)
         return times
 
     def _present_copy(self, src):
@@ -6498,6 +6646,7 @@ class Sprite:
                     self.ocean_stamps,
                     self.ocean_window,
                     W,
+                    self.seam_nudge if self.seam_show else 0,
                 )
             else:
                 copy_ocean_window(
@@ -6508,6 +6657,11 @@ class Sprite:
                     self.ocean_window,
                     W,
                 )
+                if self.seam_show and self.seam_nudge:
+                    _copy_rows(
+                        self.ocean_rgb565, self.ocean_tw, HORIZON_Y, GRASS_Y, off,
+                        self.ocean_window, W, HORIZON_Y - self.seam_nudge,
+                    )
             compose_us = _us_diff(_mono_us(), t0)
             window_ready = True
             self._pf_valid = False
@@ -6527,6 +6681,8 @@ class Sprite:
                 stamped = False
                 print("sprite stamp failed:", e)
         if window_ready:
+            if self.seam_show and not self._fx_in_buffer:
+                stamp_seam_digit(push_buf, W, self.ocean_th, self.seam_nudge)
             t0 = _mono_us()
             hand = self._present_copy(push_buf)
             self._stamp_fault(hand, fault)
@@ -7135,6 +7291,7 @@ def main():
     _last_fetch_ms = -PIXIDX_FETCH_EVERY_MS
 
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
+    seam_frames = 0
     last_rx_ms = 0
     next_draw = None
     last_ota_ms = 0
@@ -7212,6 +7369,14 @@ def main():
                     _brk_exit()
         finally:
             _brk_exit()
+
+        if sweep.active:
+            ui.sprite.set_seam(True, seam_nudge_for_frame(seam_frames))
+            seam_frames += 1
+        else:
+            if seam_frames or ui.sprite.seam_show:
+                ui.sprite.set_seam(False, 0)
+            seam_frames = 0
 
         if ota_client is not None and (
             last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS

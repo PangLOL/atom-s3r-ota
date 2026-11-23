@@ -27,6 +27,8 @@ def _load_lib():
     u8 = ctypes.POINTER(ctypes.c_uint8)
     ci = ctypes.c_int
     lib.gh_copy_rows.argtypes = [u8, ci, ci, ci, ci, u8, ci, ci]
+    lib.gh_compose_bands.argtypes = [u8, ci, ci, ci, ci, ci, ci, ci, ci, u8, ci]
+    lib.gh_compose_bands.restype = None
     lib.gh_blit_stamp.argtypes = [u8, ci, ci, ci, u8, u8, ci, ci, ci, ci, ci]
     lib.gh_stamp_sprite.argtypes = [u8, ci, ci, u8, u8, ci, ci, ci, ci]
     lib.gh_expand_indexed.argtypes = [u8, ci, ci, ci, ci, u8, ci, u8]
@@ -39,6 +41,7 @@ def _load_lib():
     lib.gh_rgb888_to_565.restype = ctypes.c_uint16
     for name in (
         "gh_copy_rows",
+        "gh_compose_bands",
         "gh_blit_stamp",
         "gh_stamp_sprite",
         "gh_expand_indexed",
@@ -75,11 +78,16 @@ class Native(object):
     def __init__(self, lib):
         self.lib = lib
 
-    def compose(self, tile, tw, th, off_c, off_w, off_g, horizon, grass, stamps, offs, window):
+    def compose(self, tile, tw, th, off_c, off_w, off_g, horizon, grass, stamps, offs, window, sea_dy=0):
         vw = 128
-        self._rows(tile, tw, 0, horizon, off_c, window, vw, 0)
-        self._rows(tile, tw, horizon, grass, off_w, window, vw, horizon)
-        self._rows(tile, tw, grass, th, off_g, window, vw, grass)
+        ct = _cbuf(tile, False)
+        co = _cbuf(window, True)
+        self.lib.gh_compose_bands(
+            ct, int(tw), int(th),
+            int(off_c), int(off_w), int(off_g),
+            int(horizon), int(grass), int(sea_dy),
+            co, vw,
+        )
         i = 0
         while i < len(stamps):
             st = stamps[i]
@@ -934,6 +942,60 @@ def _additive_probe(fw, sprite):
     return bad
 
 
+def _row_word(buf, vw, y):
+    i = y * vw * 2
+    return buf[i] | (buf[i + 1] << 8)
+
+
+def _sea_shift_probe(lib):
+    """Sea band moves up by sea_dy. sea_dy 0 keeps each row on itself."""
+    tw, th = 16, 40
+    horizon, grass = 8, 24
+    vw = 8
+    tile = bytearray(tw * th * 2)
+    y = 0
+    while y < th:
+        c = y + 1
+        x = 0
+        while x < tw:
+            i = (y * tw + x) * 2
+            tile[i] = c & 0xFF
+            tile[i + 1] = (c >> 8) & 0xFF
+            x += 1
+        y += 1
+
+    def bands(sea_dy):
+        out = bytearray(vw * th * 2)
+        lib.gh_compose_bands(
+            _cbuf(tile, False), tw, th, 0, 0, 0, horizon, grass, sea_dy,
+            _cbuf(out, True), vw,
+        )
+        return out
+
+    base = bands(0)
+    up = bands(1)
+    bad = 0
+    y = 0
+    while y < th:
+        if _row_word(base, vw, y) != y + 1:
+            bad += 1
+            break
+        y += 1
+    if _row_word(up, vw, 0) != 1:
+        bad += 1
+    if _row_word(up, vw, horizon - 1) != horizon + 1:
+        bad += 1
+    if _row_word(up, vw, horizon) != horizon + 2:
+        bad += 1
+    if _row_word(up, vw, grass) != grass + 1:
+        bad += 1
+    print(
+        "sea shift", "ok" if not bad else "bad",
+        "raised seam", _row_word(up, vw, horizon - 1),
+    )
+    return bad
+
+
 def main():
     _build_lib()
     lib = _load_lib()
@@ -1133,6 +1195,7 @@ def main():
         bad += n
 
     bad += _additive_probe(fw, sprite)
+    bad += _sea_shift_probe(lib)
 
     print("frames", frames, "digit_bad", digit_bad, "fx_bad", fx_bad, "mismatches", bad)
     if frames < 222:

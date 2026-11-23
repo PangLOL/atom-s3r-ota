@@ -608,6 +608,28 @@ def main():
     assert settle["rpm"] < fw.VTEC_OFF_RPM
     assert settle["clt"] == 96.0
     assert sum(stage[0] for stage in fw.Sweep.STAGES) == 9900
+    assert fw.SEAM_STEP_FRAMES == 30 and fw.SEAM_MAX == 10
+    assert fw.seam_nudge_for_frame(0) == 0
+    assert fw.seam_nudge_for_frame(29) == 0
+    assert fw.seam_nudge_for_frame(30) == 1
+    assert fw.seam_nudge_for_frame(270) == 9
+    assert fw.seam_nudge_for_frame(300) == 10
+    assert fw.seam_nudge_for_frame(330) == 10
+    assert fw.seam_nudge_for_frame(-1) == 0
+    # 300 presents at the 33 ms pace is the 9900 ms sweep. The last one is index 299.
+    assert fw.seam_nudge_for_frame(299) == 9
+    digit = bytearray(fw.W * fw.H * 2)
+    fw.stamp_seam_digit(digit, fw.W, fw.H, 0)
+    # Top row of "0" lights columns 1..3. Scale 2, glyph centered on 128.
+    dx = (fw.W - 5 * fw.SEAM_DIGIT_SCALE) // 2
+    dy = (fw.H - 7 * fw.SEAM_DIGIT_SCALE) // 2
+    on = fw._rgb888_to_565(fw.COL_HUD_DIGIT)
+    pix = digit[(dy * fw.W + dx + fw.SEAM_DIGIT_SCALE) * 2]
+    pix |= digit[(dy * fw.W + dx + fw.SEAM_DIGIT_SCALE) * 2 + 1] << 8
+    assert pix == on
+    blank = bytearray(fw.W * fw.H * 2)
+    fw.stamp_seam_digit(blank, fw.W, fw.H, -1)
+    assert blank == bytearray(len(blank))
 
     sw.start(0)
     fx = fw.BoostFX()

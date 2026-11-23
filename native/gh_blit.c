@@ -509,6 +509,40 @@ void gh_copy_rows(const uint8_t *tile, int tw,
     }
 }
 
+void gh_compose_bands(const uint8_t *tile, int tw, int th,
+                      int off_c, int off_w, int off_g,
+                      int horizon, int grass, int sea_dy,
+                      uint8_t *out, int vw) {
+    int seam;
+    if (tile == 0 || out == 0 || tw <= 0 || th <= 0 || vw <= 0) {
+        return;
+    }
+    if (horizon < 0) {
+        horizon = 0;
+    }
+    if (horizon > th) {
+        horizon = th;
+    }
+    if (grass < horizon) {
+        grass = horizon;
+    }
+    if (grass > th) {
+        grass = th;
+    }
+    if (sea_dy < 0) {
+        sea_dy = 0;
+    }
+    if (sea_dy > horizon) {
+        sea_dy = horizon;
+    }
+    seam = horizon - sea_dy;
+    gh_copy_rows(tile, tw, 0, horizon, off_c, out, vw, 0);
+    /* Sea source stays the horizon..grass rows. A positive sea_dy parks
+       that block higher, so it covers the bottom of the sky. */
+    gh_copy_rows(tile, tw, horizon, grass, off_w, out, vw, seam);
+    gh_copy_rows(tile, tw, grass, th, off_g, out, vw, grass);
+}
+
 void gh_blit_stamp(uint8_t *window, int vw, int vh, int tw,
                    const uint8_t *sbuf, const uint8_t *mask,
                    int sw, int sh, int ox, int oy, int off) {
