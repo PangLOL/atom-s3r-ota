@@ -4,6 +4,7 @@ No panel. The playfield pixel compares do not stamp this dot.
 """
 
 import importlib.util
+import io
 import os
 import sys
 import time
@@ -152,6 +153,78 @@ def main():
     assert start is False and idle == 1000
     start, armed, idle = fw.auto_sweep_due(21000, 0, False, False, False, 1000)
     assert start is True and armed is False
+    start, armed, idle = fw.auto_sweep_due(10000, 0, False, False, True, None, False)
+    assert start is False and armed is False and idle is None
+    start, armed, idle = fw.auto_sweep_due(10000, 0, False, False, False, None)
+    assert start is False and idle == 10000
+    if not hasattr(fw.M5, "update"):
+        fw.M5.update = lambda: None
+
+    class _Face(object):
+        def __init__(self):
+            self.n = 0
+            self.dbl = False
+
+        def wasClicked(self):
+            n = self.n
+            self.n = 0
+            return n
+
+        def wasDoubleClicked(self):
+            dbl = self.dbl
+            self.dbl = False
+            return dbl
+
+    singles = []
+    doubles = []
+    face = _Face()
+    watch = fw.ButtonWatch(face, singles.append, doubles.append)
+    face.n = 1
+    assert watch.poll(1000) is True
+    assert singles == [] and doubles == []
+    assert watch.poll(1000 + fw.AUTO_SWEEP_DOUBLE_MS) is False
+    assert singles == [] and doubles == []
+    single_at = 1000 + fw.AUTO_SWEEP_DOUBLE_MS + fw.FRAME_MIN_MS
+    assert watch.poll(single_at) is False
+    assert singles == [single_at] and doubles == []
+    face.n = 1
+    assert watch.poll(2000) is True
+    face.n = 1
+    assert watch.poll(2000 + 200) is True
+    assert singles == [single_at] and doubles == [2200]
+    assert watch.poll(2200 + fw.AUTO_SWEEP_DOUBLE_MS + 1) is False
+    assert len(singles) == 1
+    face.n = 2
+    assert watch.poll(4000) is True
+    assert doubles == [2200, 4000] and len(singles) == 1
+    held = []
+    watch2 = fw.ButtonWatch(face, held.append, doubles.append)
+    face.n = 1
+    watch2.poll(5000)
+    face.n = 1
+    watch2.poll(5000 + fw.AUTO_SWEEP_DOUBLE_MS + 50)
+    assert held == [5000 + fw.AUTO_SWEEP_DOUBLE_MS + 50]
+    watch2.poll(5000 + fw.AUTO_SWEEP_DOUBLE_MS + 50 + fw.AUTO_SWEEP_DOUBLE_MS + 1)
+    assert held == [
+        5000 + fw.AUTO_SWEEP_DOUBLE_MS + 50,
+        5000 + 2 * fw.AUTO_SWEEP_DOUBLE_MS + 51,
+    ]
+    saved = sys.stdout
+    try:
+        buf = io.StringIO()
+        sys.stdout = buf
+        assert fw._auto_sweep_enabled is True
+        fw.toggle_auto_sweep()
+        assert fw._auto_sweep_enabled is False
+        assert buf.getvalue() == "auto-sweep off\n"
+        buf.seek(0)
+        buf.truncate()
+        fw.toggle_auto_sweep()
+        assert fw._auto_sweep_enabled is True
+        assert buf.getvalue() == "auto-sweep on\n"
+    finally:
+        fw._auto_sweep_enabled = True
+        sys.stdout = saved
 
     class _Fr(object):
         duration_ms = 33

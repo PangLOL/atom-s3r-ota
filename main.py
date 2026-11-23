@@ -3195,15 +3195,34 @@ def live_can(bus, last_rx_ms, now):
 # sweep returns to rest. Never while a sweep is running or CAN is live.
 AUTO_SWEEP_BOOT_MS = 10000
 AUTO_SWEEP_IDLE_MS = 20000
+# Two face-button clicks inside this window toggle auto-sweep. 320 ms is
+# long enough for a thumb on the Atom button (a deliberate double lands
+# around 150–300 ms) and short enough that a single press still starts
+# the bench sweep before its first stage is noticeable.
+AUTO_SWEEP_DOUBLE_MS = 320
+_auto_sweep_enabled = True
 
 
-def auto_sweep_due(now, present_t0, active, can_live, boot_armed, idle_since):
+def toggle_auto_sweep(now=None):
+    """Flip auto-sweep and print one line. A running sweep is left alone."""
+    global _auto_sweep_enabled
+    _auto_sweep_enabled = not _auto_sweep_enabled
+    if _auto_sweep_enabled:
+        print("auto-sweep on")
+    else:
+        print("auto-sweep off")
+
+
+def auto_sweep_due(now, present_t0, active, can_live, boot_armed, idle_since, enabled=True):
     """Return (start, boot_armed, idle_since).
 
     present_t0 is the first present, not boot. active suppresses a start.
     can_live suppresses every auto start. boot_armed is the first wait.
-    After any sweep, idle_since counts 20 s of rest.
+    After any sweep, idle_since counts 20 s of rest. enabled False drops
+    a pending boot or idle start so turning it back on waits a fresh rest.
     """
+    if not enabled:
+        return False, False, None
     if active:
         return False, False, None
     if present_t0 is None or can_live:
@@ -7694,15 +7713,58 @@ def make_canvas(lcd):
 class ButtonWatch:
     """Poll the face button on every call. One press starts the bench sweep.
 
+    A second press inside AUTO_SWEEP_DOUBLE_MS toggles auto-sweep and does
+    not start the sweep. The single press is held until that window passes.
     M5.update() runs at most once per FRAME_MIN_MS. wasClicked is read in
     that same call. Extra polls during a paint only feed the watchdog.
     BtnA, Btn, and BtnPWR only. This board has no touch screen.
     """
 
-    def __init__(self, btn, on_press=None):
+    def __init__(self, btn, on_press=None, on_double=None):
         self.btn = btn
         self.on_press = on_press
+        self.on_double = on_double
         self._last_poll = None
+        self._pending = None
+
+    def _click_count(self):
+        btn = self.btn
+        if btn is None:
+            return 0
+        count = 0
+        if hasattr(btn, "wasClicked"):
+            try:
+                raw = btn.wasClicked()
+            except Exception:
+                raw = 0
+            if raw is True:
+                count = 1
+            elif raw is False or raw is None:
+                count = 0
+            else:
+                try:
+                    count = int(raw)
+                except Exception:
+                    count = 1 if raw else 0
+        if hasattr(btn, "wasDoubleClicked"):
+            try:
+                if btn.wasDoubleClicked() and count < 2:
+                    count = 2
+            except Exception:
+                pass
+        if count < 0:
+            count = 0
+        return count
+
+    def _flush_single(self, now):
+        pending = self._pending
+        if pending is None:
+            return
+        gap = time.ticks_diff(now, pending)
+        if gap < 0 or gap > AUTO_SWEEP_DOUBLE_MS:
+            self._pending = None
+            if self.on_press is not None:
+                self.on_press(now)
 
     def poll(self, now=None):
         _brk_enter("poll")
@@ -7720,25 +7782,21 @@ class ButtonWatch:
                 M5.update()
             finally:
                 _brk_exit()
-            btn = self.btn
-            if btn is None:
-                return False
-            clicked = False
-            if hasattr(btn, "wasClicked"):
-                try:
-                    clicked = bool(btn.wasClicked())
-                except Exception:
-                    clicked = False
-            if hasattr(btn, "wasDoubleClicked"):
-                try:
-                    extra = bool(btn.wasDoubleClicked())
-                except Exception:
-                    extra = False
-                if extra and not clicked:
-                    clicked = True
-            if clicked and self.on_press is not None:
-                self.on_press(now)
-            return clicked
+            self._flush_single(now)
+            count = self._click_count()
+            if count >= 2 or (
+                count == 1
+                and self._pending is not None
+                and 0 <= time.ticks_diff(now, self._pending) <= AUTO_SWEEP_DOUBLE_MS
+            ):
+                self._pending = None
+                if self.on_double is not None:
+                    self.on_double(now)
+                return True
+            if count == 1:
+                self._pending = now
+                return True
+            return False
         finally:
             _brk_exit()
 
@@ -7983,7 +8041,7 @@ def main():
     _show_boot_splash(lcd)
     pack = try_load_pixidx()
     sweep = Sweep()
-    button = ButtonWatch(find_btn(), sweep.start)
+    button = ButtonWatch(find_btn(), sweep.start, toggle_auto_sweep)
     # Ocean and sprite caches allocate here. Arm the watchdog after that so
     # the first build cannot reset the device.
     ui = Dashboard(lcd, pack, button=button)
@@ -8069,6 +8127,7 @@ def main():
                 live_can(bus, last_rx_ms, now),
                 boot_sweep_armed,
                 sweep_idle_since,
+                _auto_sweep_enabled,
             )
             if start_auto:
                 sweep.start(now)
