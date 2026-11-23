@@ -32,7 +32,8 @@ The OTA client stays, on its existing schedule; its HTTP fetch cannot
 block forever. A machine.WDT is armed after the first heavy alloc, fed
 from the loop, and not used as a routine reboot. This file is version 15.
 It is not the published Pages payload.
-Chao, official mouths, boost rips, and hockey-stop sheets are not packed yet, packing is allowed.
+Chao, official mouths, and boost rips are not packed yet, packing is allowed.
+The three hockey-stop frames are packed and face right.
 Aura, shockwave, sound barrier, and full-speed sparks are V2 primitives
 drawn on top of Sonic. The native path saturating-adds them in RGB565.
 FACE_ENABLED stays off.
@@ -168,8 +169,8 @@ FX_FRAME_MS = 1000 // 15  # 15 fps, same as S3Vec run_fast
 # Hockey stop. Brake bit plus a hard decel, then a 3-frame pose.
 # Enter only while brk is held, decel stays at or above 10 km/h per
 # second, and speed is still above 25 km/h, for HOCKEY_ARM_MS. Leave
-# when the brake releases or decel falls under 6. The pack has no
-# hockey frames; the pose waits for art facing right.
+# when the brake releases or decel falls under 6. The three packed
+# frames face right.
 HOCKEY_MIN_KMH = 25.0
 HOCKEY_ON_DECEL = 10.0
 HOCKEY_OFF_DECEL = 6.0
@@ -469,8 +470,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "f33a0418a01743d405be8cee372a3ad0b8c3d72efbc8e2f0f95720468cb2c1c0"
-PIXIDX_SIZE = 216653
+PIXIDX_SHA256 = "ac3be0a343ecccc8dfd01c9043ec736cd27d267fac23d5fb2d60070a7b2b6b76"
+PIXIDX_SIZE = 225174
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -2908,7 +2909,7 @@ def _underlay_budget(pack):
         return best
 
     sonic = 0
-    for key in ("idle", "idle_trigger", "run_slow", "run_medium", "run_fast"):
+    for key in ("idle", "idle_trigger", "run_slow", "run_medium", "run_fast", "hockey"):
         sonic = max(sonic, max_bytes(pack.cycles.get(key)))
     rings = max_bytes(pack.cycles.get("rings"))
     spark = max_bytes(pack.cycles.get("rings_sparkle"))
@@ -3187,6 +3188,10 @@ def _bake_frame_list(pack):
     spark = pack.cycles.get("rings_sparkle")
     if spark:
         frames.extend(spark)
+    # Same C stamp path as the run cycle. Missing art just skips the bake.
+    hockey = pack.cycles.get("hockey")
+    if hockey:
+        frames.extend(hockey)
     return frames
 
 
