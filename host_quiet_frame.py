@@ -619,7 +619,7 @@ def main():
     assert fw.SW_TIP_X == 76
     assert fw.SPARK_FRONT_X == 22 and fw.SPARK_MID_Y == 88
     assert fw.FX_FRAME_MS == 1000 // 15
-    assert fw.HOCKEY_ON_DECEL == 10.0 and fw.HOCKEY_OFF_DECEL == 6.0
+    assert fw.HOCKEY_ON_DECEL == 5.0 and fw.HOCKEY_OFF_DECEL == 6.0
     assert fw.HOCKEY_MIN_KMH == 25.0
     assert 150 <= fw.HOCKEY_ARM_MS <= 200
     assert fw.HOCKEY_FRAMES == 3

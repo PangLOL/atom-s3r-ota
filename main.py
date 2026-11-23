@@ -173,12 +173,12 @@ VTEC_ON_RPM = 5400.0
 VTEC_OFF_RPM = 5100.0
 FX_FRAME_MS = 1000 // 15  # 15 fps, same as S3Vec run_fast
 # Hockey stop. Brake bit plus a hard decel, then a 3-frame pose.
-# Enter only while brk is held, decel stays at or above 10 km/h per
+# Enter only while brk is held, decel stays at or above 5 km/h per
 # second, and speed is still above 25 km/h, for HOCKEY_ARM_MS. Leave
 # when the brake releases or decel falls under 6. The three packed
 # frames face right.
 HOCKEY_MIN_KMH = 25.0
-HOCKEY_ON_DECEL = 10.0
+HOCKEY_ON_DECEL = 5.0
 HOCKEY_OFF_DECEL = 6.0
 HOCKEY_ARM_MS = 180
 HOCKEY_FRAMES = 3
