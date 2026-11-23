@@ -32,9 +32,10 @@ The OTA client stays, on its existing schedule; its HTTP fetch cannot
 block forever. A machine.WDT is armed after the first heavy alloc, fed
 from the loop, and not used as a routine reboot. This file is version 15.
 It is not the published Pages payload.
-Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
-barrier still use V2 primitives, layered on top of Sonic at tip (66, 72),
-alpha 178. FACE_ENABLED stays off.
+Chao, official mouths, boost rips, and hockey-stop sheets are not packed.
+Aura, shockwave, sound barrier, and full-speed sparks are V2 primitives
+drawn on top of Sonic. The native path saturating-adds them in RGB565.
+FACE_ENABLED stays off.
 Companion asset pixidx.bin is fetched from the OTA host if missing, stale, or
 the wrong size / geometry (a leftover V6 pack must not be used).
 
@@ -164,6 +165,16 @@ BOOST_END_MS = 2000
 VTEC_ON_RPM = 5400.0
 VTEC_OFF_RPM = 5100.0
 FX_FRAME_MS = 1000 // 15  # 15 fps, same as S3Vec run_fast
+# Hockey stop. Brake bit plus a hard decel, then a 3-frame pose.
+# Enter only while brk is held, decel stays at or above 10 km/h per
+# second, and speed is still above 25 km/h, for HOCKEY_ARM_MS. Leave
+# when the brake releases or decel falls under 6. The pack has no
+# hockey frames; the pose waits for original art facing right.
+HOCKEY_MIN_KMH = 25.0
+HOCKEY_ON_DECEL = 10.0
+HOCKEY_OFF_DECEL = 6.0
+HOCKEY_ARM_MS = 180
+HOCKEY_FRAMES = 3
 SONIC_MID_Y = 72
 AURA_TIP_X = 66
 SW_TIP_X = 76
@@ -481,7 +492,11 @@ SONIC_FRONT_X = 54
 SONIC_FEET_DEST_X = SONIC_X + SONIC_W // 2  # 35
 SONIC_FEET_DEST_Y = SONIC_Y + SONIC_H       # 91
 AURA_TIP_Y = SONIC_MID_Y  # 72
-AURA_ALPHA = 178
+BAR_TIP_X = 68            # 8 px left of the shockwave tip
+BAR_TIP_Y = SONIC_MID_Y   # 72
+SPARK_FRONT_X = 22
+SPARK_MID_Y = 88
+SPARK_FRAMES = 4
 HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
 GROUND_SURFACE_IN_TILE = 0  # unused; feet dest is locked, backdrop includes ground
@@ -3989,6 +4004,7 @@ class Sweep:
             "rpm": clamp(rpm, RPM_MIN, RPM_MAX),
             "tps": clamp(tps, TPS_MIN, TPS_MAX),
             "clt": clamp(clt, CLT_MIN, CLT_MAX),
+            "brk": 0.0,
         }
 
 
@@ -4128,22 +4144,46 @@ def draw_shockwave(lcd, tip_x, tip_y, frame):
 
 
 def draw_barrier(lcd, tip_x, tip_y, frame):
-    """Original sound-barrier after the end shockwave. 6 short frames."""
-    if frame < 0 or frame > 5:
+    """Original sound barrier. Four frames: grow, peak, near streak, far streak."""
+    if frame < 0 or frame > 3:
         return
-    # Grow a thin vertical ripple, then streak it forward and fade.
-    if frame <= 2:
-        h = 6 + frame * 6
-        x = tip_x + 2 + frame
+    # Same shapes as the old frames 0, 2, 3, and 5.
+    if frame <= 1:
+        h = 6 if frame == 0 else 18
+        x = tip_x + (2 if frame == 0 else 4)
         _chevron_column(lcd, x, tip_y, h, 4, COL_AURA_W, steps=3)
         _chevron_column(lcd, x - 4, tip_y, max(4, h - 3), 3, COL_AURA_I, steps=3)
     else:
-        k = frame - 2
+        k = 1 if frame == 2 else 3
         x = tip_x + 6 + k * 8
         h = 22 - k * 4
         _chevron_column(lcd, x, tip_y, max(4, h), 3, COL_AURA_I, steps=3)
         fill_triangle(lcd, x + 2, tip_y - h, x + 8 + k, tip_y - h + 2, x + 2, tip_y - h + 6, COL_AURA_W)
         fill_triangle(lcd, x + 2, tip_y + h, x + 8 + k, tip_y + h - 2, x + 2, tip_y + h - 6, COL_AURA_M)
+
+
+def draw_sparks(lcd, front_x, mid_y, frame):
+    """Original full-speed sparks. Short streaks trail left from the front.
+
+    Not a blue boost trail, and not copied from a ripped sheet. The panel
+    fallback replaces pixels. The native path saturating-adds them.
+    """
+    if frame < 0:
+        return
+    shards = (
+        ((-1, -1, 5, COL_AURA_W), (-4, 3, 4, COL_AURA_I), (-7, -4, 3, COL_AURA_W), (-3, 6, 3, COL_AURA_I)),
+        ((-2, 1, 6, COL_AURA_I), (-5, -3, 4, COL_AURA_W), (-8, 4, 3, COL_AURA_I), (-3, -6, 3, COL_AURA_W)),
+        ((-1, 2, 5, COL_AURA_W), (-6, -1, 5, COL_AURA_I), (-4, 5, 3, COL_AURA_W), (-9, -3, 3, COL_AURA_I)),
+        ((-2, -2, 4, COL_AURA_I), (-5, 2, 6, COL_AURA_W), (-8, -5, 3, COL_AURA_I), (-3, 5, 4, COL_AURA_W)),
+    )
+    for dx, dy, length, col in shards[frame % SPARK_FRAMES]:
+        fill_triangle(
+            lcd,
+            front_x + dx, mid_y + dy,
+            front_x + dx - length, mid_y + dy - 1,
+            front_x + dx - 2, mid_y + dy + 2,
+            col,
+        )
 
 
 class BoostFX:
@@ -4157,10 +4197,13 @@ class BoostFX:
         self.aura_i = -1
         self.sw_i = -1
         self.bar_i = -1
+        self.spark_i = -1
+        self.spark_on = False
         self.start_sw_done = False
         self.ticks = 0
 
     def reset(self):
+        """End the boost sequence. The spark index stays with _sync_spark."""
         self.initiated = False
         self.phase = "idle"
         self.accum = 0
@@ -4171,14 +4214,27 @@ class BoostFX:
         self.start_sw_done = False
         self.ticks = 0
 
+    def _sync_spark(self, speed):
+        if speed >= SPEED_FAST:
+            if self.spark_i < 0:
+                self.spark_i = 0
+            self.spark_on = True
+        else:
+            self.spark_i = -1
+            self.spark_on = False
+
     def tick(self, speed, dt_ms, rpm=None):
         # `speed` stays for callers. The aura follows rpm, not km/h.
+        # Sparks follow full-speed running, on the same 15 fps clock.
         if rpm is None:
             rpm = 0.0
+        if speed is None:
+            speed = 0.0
+        self._sync_spark(speed)
         if self._vtec_on(rpm):
             self.below_ms = 0
             if not self.initiated or self.phase in ("end_sw", "barrier", "idle"):
-                # (Re)initiate: aura 1 + shockwave once on top.
+                # (Re)initiate: aura frame 0, shockwave once on top.
                 self.initiated = True
                 self.phase = "run"
                 self.accum = 0
@@ -4201,7 +4257,7 @@ class BoostFX:
             elif self.phase == "idle":
                 self.below_ms = 0
 
-        if self.phase == "idle":
+        if self.phase == "idle" and self.spark_i < 0:
             return
 
         self.accum += dt_ms
@@ -4230,13 +4286,11 @@ class BoostFX:
 
     def _step_frame(self):
         self.ticks += 1
+        if self.spark_on and self.spark_i >= 0:
+            self.spark_i = (self.spark_i + 1) % SPARK_FRAMES
         if self.phase == "run":
-            # Aura: frame 1, then 2, then cycle 3 and 4.
-            if self.ticks == 1:
-                self.aura_i = 1
-            elif self.ticks >= 2:
-                # ticks 2+ : cycle frames 2 and 3 (aura 3 and 4)
-                self.aura_i = 2 + ((self.ticks - 2) & 1)
+            # All four aura frames, for the whole boost, at 15 fps.
+            self.aura_i = (self.aura_i + 1) & 3
             if not self.start_sw_done:
                 if self.sw_i < 4:
                     self.sw_i += 1
@@ -4251,7 +4305,7 @@ class BoostFX:
                 self.sw_i = -1
                 self.bar_i = 0
         elif self.phase == "barrier":
-            if self.bar_i < 5:
+            if self.bar_i < 3:
                 self.bar_i += 1
             else:
                 self.reset()
@@ -4264,7 +4318,9 @@ class BoostFX:
         if self.sw_i >= 0:
             draw_shockwave(lcd, tip_x, tip_y, self.sw_i)
         if self.bar_i >= 0:
-            draw_barrier(lcd, tip_x, tip_y, self.bar_i)
+            draw_barrier(lcd, BAR_TIP_X, BAR_TIP_Y, self.bar_i)
+        if self.spark_i >= 0:
+            draw_sparks(lcd, SPARK_FRONT_X, SPARK_MID_Y, self.spark_i)
 
 
 class Sprite:
@@ -4285,6 +4341,12 @@ class Sprite:
         self.anim_accum = 0
         self.idle_wait = 0
         self.triggering = False
+        self.hockey = False
+        self.hockey_i = -1
+        self._hockey_arm = 0
+        self._hockey_accum = 0
+        self._spd_prev = None
+        self.decel = 0.0
         self.ring_i = 0
         self.ring_accum = 0
         self.sparkles = []  # [x, y, i, accum]
@@ -4376,6 +4438,7 @@ class Sprite:
         self._nat_aura = -999
         self._nat_sw = -999
         self._nat_bar = -999
+        self._nat_spk = -999
         self._nat_spark = []
         self._off_buf = []
         self._sync_ground()
@@ -4597,21 +4660,63 @@ class Sprite:
         del self._under_spans[:]
         self._retain = True
 
-    def advance(self, speed, dt_ms, rpm=None):
+    def advance(self, speed, dt_ms, rpm=None, brk=None):
         if speed is None:
             speed = 0.0
         if rpm is None:
             rpm = 0.0
+        if brk is None:
+            brk = 0.0
         period = self._scroll_period
         self.scroll = (self.scroll + speed * dt_ms * 0.012) % period
         if speed < 1.0:
             self.phase = 0.0
         else:
             self.phase = (self.phase + dt_ms * (0.002 + 0.00035 * speed)) % 4.0
+        self._step_hockey(speed, dt_ms, brk)
         self.boost.tick(speed, dt_ms, rpm)
         self._step_anim(speed, dt_ms)
         self._collect_rings()
         self._step_sparkles(dt_ms)
+
+    def _step_hockey(self, speed, dt_ms, brk):
+        """Arm a 3-frame stop when the brake and the decel both stay hard.
+
+        The pose faces the way the run faces. Nothing is drawn until a
+        `hockey` cycle exists in the pack, and that cycle has to be
+        original art facing right. Ripped sheets stay off the device.
+        """
+        prev = self._spd_prev
+        self._spd_prev = speed
+        if prev is None or dt_ms <= 0:
+            decel = 0.0
+        else:
+            decel = (prev - speed) * (1000.0 / float(dt_ms))
+        self.decel = decel
+        braking = brk >= 0.5
+        if self.hockey:
+            if (not braking) or decel < HOCKEY_OFF_DECEL:
+                self.hockey = False
+                self.hockey_i = -1
+                self._hockey_arm = 0
+                self._hockey_accum = 0
+                return
+            self._hockey_accum += dt_ms
+            if self._hockey_accum >= FX_FRAME_MS:
+                self._hockey_accum -= FX_FRAME_MS
+                if self._hockey_accum > FX_FRAME_MS:
+                    self._hockey_accum = FX_FRAME_MS
+                if self.hockey_i < HOCKEY_FRAMES - 1:
+                    self.hockey_i += 1
+            return
+        if braking and decel >= HOCKEY_ON_DECEL and speed > HOCKEY_MIN_KMH:
+            self._hockey_arm += dt_ms
+            if self._hockey_arm >= HOCKEY_ARM_MS:
+                self.hockey = True
+                self.hockey_i = 0
+                self._hockey_accum = 0
+        else:
+            self._hockey_arm = 0
 
     def _cycle_frames(self, tag):
         pack = self.pack
@@ -4623,7 +4728,12 @@ class Sprite:
         pack = self.pack
         if pack is None:
             return
-        if speed < 1.0:
+        hockey_frames = None
+        if self.hockey:
+            hockey_frames = self._cycle_frames("hockey")
+        if hockey_frames:
+            tag = "hockey"
+        elif speed < 1.0:
             if self.triggering:
                 tag = "idle_trigger"
             else:
@@ -4643,24 +4753,38 @@ class Sprite:
                 tag = "run_medium"
             else:
                 tag = "run_fast"
-        frames = self._cycle_frames(tag)
+        if hockey_frames:
+            frames = hockey_frames
+        else:
+            frames = self._cycle_frames(tag)
         if not frames:
             return
         if tag != self.anim_tag:
             # Show the first frame of the new cycle for this present.
             self.anim_tag = tag
-            self.anim_i = 0
-            self.anim_accum = 0
-        else:
-            # One Sonic frame per present. A late paint must not spend
-            # leftover dt on a second step.
-            self.anim_i += 1
-            if self.anim_i >= len(frames):
+            if tag == "hockey":
+                self.anim_i = self.hockey_i if self.hockey_i >= 0 else 0
+            else:
                 self.anim_i = 0
-                if self.anim_tag == "idle_trigger":
-                    self.triggering = False
-                    self.anim_tag = "idle"
-                    self.idle_wait = 0
+            self.anim_accum = 0
+        elif tag == "hockey":
+            self.anim_i = self.hockey_i if self.hockey_i >= 0 else 0
+            if self.anim_i >= len(frames):
+                self.anim_i = len(frames) - 1
+        else:
+            # Character frames at 15 fps. A late paint still takes one step.
+            self.anim_accum += dt_ms
+            if self.anim_accum >= FX_FRAME_MS:
+                self.anim_accum -= FX_FRAME_MS
+                if self.anim_accum > FX_FRAME_MS:
+                    self.anim_accum = FX_FRAME_MS
+                self.anim_i += 1
+                if self.anim_i >= len(frames):
+                    self.anim_i = 0
+                    if self.anim_tag == "idle_trigger":
+                        self.triggering = False
+                        self.anim_tag = "idle"
+                        self.idle_wait = 0
         self.ring_i = (self.ring_i + 1) & 7
 
     def _purge_sparkles(self):
@@ -6008,6 +6132,7 @@ class Sprite:
             self._nat_aura != boost.aura_i
             or self._nat_sw != boost.sw_i
             or self._nat_bar != boost.bar_i
+            or self._nat_spk != boost.spark_i
         ):
             return False
         sp = self.sparkles
@@ -6053,6 +6178,7 @@ class Sprite:
         self._nat_aura = boost.aura_i
         self._nat_sw = boost.sw_i
         self._nat_bar = boost.bar_i
+        self._nat_spk = boost.spark_i
         prev = self._nat_spark
         del prev[:]
         for item in self.sparkles:
@@ -6142,6 +6268,7 @@ class Sprite:
                     window, vw, vh,
                     boost.aura_i, boost.sw_i, boost.bar_i,
                     AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
+                    boost.spark_i, BAR_TIP_X, SPARK_FRONT_X, SPARK_MID_Y,
                 )
             finally:
                 _brk_exit()
@@ -6797,7 +6924,10 @@ class Dashboard:
         t_adv = _mono_us()
         _brk_enter("adv")
         try:
-            self.sprite.advance(speed, dt, rpm)
+            brk = values.get("brk")
+            if brk is None:
+                brk = 0.0
+            self.sprite.advance(speed, dt, rpm, brk)
         finally:
             _brk_exit()
         _flow_add("adv", _us_diff(_mono_us(), t_adv))

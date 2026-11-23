@@ -168,13 +168,28 @@ def main():
     sprite.idle_wait = 0
     sprite.triggering = False
     sprite._step_anim(0.0, 45)
-    assert sprite.anim_i == 1 and sprite.ring_i == 1
-    sprite._step_anim(0.0, 90)
-    assert sprite.anim_i == 2 and sprite.ring_i == 2
+    assert sprite.anim_i == 0 and sprite.anim_accum == 45 and sprite.ring_i == 1
+    sprite._step_anim(0.0, 30)
+    assert sprite.anim_i == 1 and sprite.anim_accum == 9 and sprite.ring_i == 2
     sprite._step_anim(120.0, 80)
-    assert sprite.anim_tag == "run_fast" and sprite.anim_i == 0
+    assert sprite.anim_tag == "run_fast" and sprite.anim_i == 0 and sprite.anim_accum == 0
     sprite._step_anim(120.0, 80)
     assert sprite.anim_i == 1 and sprite.ring_i == 4
+    # Idle trigger still keys off the same wait. The frame rate does not.
+    sprite.pack.cycles["idle_trigger"] = [_Fr(), _Fr(), _Fr()]
+    sprite.anim_tag = "idle"
+    sprite.anim_i = 0
+    sprite.anim_accum = 0
+    sprite.idle_wait = 0
+    sprite.triggering = False
+    waited = 0
+    while waited < fw.IDLE_TRIGGER_AFTER_MS - 50:
+        sprite._step_anim(0.0, 50)
+        waited += 50
+    assert sprite.triggering is False and sprite.anim_tag == "idle"
+    assert sprite.idle_wait == waited
+    sprite._step_anim(0.0, 50)
+    assert sprite.triggering is True and sprite.anim_tag == "idle_trigger"
     assert fw.anim_dt(40) == 40
     assert fw.anim_dt(50) == 50
     assert fw.anim_dt(134) == fw.REFRESH_MS
@@ -496,6 +511,72 @@ def main():
     assert fx.phase == "idle", "100 km/h under 5400 rpm does not start the aura"
     fx.tick(20.0, 50, fw.VTEC_ON_RPM)
     assert fx.phase == "run" and fx.aura_i == 0 and fx.initiated
+    assert fx.spark_i < 0
+    seen = [fx.aura_i]
+    guard = 0
+    while len(seen) < 8 and guard < 12:
+        fx.tick(20.0, fw.FX_FRAME_MS, fw.VTEC_ON_RPM)
+        seen.append(fx.aura_i)
+        guard += 1
+    assert seen[:8] == [0, 1, 2, 3, 0, 1, 2, 3], seen
+    assert fx.sw_i < 0 and fx.start_sw_done
+    fast = fw.BoostFX()
+    fast.tick(fw.SPEED_FAST, 20, 0.0)
+    assert fast.phase == "idle" and fast.spark_i == 0
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 1
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 2
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 3
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 0
+    fast.tick(fw.SPEED_FAST - 1.0, 10, 0.0)
+    assert fast.spark_i < 0
+    assert not hasattr(fw, "AURA_ALPHA")
+    assert fw.BAR_TIP_X == 68 and fw.BAR_TIP_Y == 72
+    assert fw.AURA_TIP_X == 66 and fw.AURA_TIP_Y == 72
+    assert fw.SW_TIP_X == 76
+    assert fw.SPARK_FRONT_X == 22 and fw.SPARK_MID_Y == 88
+    assert fw.FX_FRAME_MS == 1000 // 15
+    assert fw.HOCKEY_ON_DECEL == 10.0 and fw.HOCKEY_OFF_DECEL == 6.0
+    assert fw.HOCKEY_MIN_KMH == 25.0
+    assert 150 <= fw.HOCKEY_ARM_MS <= 200
+    assert fw.HOCKEY_FRAMES == 3
+    stop = fw.Sprite(None)
+    stop._spd_prev = 80.0
+    stop._step_hockey(78.0, 100, 1.0)
+    assert stop.hockey is False and stop._hockey_arm == 100
+    stop._step_hockey(76.0, 100, 1.0)
+    assert stop.hockey is True and stop.hockey_i == 0
+    stop._step_hockey(74.0, fw.FX_FRAME_MS, 1.0)
+    assert stop.hockey is True and stop.hockey_i == 1
+    stop._step_hockey(72.0, fw.FX_FRAME_MS, 1.0)
+    stop._step_hockey(70.0, fw.FX_FRAME_MS, 1.0)
+    assert stop.hockey_i == 2
+    stop._step_hockey(68.0, fw.FX_FRAME_MS, 1.0)
+    assert stop.hockey_i == 2
+    stop._step_hockey(67.5, 200, 1.0)
+    assert stop.hockey is False
+    slow = fw.Sprite(None)
+    slow._spd_prev = 30.0
+    slow._step_hockey(20.0, 200, 1.0)
+    assert slow.hockey is False and slow._hockey_arm == 0
+    stop.pack = type("Pack", (), {})()
+    stop.pack.cycles = {
+        "hockey": [_Fr(), _Fr(), _Fr()],
+        "run_fast": [_Fr(), _Fr()],
+    }
+    stop.hockey = True
+    stop.hockey_i = 1
+    stop.anim_tag = "run_fast"
+    stop.anim_i = 0
+    stop.anim_accum = 0
+    stop.ring_i = 0
+    stop.idle_wait = 0
+    stop.triggering = False
+    stop._step_anim(70.0, 16)
+    assert stop.anim_tag == "hockey" and stop.anim_i == 1
     fx.tick(20.0, 800, fw.VTEC_OFF_RPM)
     assert fx.phase == "run" and fx.below_ms == 0
     fx.tick(20.0, fw.BOOST_END_MS - 1, fw.VTEC_OFF_RPM - 1)

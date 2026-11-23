@@ -86,6 +86,98 @@ static void put565(uint8_t *p, uint16_t c) {
     p[1] = (uint8_t)(c >> 8);
 }
 
+/* Saturating add in the RGB565 channels: dst = min(max, dst + src).
+   HUD digits leave gh_fx_add clear and keep replacing pixels. */
+static uint16_t add565(uint16_t dst, uint16_t src) {
+    unsigned dr = (unsigned)(dst >> 11);
+    unsigned dg = (unsigned)((dst >> 5) & 63u);
+    unsigned db = (unsigned)(dst & 31u);
+    unsigned sr = (unsigned)(src >> 11);
+    unsigned sg = (unsigned)((src >> 5) & 63u);
+    unsigned sb = (unsigned)(src & 31u);
+    unsigned r = dr + sr;
+    unsigned g = dg + sg;
+    unsigned b = db + sb;
+    if (r > 31u) {
+        r = 31u;
+    }
+    if (g > 63u) {
+        g = 63u;
+    }
+    if (b > 31u) {
+        b = 31u;
+    }
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+/* One bit per pixel so the fills inside one effect contribute once.
+   128*128 is enough for the playfield. A larger buffer adds every write. */
+#define GH_FX_COVER_BYTES 2048
+uint8_t gh_fx_cover[GH_FX_COVER_BYTES];
+static int gh_fx_add;
+static int gh_fx_vw;
+static int gh_fx_vh;
+static int gh_fx_cover_n;
+static int gh_fx_mask_ok;
+
+static void gh_fx_begin(int vw, int vh) {
+    int n = (vw * vh + 7) >> 3;
+    gh_fx_add = 1;
+    gh_fx_vw = vw;
+    gh_fx_vh = vh;
+    if (n > 0 && n <= GH_FX_COVER_BYTES) {
+        gh_fx_mask_ok = 1;
+        gh_fx_cover_n = n;
+        memset(gh_fx_cover, 0, (size_t)n);
+    } else {
+        gh_fx_mask_ok = 0;
+        gh_fx_cover_n = 0;
+    }
+}
+
+static void gh_fx_end(void) {
+    gh_fx_add = 0;
+}
+
+static void gh_fx_cover_clear(void) {
+    if (gh_fx_mask_ok && gh_fx_cover_n > 0) {
+        memset(gh_fx_cover, 0, (size_t)gh_fx_cover_n);
+    }
+}
+
+/* Front-most primitive is drawn first and claims the pixel. */
+static int gh_fx_claim(int x, int y) {
+    int i;
+    unsigned bit;
+    uint8_t *p;
+    if (!gh_fx_mask_ok) {
+        return 1;
+    }
+    if ((unsigned)x >= (unsigned)gh_fx_vw || (unsigned)y >= (unsigned)gh_fx_vh) {
+        return 0;
+    }
+    i = y * gh_fx_vw + x;
+    bit = 1u << (i & 7);
+    p = gh_fx_cover + (i >> 3);
+    if (*p & (uint8_t)bit) {
+        return 0;
+    }
+    *p = (uint8_t)(*p | (uint8_t)bit);
+    return 1;
+}
+
+static void write565(uint8_t *p, int x, int y, uint16_t c) {
+    if (gh_fx_add) {
+        uint16_t dst;
+        if (!gh_fx_claim(x, y)) {
+            return;
+        }
+        dst = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+        c = add565(dst, c);
+    }
+    put565(p, c);
+}
+
 static void hline(uint8_t *buf, int vw, int vh, int x, int y, int w, uint16_t c) {
     int i;
     uint8_t *p;
@@ -111,7 +203,7 @@ static void hline(uint8_t *buf, int vw, int vh, int x, int y, int w, uint16_t c)
     }
     p = buf + ((y * vw + x) * 2);
     for (i = 0; i < w; i++) {
-        put565(p, c);
+        write565(p, x + i, y, c);
         p += 2;
     }
 }
@@ -171,7 +263,7 @@ static void draw_line(uint8_t *buf, int vw, int vh, int x0, int y0, int x1, int 
     int guard = 0;
     for (;;) {
         if ((unsigned)x0 < (unsigned)vw && (unsigned)y0 < (unsigned)vh) {
-            put565(buf + ((y0 * vw + x0) * 2), c);
+            write565(buf + ((y0 * vw + x0) * 2), x0, y0, c);
         }
         if (x0 == x1 && y0 == y1) {
             break;
@@ -833,18 +925,10 @@ static void draw_aura(uint8_t *buf, int vw, int vh, int tip_x, int tip_y, int fr
     int i;
     uint16_t cols[3];
     static const int spikes[4][2] = {{-8, 8}, {-3, 12}, {3, 11}, {8, 7}};
-    fill_ellipse_clamped(buf, vw, vh, cx, cy, rx + 1, ry + 1, mid);
-    gh_fill_triangle(buf, vw, vh, cx + rx - 5, cy - 6, tip_x + 1, cy, cx + rx - 5, cy + 6, mid);
-    fill_ellipse_clamped(buf, vw, vh, cx + 2, cy, imax(2, rx - 5), imax(2, ry - 4), lo);
-    fill_ellipse_clamped(buf, vw, vh, cx + 6, cy, imax(2, rx - 11), imax(2, ry - 7), hi);
-    cols[0] = hi;
-    cols[1] = ice;
-    cols[2] = mid;
-    for (i = 0; i < 3; i++) {
-        chevron(buf, vw, vh, cx - 2 + i * 5 + shift, cy, imax(4, ry - 2), 5, cols[i], 4);
-    }
+    /* Front to back, so each pixel takes the front color once, then adds. */
+    gh_fx_cover_clear();
     back = cx - rx;
-    for (i = 0; i < 4; i++) {
+    for (i = 3; i >= 0; i--) {
         int dy = spikes[i][0];
         int length = spikes[i][1];
         uint16_t col = dy < 0 ? lo : mid;
@@ -854,6 +938,16 @@ static void draw_aura(uint8_t *buf, int vw, int vh, int tip_x, int tip_y, int fr
                          back + 2, cy + dy + 3,
                          col);
     }
+    cols[0] = hi;
+    cols[1] = ice;
+    cols[2] = mid;
+    for (i = 2; i >= 0; i--) {
+        chevron(buf, vw, vh, cx - 2 + i * 5 + shift, cy, imax(4, ry - 2), 5, cols[i], 4);
+    }
+    fill_ellipse_clamped(buf, vw, vh, cx + 6, cy, imax(2, rx - 11), imax(2, ry - 7), hi);
+    fill_ellipse_clamped(buf, vw, vh, cx + 2, cy, imax(2, rx - 5), imax(2, ry - 4), lo);
+    gh_fill_triangle(buf, vw, vh, cx + rx - 5, cy - 6, tip_x + 1, cy, cx + rx - 5, cy + 6, mid);
+    fill_ellipse_clamped(buf, vw, vh, cx, cy, rx + 1, ry + 1, mid);
 }
 
 static void draw_shockwave(uint8_t *buf, int vw, int vh, int tip_x, int tip_y, int frame) {
@@ -875,20 +969,21 @@ static void draw_shockwave(uint8_t *buf, int vw, int vh, int tip_x, int tip_y, i
     cw = gh_rgb888_to_565(COL_AURA_W);
     ci = gh_rgb888_to_565(COL_AURA_I);
     cm = gh_rgb888_to_565(COL_AURA_M);
+    gh_fx_cover_clear();
     if (frame < 4) {
-        chevron(buf, vw, vh, tip_x - 1, tip_y, h, w, cw, 4 + frame);
-        chevron(buf, vw, vh, tip_x - 6, tip_y, imax(4, h - 3), w - 2, ci, 4);
-        chevron(buf, vw, vh, tip_x - 11, tip_y, imax(4, h - 6), imax(3, w - 3), cm, 3);
         if (frame >= 2) {
             chevron(buf, vw, vh, tip_x + 3, tip_y, imax(4, h - 8), 4, ci, 3);
         }
+        chevron(buf, vw, vh, tip_x - 11, tip_y, imax(4, h - 6), imax(3, w - 3), cm, 3);
+        chevron(buf, vw, vh, tip_x - 6, tip_y, imax(4, h - 3), w - 2, ci, 4);
+        chevron(buf, vw, vh, tip_x - 1, tip_y, h, w, cw, 4 + frame);
     } else {
         int i;
         uint16_t cols[3];
         cols[0] = ci;
         cols[1] = cw;
         cols[2] = cm;
-        for (i = 0; i < 12; i++) {
+        for (i = 11; i >= 0; i--) {
             int dx = frags[i][0];
             int dy = frags[i][1];
             int s = frags[i][2];
@@ -902,42 +997,83 @@ static void draw_shockwave(uint8_t *buf, int vw, int vh, int tip_x, int tip_y, i
     }
 }
 
+/* Four-frame barrier. 0 and 1 grow the ripple; 2 and 3 streak it out.
+   Same shapes as the old frames 0, 2, 3, and 5, packed into one loop. */
 static void draw_barrier(uint8_t *buf, int vw, int vh, int tip_x, int tip_y, int frame) {
     uint16_t cw = gh_rgb888_to_565(COL_AURA_W);
     uint16_t ci = gh_rgb888_to_565(COL_AURA_I);
     uint16_t cm = gh_rgb888_to_565(COL_AURA_M);
-    if (frame < 0 || frame > 5) {
+    if (frame < 0 || frame > 3) {
         return;
     }
-    if (frame <= 2) {
-        int h = 6 + frame * 6;
-        int x = tip_x + 2 + frame;
-        chevron(buf, vw, vh, x, tip_y, h, 4, cw, 3);
+    gh_fx_cover_clear();
+    if (frame <= 1) {
+        int h = frame == 0 ? 6 : 18;
+        int x = tip_x + (frame == 0 ? 2 : 4);
         chevron(buf, vw, vh, x - 4, tip_y, imax(4, h - 3), 3, ci, 3);
+        chevron(buf, vw, vh, x, tip_y, h, 4, cw, 3);
     } else {
-        int k = frame - 2;
+        int k = frame == 2 ? 1 : 3;
         int x = tip_x + 6 + k * 8;
         int h = 22 - k * 4;
-        chevron(buf, vw, vh, x, tip_y, imax(4, h), 3, ci, 3);
-        gh_fill_triangle(buf, vw, vh,
-                         x + 2, tip_y - h,
-                         x + 8 + k, tip_y - h + 2,
-                         x + 2, tip_y - h + 6,
-                         cw);
         gh_fill_triangle(buf, vw, vh,
                          x + 2, tip_y + h,
                          x + 8 + k, tip_y + h - 2,
                          x + 2, tip_y + h - 6,
                          cm);
+        gh_fill_triangle(buf, vw, vh,
+                         x + 2, tip_y - h,
+                         x + 8 + k, tip_y - h + 2,
+                         x + 2, tip_y - h + 6,
+                         cw);
+        chevron(buf, vw, vh, x, tip_y, imax(4, h), 3, ci, 3);
+    }
+}
+
+/* Original running sparks. Short streaks trail left from the front point.
+   Not a boost trail, and not taken from a ripped sheet. */
+static void draw_sparks(uint8_t *buf, int vw, int vh, int sx, int sy, int frame) {
+    static const int shard[4][4][4] = {
+        {{-1, -1, 5, 0}, {-4, 3, 4, 1}, {-7, -4, 3, 0}, {-3, 6, 3, 1}},
+        {{-2, 1, 6, 1}, {-5, -3, 4, 0}, {-8, 4, 3, 1}, {-3, -6, 3, 0}},
+        {{-1, 2, 5, 0}, {-6, -1, 5, 1}, {-4, 5, 3, 0}, {-9, -3, 3, 1}},
+        {{-2, -2, 4, 1}, {-5, 2, 6, 0}, {-8, -5, 3, 1}, {-3, 5, 4, 0}},
+    };
+    int slot;
+    int i;
+    uint16_t cols[3];
+    if (frame < 0) {
+        return;
+    }
+    slot = mod_pos(frame, 4);
+    gh_fx_cover_clear();
+    cols[0] = gh_rgb888_to_565(COL_AURA_W);
+    cols[1] = gh_rgb888_to_565(COL_AURA_I);
+    cols[2] = gh_rgb888_to_565(COL_AURA_M);
+    for (i = 0; i < 4; i++) {
+        int dx = shard[slot][i][0];
+        int dy = shard[slot][i][1];
+        int len = shard[slot][i][2];
+        uint16_t col = cols[shard[slot][i][3]];
+        gh_fill_triangle(buf, vw, vh,
+                         sx + dx, sy + dy,
+                         sx + dx - len, sy + dy - 1,
+                         sx + dx - 2, sy + dy + 2,
+                         col);
     }
 }
 
 void gh_fx(uint8_t *buf, int vw, int vh,
-           int aura_i, int sw_i, int bar_i,
-           int aura_x, int aura_y, int sw_x) {
+           int aura_i, int sw_i, int bar_i, int spark_i,
+           int aura_x, int aura_y, int sw_x, int bar_x,
+           int spark_x, int spark_y) {
     if (buf == 0 || vw <= 0 || vh <= 0) {
         return;
     }
+    /* Each effect clears the claim mask, then adds its front color once.
+       Later effects add on top of earlier ones. The caller has already
+       stamped Sonic, so this brightens him instead of sitting behind. */
+    gh_fx_begin(vw, vh);
     if (aura_i >= 0) {
         draw_aura(buf, vw, vh, aura_x, aura_y, aura_i);
     }
@@ -945,6 +1081,10 @@ void gh_fx(uint8_t *buf, int vw, int vh,
         draw_shockwave(buf, vw, vh, sw_x, aura_y, sw_i);
     }
     if (bar_i >= 0) {
-        draw_barrier(buf, vw, vh, sw_x, aura_y, bar_i);
+        draw_barrier(buf, vw, vh, bar_x, aura_y, bar_i);
     }
+    if (spark_i >= 0) {
+        draw_sparks(buf, vw, vh, spark_x, spark_y, spark_i);
+    }
+    gh_fx_end();
 }

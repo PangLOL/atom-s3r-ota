@@ -57,10 +57,13 @@ void gh_fill_triangle(uint8_t *buf, int vw, int vh,
                       int x0, int y0, int x1, int y1, int x2, int y2,
                       uint16_t c565);
 
-/* aura_i / sw_i / bar_i < 0 skips that layer. Order is aura, shockwave, barrier. */
+/* aura_i / sw_i / bar_i / spark_i < 0 skips that layer.
+   Order is aura, shockwave, barrier, sparks. Each layer is saturating
+   RGB565 add over the pixels already in buf (Sonic included). */
 void gh_fx(uint8_t *buf, int vw, int vh,
-           int aura_i, int sw_i, int bar_i,
-           int aura_x, int aura_y, int sw_x);
+           int aura_i, int sw_i, int bar_i, int spark_i,
+           int aura_x, int aura_y, int sw_x, int bar_x,
+           int spark_x, int spark_y);
 
 void gh_draw_digit(uint8_t *buf, int vw, int vh,
                    int x, int y, int n,

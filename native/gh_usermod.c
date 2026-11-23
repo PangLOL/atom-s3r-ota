@@ -148,17 +148,38 @@ static mp_obj_t gh_fx_fn(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t win;
     int vw = arg_int(args[1]);
     int vh = arg_int(args[2]);
+    int spark_i;
+    int aura_x, aura_y, sw_x, bar_x, spark_x, spark_y;
     (void)n_args;
     need_buf(args[0], &win, 1);
+    aura_x = arg_int(args[6]);
+    aura_y = arg_int(args[7]);
+    sw_x = arg_int(args[8]);
+    spark_i = -1;
+    bar_x = sw_x;
+    spark_x = 22;
+    spark_y = 88;
+    if (n_args >= 10) {
+        spark_i = arg_int(args[9]);
+    }
+    if (n_args >= 11) {
+        bar_x = arg_int(args[10]);
+    }
+    if (n_args >= 12) {
+        spark_x = arg_int(args[11]);
+    }
+    if (n_args >= 13) {
+        spark_y = arg_int(args[12]);
+    }
     if (vw > 0 && vh > 0) {
         need_len(&win, (size_t)vw * (size_t)vh * 2);
         gh_fx(win.buf, vw, vh,
-              arg_int(args[3]), arg_int(args[4]), arg_int(args[5]),
-              arg_int(args[6]), arg_int(args[7]), arg_int(args[8]));
+              arg_int(args[3]), arg_int(args[4]), arg_int(args[5]), spark_i,
+              aura_x, aura_y, sw_x, bar_x, spark_x, spark_y);
     }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_fx_obj, 9, 9, gh_fx_fn);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_fx_obj, 9, 13, gh_fx_fn);
 
 static mp_obj_t gh_digits(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t win;

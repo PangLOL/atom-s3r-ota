@@ -30,7 +30,7 @@ def _load_lib():
     lib.gh_blit_stamp.argtypes = [u8, ci, ci, ci, u8, u8, ci, ci, ci, ci, ci]
     lib.gh_stamp_sprite.argtypes = [u8, ci, ci, u8, u8, ci, ci, ci, ci]
     lib.gh_expand_indexed.argtypes = [u8, ci, ci, ci, ci, u8, ci, u8]
-    lib.gh_fx.argtypes = [u8, ci, ci, ci, ci, ci, ci, ci, ci]
+    lib.gh_fx.argtypes = [u8, ci, ci, ci, ci, ci, ci, ci, ci, ci, ci, ci, ci]
     lib.gh_draw_hud_digits.argtypes = [u8, ci, ci, ci, ci, ci]
     lib.gh_fill_rect.argtypes = [u8, ci, ci, ci, ci, ci, ci, ctypes.c_uint16]
     lib.gh_fill_ellipse.argtypes = [u8, ci, ci, ci, ci, ci, ci, ctypes.c_uint16]
@@ -124,12 +124,16 @@ class Native(object):
             cs, int(stride), int(bpp), int(w), int(h), cp, int(ncolors), cd
         )
 
-    def fx(self, window, vw, vh, aura_i, sw_i, bar_i, aura_x, aura_y, sw_x):
+    def fx(self, window, vw, vh, aura_i, sw_i, bar_i, aura_x, aura_y, sw_x,
+           spark_i=-1, bar_x=None, spark_x=22, spark_y=88):
+        if bar_x is None:
+            bar_x = 68
         cw = _cbuf(window, True)
         self.lib.gh_fx(
             cw, int(vw), int(vh),
-            int(aura_i), int(sw_i), int(bar_i),
-            int(aura_x), int(aura_y), int(sw_x),
+            int(aura_i), int(sw_i), int(bar_i), int(spark_i),
+            int(aura_x), int(aura_y), int(sw_x), int(bar_x),
+            int(spark_x), int(spark_y),
         )
 
     def digits(self, window, vw, vh, bx, by, rings):
@@ -189,7 +193,7 @@ def _oracle(fw, sprite, amount):
     return bytes(play)
 
 
-def _set_state(sprite, scroll, tag, anim_i, ring_i, sparkles, rings=None, aura=-1, sw=-1, bar=-1):
+def _set_state(sprite, scroll, tag, anim_i, ring_i, sparkles, rings=None, aura=-1, sw=-1, bar=-1, spark=-1):
     sprite.scroll = float(scroll)
     sprite.anim_tag = tag
     sprite.anim_i = anim_i
@@ -200,6 +204,7 @@ def _set_state(sprite, scroll, tag, anim_i, ring_i, sparkles, rings=None, aura=-
     sprite.boost.aura_i = aura
     sprite.boost.sw_i = sw
     sprite.boost.bar_i = bar
+    sprite.boost.spark_i = spark
 
 
 class BufLcd(object):
@@ -262,6 +267,69 @@ def _py_digits(fw, vw, vh, bx, by, rings):
     return bytes(lcd.buf)
 
 
+_FX_ADD = False
+_FX_COVER = bytearray()
+_FX_VW = 0
+_FX_VH = 0
+_FX_N = 0
+
+
+def _add565(dst, src):
+    dr = (dst >> 11) & 31
+    dg = (dst >> 5) & 63
+    db = dst & 31
+    sr = (src >> 11) & 31
+    sg = (src >> 5) & 63
+    sb = src & 31
+    r = dr + sr
+    g = dg + sg
+    b = db + sb
+    if r > 31:
+        r = 31
+    if g > 63:
+        g = 63
+    if b > 31:
+        b = 31
+    return (r << 11) | (g << 5) | b
+
+
+def _fx_begin(vw, vh):
+    global _FX_ADD, _FX_COVER, _FX_VW, _FX_VH, _FX_N
+    _FX_ADD = True
+    _FX_VW = vw
+    _FX_VH = vh
+    _FX_N = (vw * vh + 7) // 8
+    if len(_FX_COVER) < _FX_N:
+        _FX_COVER = bytearray(_FX_N)
+    else:
+        _FX_COVER[:_FX_N] = b"\x00" * _FX_N
+
+
+def _fx_cover_clear():
+    _FX_COVER[:_FX_N] = b"\x00" * _FX_N
+
+
+def _fx_claim(x, y):
+    i = y * _FX_VW + x
+    byte = i >> 3
+    bit = 1 << (i & 7)
+    if _FX_COVER[byte] & bit:
+        return False
+    _FX_COVER[byte] |= bit
+    return True
+
+
+def _store565(buf, vw, x, y, c):
+    i = (y * vw + x) * 2
+    if _FX_ADD:
+        if not _fx_claim(x, y):
+            return
+        dst = buf[i] | (buf[i + 1] << 8)
+        c = _add565(dst, c)
+    buf[i] = c & 0xFF
+    buf[i + 1] = (c >> 8) & 0xFF
+
+
 def _hline(buf, vw, vh, x, y, w, c):
     if w < 0:
         x += w
@@ -277,14 +345,9 @@ def _hline(buf, vw, vh, x, y, w, c):
         w = vw - x
     if w < 1:
         return
-    lo = c & 0xFF
-    hi = (c >> 8) & 0xFF
-    i = (y * vw + x) * 2
     k = 0
     while k < w:
-        buf[i] = lo
-        buf[i + 1] = hi
-        i += 2
+        _store565(buf, vw, x + k, y, c)
         k += 1
 
 
@@ -331,9 +394,7 @@ def _draw_line(buf, vw, vh, x0, y0, x1, y1, c):
     guard = 0
     while True:
         if 0 <= x0 < vw and 0 <= y0 < vh:
-            i = (y0 * vw + x0) * 2
-            buf[i] = c & 0xFF
-            buf[i + 1] = (c >> 8) & 0xFF
+            _store565(buf, vw, x0, y0, c)
         if x0 == x1 and y0 == y1:
             break
         guard += 1
@@ -553,19 +614,23 @@ def _ref_aura(fw, buf, vw, vh, tip_x, tip_y, frame):
     ry = int(13 * scale)
     cx = tip_x - rx + 2
     cy = tip_y
-    _ellipse_clamped(buf, vw, vh, cx, cy, rx + 1, ry + 1, mid)
-    _fill_triangle(buf, vw, vh, cx + rx - 5, cy - 6, tip_x + 1, cy, cx + rx - 5, cy + 6, mid)
-    _ellipse_clamped(buf, vw, vh, cx + 2, cy, max(2, rx - 5), max(2, ry - 4), lo)
-    _ellipse_clamped(buf, vw, vh, cx + 6, cy, max(2, rx - 11), max(2, ry - 7), hi)
     shift = (0, 2, 4, 1)[slot]
-    for i, col in enumerate((hi, ice, mid)):
-        _chevron(buf, vw, vh, cx - 2 + i * 5 + shift, cy, max(4, ry - 2), 5, col, 4)
     back = cx - rx
-    for dy, length in ((-8, 8), (-3, 12), (3, 11), (8, 7)):
+    # Front to back, matching gh_blit.c so the claim mask keeps one color.
+    for dy, length in ((8, 7), (3, 11), (-3, 12), (-8, 8)):
         col = lo if dy < 0 else mid
         _fill_triangle(
             buf, vw, vh, back + 2, cy + dy, back - length, cy + dy, back + 2, cy + dy + 3, col
         )
+    cols = (hi, ice, mid)
+    i = 2
+    while i >= 0:
+        _chevron(buf, vw, vh, cx - 2 + i * 5 + shift, cy, max(4, ry - 2), 5, cols[i], 4)
+        i -= 1
+    _ellipse_clamped(buf, vw, vh, cx + 6, cy, max(2, rx - 11), max(2, ry - 7), hi)
+    _ellipse_clamped(buf, vw, vh, cx + 2, cy, max(2, rx - 5), max(2, ry - 4), lo)
+    _fill_triangle(buf, vw, vh, cx + rx - 5, cy - 6, tip_x + 1, cy, cx + rx - 5, cy + 6, mid)
+    _ellipse_clamped(buf, vw, vh, cx, cy, rx + 1, ry + 1, mid)
 
 
 def _ref_shock(fw, buf, vw, vh, tip_x, tip_y, frame):
@@ -579,17 +644,17 @@ def _ref_shock(fw, buf, vw, vh, tip_x, tip_y, frame):
     ci = _c565(fw, 0xA8E8FF)
     cm = _c565(fw, 0x3A98FF)
     if frame < 4:
-        _chevron(buf, vw, vh, tip_x - 1, tip_y, h, w, cw, 4 + frame)
-        _chevron(buf, vw, vh, tip_x - 6, tip_y, max(4, h - 3), w - 2, ci, 4)
-        _chevron(buf, vw, vh, tip_x - 11, tip_y, max(4, h - 6), max(3, w - 3), cm, 3)
         if frame >= 2:
             _chevron(buf, vw, vh, tip_x + 3, tip_y, max(4, h - 8), 4, ci, 3)
+        _chevron(buf, vw, vh, tip_x - 11, tip_y, max(4, h - 6), max(3, w - 3), cm, 3)
+        _chevron(buf, vw, vh, tip_x - 6, tip_y, max(4, h - 3), w - 2, ci, 4)
+        _chevron(buf, vw, vh, tip_x - 1, tip_y, h, w, cw, 4 + frame)
     else:
         frags = (
-            (-18, -16, 6, ci), (-10, -22, 5, cw), (4, -18, 5, cm),
-            (10, -8, 5, cw), (-20, 8, 5, cm), (-8, 18, 6, cw),
-            (8, 16, 4, ci), (12, 4, 5, cm), (-24, -4, 4, ci),
-            (6, 22, 3, cw), (-14, 20, 4, cm), (14, -20, 4, ci),
+            (14, -20, 4, ci), (-14, 20, 4, cm), (6, 22, 3, cw),
+            (-24, -4, 4, ci), (12, 4, 5, cm), (8, 16, 4, ci),
+            (-8, 18, 6, cw), (-20, 8, 5, cm), (10, -8, 5, cw),
+            (4, -18, 5, cm), (-10, -22, 5, cw), (-18, -16, 6, ci),
         )
         for dx, dy, s, col in frags:
             _fill_triangle(
@@ -602,32 +667,271 @@ def _ref_shock(fw, buf, vw, vh, tip_x, tip_y, frame):
 
 
 def _ref_barrier(fw, buf, vw, vh, tip_x, tip_y, frame):
-    if frame < 0 or frame > 5:
+    if frame < 0 or frame > 3:
         return
     cw = _c565(fw, 0xFFFFFF)
     ci = _c565(fw, 0xA8E8FF)
     cm = _c565(fw, 0x3A98FF)
-    if frame <= 2:
-        h = 6 + frame * 6
-        x = tip_x + 2 + frame
-        _chevron(buf, vw, vh, x, tip_y, h, 4, cw, 3)
+    if frame <= 1:
+        h = 6 if frame == 0 else 18
+        x = tip_x + (2 if frame == 0 else 4)
         _chevron(buf, vw, vh, x - 4, tip_y, max(4, h - 3), 3, ci, 3)
+        _chevron(buf, vw, vh, x, tip_y, h, 4, cw, 3)
     else:
-        k = frame - 2
+        k = 1 if frame == 2 else 3
         x = tip_x + 6 + k * 8
         h = 22 - k * 4
-        _chevron(buf, vw, vh, x, tip_y, max(4, h), 3, ci, 3)
-        _fill_triangle(buf, vw, vh, x + 2, tip_y - h, x + 8 + k, tip_y - h + 2, x + 2, tip_y - h + 6, cw)
         _fill_triangle(buf, vw, vh, x + 2, tip_y + h, x + 8 + k, tip_y + h - 2, x + 2, tip_y + h - 6, cm)
+        _fill_triangle(buf, vw, vh, x + 2, tip_y - h, x + 8 + k, tip_y - h + 2, x + 2, tip_y - h + 6, cw)
+        _chevron(buf, vw, vh, x, tip_y, max(4, h), 3, ci, 3)
 
 
-def _ref_fx(fw, buf, vw, vh, aura_i, sw_i, bar_i, aura_x, aura_y, sw_x):
-    if aura_i >= 0:
-        _ref_aura(fw, buf, vw, vh, aura_x, aura_y, aura_i)
-    if sw_i >= 0:
-        _ref_shock(fw, buf, vw, vh, sw_x, aura_y, sw_i)
-    if bar_i >= 0:
-        _ref_barrier(fw, buf, vw, vh, sw_x, aura_y, bar_i)
+def _ref_spark(fw, buf, vw, vh, sx, sy, frame):
+    if frame < 0:
+        return
+    shards = (
+        ((-1, -1, 5, 0xFFFFFF), (-4, 3, 4, 0xA8E8FF), (-7, -4, 3, 0xFFFFFF), (-3, 6, 3, 0xA8E8FF)),
+        ((-2, 1, 6, 0xA8E8FF), (-5, -3, 4, 0xFFFFFF), (-8, 4, 3, 0xA8E8FF), (-3, -6, 3, 0xFFFFFF)),
+        ((-1, 2, 5, 0xFFFFFF), (-6, -1, 5, 0xA8E8FF), (-4, 5, 3, 0xFFFFFF), (-9, -3, 3, 0xA8E8FF)),
+        ((-2, -2, 4, 0xA8E8FF), (-5, 2, 6, 0xFFFFFF), (-8, -5, 3, 0xA8E8FF), (-3, 5, 4, 0xFFFFFF)),
+    )
+    for dx, dy, length, col in shards[frame % 4]:
+        c = _c565(fw, col)
+        _fill_triangle(
+            buf, vw, vh,
+            sx + dx, sy + dy,
+            sx + dx - length, sy + dy - 1,
+            sx + dx - 2, sy + dy + 2,
+            c,
+        )
+
+
+def _ref_fx(fw, buf, vw, vh, aura_i, sw_i, bar_i, aura_x, aura_y, sw_x,
+            spark_i=-1, bar_x=None, spark_x=None, spark_y=None):
+    global _FX_ADD
+    if bar_x is None:
+        bar_x = fw.BAR_TIP_X
+    if spark_x is None:
+        spark_x = fw.SPARK_FRONT_X
+    if spark_y is None:
+        spark_y = fw.SPARK_MID_Y
+    _fx_begin(vw, vh)
+    try:
+        if aura_i >= 0:
+            _fx_cover_clear()
+            _ref_aura(fw, buf, vw, vh, aura_x, aura_y, aura_i)
+        if sw_i >= 0:
+            _fx_cover_clear()
+            _ref_shock(fw, buf, vw, vh, sw_x, aura_y, sw_i)
+        if bar_i >= 0:
+            _fx_cover_clear()
+            _ref_barrier(fw, buf, vw, vh, bar_x, aura_y, bar_i)
+        if spark_i >= 0:
+            _fx_cover_clear()
+            _ref_spark(fw, buf, vw, vh, spark_x, spark_y, spark_i)
+    finally:
+        _FX_ADD = False
+
+
+def _pix(buf, vw, x, y):
+    i = (y * vw + x) * 2
+    return buf[i] | (buf[i + 1] << 8)
+
+
+def _lum565(c):
+    r = (c >> 11) & 31
+    g = (c >> 5) & 63
+    b = c & 31
+    r8 = (r << 3) | (r >> 2)
+    g8 = (g << 2) | (g >> 4)
+    b8 = (b << 3) | (b >> 2)
+    return (299 * r8 + 587 * g8 + 114 * b8) // 1000
+
+
+def _fill565(buf, vw, vh, c):
+    lo = c & 0xFF
+    hi = (c >> 8) & 0xFF
+    i = 0
+    n = vw * vh
+    while i < n:
+        o = i * 2
+        buf[o] = lo
+        buf[o + 1] = hi
+        i += 1
+
+
+def _additive_probe(fw, sprite):
+    """Numbers for the saturating add, plus a check that FX sits on Sonic."""
+    vw, vh = 128, 103
+    bad = 0
+    grass = fw._rgb888_to_565(fw.COL_GRASS)
+    base = bytearray(vw * vh * 2)
+    _fill565(base, vw, vh, grass)
+    got = bytearray(base)
+    fw._GH.fx(got, vw, vh, 0, -1, -1, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X)
+    before_l = _lum565(grass)
+    lifted = 0
+    clipped_g = 0
+    sample = None
+    peak = before_l
+    y = 0
+    while y < vh:
+        x = 0
+        while x < vw:
+            c = _pix(got, vw, x, y)
+            if c != grass:
+                lifted += 1
+                lum = _lum565(c)
+                if lum > peak:
+                    peak = lum
+                if ((c >> 5) & 63) == 63:
+                    clipped_g += 1
+                if sample is None:
+                    sample = (x, y, c, lum)
+            x += 1
+        y += 1
+    print(
+        "additive grass L", before_l, "peak", peak, "sample", sample,
+        "lifted", lifted, "green_clip", clipped_g,
+    )
+    if sample is None or peak <= before_l or clipped_g < 1:
+        print("additive grass lift failed")
+        bad += 1
+    if _pix(got, vw, 0, 0) != grass:
+        print("additive touched the corner")
+        bad += 1
+
+    dark = (2 << 11) | (4 << 5) | 2
+    one_mid = _add565(dark, fw._rgb888_to_565(0x1E58D8))
+    one_lo = _add565(dark, fw._rgb888_to_565(0x3A98FF))
+    stacked = _add565(one_mid, fw._rgb888_to_565(0x3A98FF))
+    field = bytearray(vw * vh * 2)
+    _fill565(field, vw, vh, dark)
+    got = bytearray(field)
+    fw._GH.fx(got, vw, vh, 2, -1, -1, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X)
+    n_mid = 0
+    n_lo = 0
+    n_stack = 0
+    y = 0
+    while y < vh:
+        x = 0
+        while x < vw:
+            c = _pix(got, vw, x, y)
+            if c == one_mid:
+                n_mid += 1
+            if c == one_lo:
+                n_lo += 1
+            if stacked != one_lo and stacked != one_mid and c == stacked:
+                n_stack += 1
+            if c != dark and _lum565(c) < _lum565(dark):
+                print("additive darkened", x, y, hex(c))
+                bad += 1
+                break
+            x += 1
+        else:
+            y += 1
+            continue
+        break
+    print(
+        "additive once mid", n_mid, "lo", n_lo, "stacked", n_stack,
+        "lo", hex(one_lo), "stacked_color", hex(stacked),
+    )
+    if n_mid < 1 or n_lo < 1 or n_stack != 0:
+        print("additive mask failed")
+        bad += 1
+
+    got = bytearray(vw * vh * 2)
+    _fill565(got, vw, vh, 0xFFFF)
+    fw._GH.fx(
+        got, vw, vh, 0, 4, 3, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X,
+        0, fw.BAR_TIP_X, fw.SPARK_FRONT_X, fw.SPARK_MID_Y,
+    )
+    miss = 0
+    i = 0
+    while i < len(got):
+        if got[i] != 0xFF or got[i + 1] != 0xFF:
+            miss += 1
+        i += 2
+    print("saturate nonwhite", miss)
+    if miss:
+        bad += 1
+
+    got = bytearray(vw * vh * 2)
+    _fill565(got, vw, vh, grass)
+    fw._GH.fx(
+        got, vw, vh, -1, -1, -1, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X,
+        0, fw.BAR_TIP_X, fw.SPARK_FRONT_X, fw.SPARK_MID_Y,
+    )
+    spark_n = 0
+    y = 0
+    while y < vh:
+        x = 0
+        while x < vw:
+            if _pix(got, vw, x, y) != grass:
+                spark_n += 1
+                if x > 40:
+                    print("spark reached", x, y)
+                    bad += 1
+            x += 1
+        y += 1
+    print("spark pixels", spark_n, "front", fw.SPARK_FRONT_X, fw.SPARK_MID_Y)
+    if spark_n < 1:
+        bad += 1
+
+    def _min_x(tip):
+        buf = bytearray(vw * vh * 2)
+        _fill565(buf, vw, vh, dark)
+        fw._GH.fx(
+            buf, vw, vh, -1, -1, 0, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X,
+            -1, tip, fw.SPARK_FRONT_X, fw.SPARK_MID_Y,
+        )
+        x0 = vw
+        yy = 0
+        while yy < vh:
+            xx = 0
+            while xx < vw:
+                if _pix(buf, vw, xx, yy) != dark:
+                    if xx < x0:
+                        x0 = xx
+                    break
+                xx += 1
+            yy += 1
+        return x0
+
+    left = _min_x(fw.BAR_TIP_X)
+    right = _min_x(fw.SW_TIP_X)
+    print("barrier min x", left, "at", fw.BAR_TIP_X, "vs", right, "at", fw.SW_TIP_X)
+    if right - left != fw.SW_TIP_X - fw.BAR_TIP_X:
+        print("barrier nudge mismatch")
+        bad += 1
+
+    _set_state(sprite, 64, "run_fast", 0, 0, [], rings=0, aura=2)
+    sprite._paint_native(0.0, False)
+    under = bytearray(sprite.play_window)
+    sprite._paint_native(0.0, True)
+    over = sprite.play_window
+    brighter = 0
+    y = fw.SONIC_Y
+    while y < fw.SONIC_Y + fw.SONIC_H:
+        x = fw.SONIC_X
+        while x < fw.SONIC_X + fw.SONIC_W:
+            a = _pix(under, vw, x, y)
+            b = _pix(over, vw, x, y)
+            if b != a:
+                if _lum565(b) < _lum565(a):
+                    print("sonic darkened", x, y)
+                    bad += 1
+                    break
+                brighter += 1
+            x += 1
+        else:
+            y += 1
+            continue
+        break
+    print("sonic box brightened", brighter)
+    if brighter < 1:
+        bad += 1
+    return bad
 
 
 def main():
@@ -786,6 +1090,49 @@ def main():
         if fx_bad > 8:
             break
     bad += fx_bad
+
+    for spark in range(4):
+        base = bytearray(vw * vh * 2)
+        i = 0
+        while i < len(base):
+            base[i] = (i * 13) & 0xFF
+            base[i + 1] = (i * 7) & 0xFF
+            i += 2
+        got = bytearray(base)
+        exp = bytearray(base)
+        fw._GH.fx(
+            got, vw, vh, -1, -1, -1, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X,
+            spark, fw.BAR_TIP_X, fw.SPARK_FRONT_X, fw.SPARK_MID_Y,
+        )
+        _ref_fx(
+            fw, exp, vw, vh, -1, -1, -1, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X,
+            spark, fw.BAR_TIP_X, fw.SPARK_FRONT_X, fw.SPARK_MID_Y,
+        )
+        n, first = v14.mismatches(got, exp, vw)
+        if n:
+            print("spark", spark, n, first)
+            bad += n
+    got = bytearray(vw * vh * 2)
+    exp = bytearray(vw * vh * 2)
+    i = 0
+    while i < len(got):
+        got[i] = exp[i] = 0x20
+        got[i + 1] = exp[i + 1] = 0x42
+        i += 2
+    fw._GH.fx(
+        got, vw, vh, 1, 2, 2, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X,
+        3, fw.BAR_TIP_X, fw.SPARK_FRONT_X, fw.SPARK_MID_Y,
+    )
+    _ref_fx(
+        fw, exp, vw, vh, 1, 2, 2, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X,
+        3, fw.BAR_TIP_X, fw.SPARK_FRONT_X, fw.SPARK_MID_Y,
+    )
+    n, first = v14.mismatches(got, exp, vw)
+    if n:
+        print("combined", n, first)
+        bad += n
+
+    bad += _additive_probe(fw, sprite)
 
     print("frames", frames, "digit_bad", digit_bad, "fx_bad", fx_bad, "mismatches", bad)
     if frames < 222:
