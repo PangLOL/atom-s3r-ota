@@ -609,6 +609,7 @@ def main():
     assert settle["clt"] == 96.0
     assert sum(stage[0] for stage in fw.Sweep.STAGES) == 9900
     assert fw.SEAM_STEP_FRAMES == 30 and fw.SEAM_MAX == 10
+    assert fw.SEAM_DIGIT_SCALE == 1
     assert fw.seam_nudge_for_frame(0) == 0
     assert fw.seam_nudge_for_frame(29) == 0
     assert fw.seam_nudge_for_frame(30) == 1
@@ -620,7 +621,7 @@ def main():
     assert fw.seam_nudge_for_frame(299) == 9
     digit = bytearray(fw.W * fw.H * 2)
     fw.stamp_seam_digit(digit, fw.W, fw.H, 0)
-    # Top row of "0" lights columns 1..3. Scale 2, glyph centered on 128.
+    # Top row of "0" lights columns 1..3. Scale 1 is the 7x9 outlined glyph.
     dx = (fw.W - 5 * fw.SEAM_DIGIT_SCALE) // 2
     dy = (fw.H - 7 * fw.SEAM_DIGIT_SCALE) // 2
     on = fw._rgb888_to_565(fw.COL_HUD_DIGIT)
@@ -630,6 +631,26 @@ def main():
     blank = bytearray(fw.W * fw.H * 2)
     fw.stamp_seam_digit(blank, fw.W, fw.H, -1)
     assert blank == bytearray(len(blank))
+
+    class _Rects(object):
+        def __init__(self):
+            self.calls = []
+
+        def fillRect(self, x, y, w, h, color):
+            self.calls.append((x, y, w, h))
+
+    rects = _Rects()
+    fw.fill_rect_clip(rects, -2, 10, 6, 6, 1)
+    assert rects.calls == [(0, 10, 4, 6)]
+    # A loop whose center has crossed the right edge still has its left half
+    # on screen. The old wrap treated that center as a left edge and dropped it.
+    sp = fw.Sprite(None)
+    half = fw.LOOP_RO + 6
+    centers = list(sp._wrapped_center(fw.LOOP_X, half, fw.LOOP_X - fw.W))
+    assert fw.W in centers, centers
+    assert any((c - half) < fw.W and (c + half) > fw.W for c in centers)
+    gone = list(sp._wrapped_center(fw.LOOP_X, half, fw.LOOP_X - (fw.W + half)))
+    assert gone == [], gone
 
     sw.start(0)
     fx = fw.BoostFX()

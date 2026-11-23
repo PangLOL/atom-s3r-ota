@@ -1196,6 +1196,21 @@ def main():
 
     bad += _additive_probe(fw, sprite)
     bad += _sea_shift_probe(lib)
+    tw = sprite.ocean_tw
+    tile = sprite.ocean_rgb565
+    src = 101 * tw * 2
+    tmpl = bytes(tile[src:src + 24])
+    x = 0
+    dirt_bad = 0
+    while x < tw:
+        if bytes(tile[src + x * 2:src + (x + 12) * 2]) != tmpl:
+            dirt_bad += 1
+        x += 12
+    # The period also has to meet itself at the wrap.
+    if bytes(tile[src + (tw - 12) * 2:src + tw * 2]) != tmpl:
+        dirt_bad += 1
+    print("dirt period breaks", dirt_bad)
+    bad += dirt_bad
 
     print("frames", frames, "digit_bad", digit_bad, "fx_bad", fx_bad, "mismatches", bad)
     if frames < 222:

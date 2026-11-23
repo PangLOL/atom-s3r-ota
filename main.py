@@ -514,7 +514,7 @@ RING_FPS_MS = 1000 // 30  # 33
 # One pixel up every 30 presents. At this 33 ms pace that is 990 ms.
 SEAM_STEP_FRAMES = 30
 SEAM_MAX = 10
-SEAM_DIGIT_SCALE = 2
+SEAM_DIGIT_SCALE = 1  # 5x7 glyph plus the 1px outline, a 7x9 box
 
 
 def seam_nudge_for_frame(frame_index):
@@ -840,6 +840,28 @@ def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
             buf[di + 1] = pair[1]
             di += 2
     return buf, w, h
+
+
+def _continue_dirt_checker(tile, tw, th):
+    """Keep the packed dirt checker in phase across the 128-wide joins.
+
+    Rows 100-102 of the 384-wide ocean are only the checker. The clean
+    left edge is a 12px cell, and 384 is a multiple of 12, so repeating
+    that cell removes the skipped columns at x=128, x=256, and the wrap.
+    The sea and the loops are not rewritten. pixidx.bin is not touched.
+    """
+    if tile is None or tw < 12 or th < 103 or (tw % 12) != 0:
+        return
+    period = 12
+    y = 100
+    while y <= 102 and y < th:
+        src = y * tw * 2
+        tmpl = bytes(tile[src:src + period * 2])
+        x = 0
+        while x < tw:
+            tile[src + x * 2:src + (x + period) * 2] = tmpl
+            x += period
+        y += 1
 
 
 def copy_ocean_window(tile, tw, th, scroll, out, vw=W):
@@ -4068,6 +4090,34 @@ COL_HUD_DIGIT = 0xF8F8F8
 COL_HUD_OUTLINE = 0x101018
 
 
+def fill_rect_clip(lcd, x, y, w, h, color, vw=W, vh=None):
+    """fillRect that drops the off-screen part instead of sliding it on screen."""
+    if vh is None:
+        vh = GAUGE_Y
+    x = int(x)
+    y = int(y)
+    w = int(w)
+    h = int(h)
+    if w < 0:
+        x += w
+        w = -w
+    if h < 0:
+        y += h
+        h = -h
+    if x < 0:
+        w += x
+        x = 0
+    if y < 0:
+        h += y
+        y = 0
+    if x + w > vw:
+        w = vw - x
+    if y + h > vh:
+        h = vh - y
+    if w > 0 and h > 0:
+        lcd.fillRect(x, y, w, h, color)
+
+
 def draw_digit(lcd, x, y, n, color=None, s=1, outline=None):
     n = int(n) % 10
     bits = DIGITS[n]
@@ -4637,6 +4687,7 @@ class Sprite:
                 buf, tw, th = prerender_ocean_rgb565(pack, ocean)
             except Exception:
                 pass
+        _continue_dirt_checker(buf, tw, th)
         self.ocean_rgb565 = buf
         self.ocean_tw = tw
         self.ocean_th = th
@@ -6710,10 +6761,29 @@ class Sprite:
         self.boost.draw_front(lcd, SW_TIP_X, AURA_TIP_Y)
 
     def _wrapped(self, x, w, off):
-        xx = (x - off) % PERIOD
-        for cand in (xx, xx - PERIOD):
+        """Screen left edges for a prop whose world left is x and width is w.
+
+        x is the left edge, not the center. A loop whose center has crossed
+        the right edge still overlaps the screen, so callers that anchor on
+        a center pass center - half_width. Copies one period left and right
+        are kept when they still touch the panel.
+        """
+        span = PERIOD
+        if span <= 0 or w <= 0:
+            return
+        xx = (int(x) - int(off)) % span
+        for cand in (xx - span, xx, xx + span):
             if cand < W and cand + w > 0:
                 yield cand
+
+    def _wrapped_center(self, cx, half_w, off):
+        """Centers of a prop that is 2*half_w wide and may straddle an edge."""
+        if half_w < 1:
+            half_w = 1
+        left = int(cx) - int(half_w)
+        width = int(half_w) * 2
+        for edge in self._wrapped(left, width, off):
+            yield edge + int(half_w)
 
     def _draw_background(self, lcd):
         gy = self.ground_y
@@ -6724,7 +6794,7 @@ class Sprite:
         off_i = int(self.scroll * 0.6)
 
         for cx, cy, rx, ry in CLOUDS:
-            for x in self._wrapped(cx, rx * 2, off_c):
+            for x in self._wrapped_center(cx, rx, off_c):
                 fill_ellipse(lcd, x, cy, rx, ry, COL_CLOUD)
 
         base = WATER_Y + 2
@@ -6747,57 +6817,68 @@ class Sprite:
         lcd.fillRect(0, WATER_Y + 8, W, 1, COL_WATER if sh < 3 else COL_WATER_HI)
 
         for ix, rx, ry in ISLANDS:
-            for x in self._wrapped(ix, rx * 2, off_i):
+            for x in self._wrapped_center(ix, rx, off_i):
                 fill_ellipse(lcd, x, WATER_Y + 2, rx, ry, COL_MTN_GRASS)
                 fill_ellipse(lcd, x, WATER_Y, rx - 2, 2, COL_GRASS)
 
         for hx, rx, ry in HILLS:
-            for x in self._wrapped(hx, rx * 2, off):
+            for x in self._wrapped_center(hx, rx, off):
                 fill_ellipse(lcd, x, gy - GRASS_H + 2, rx, ry, COL_GRASS_DK)
                 fill_ellipse(lcd, x, gy - GRASS_H, rx - 2, ry - 2, COL_GRASS)
 
-        for x in self._wrapped(LOOP_X, LOOP_RO * 2, off):
+        # The island under the loop sticks out past the ring.
+        loop_half = LOOP_RO + 6
+        for x in self._wrapped_center(LOOP_X, loop_half, off):
             self._draw_loop(lcd, x, gy - LOOP_RO - 2)
 
         for px, ph in PALMS:
-            for x in self._wrapped(px, 22, off):
-                self._draw_palm(lcd, x, gy - GRASS_H + 2, ph)
+            # Trunk x, fronds reach about 10 px to either side.
+            for x in self._wrapped(px - 10, 22, off):
+                self._draw_palm(lcd, x + 10, gy - GRASS_H + 2, ph)
 
-        # After-style checker dirt with a bevel, plus a denser grass crown.
-        start = -(off % TILE)
+        # Square checker under the grass. TILE x TILE, clipped at the edges
+        # so a partial cell is not redrawn as a full one. World x picks the
+        # color, and 180 is a multiple of TILE, so the period wrap continues.
+        cell = TILE
+        dirt_top = gy - cell
+        grass_top = dirt_top - (GRASS_H - 2)
+        off_i = int(off)
+        start = -(off_i % cell)
+        if start > 0:
+            start -= cell
         x = start
-        dirt_y = gy - 2
-        grass_y = gy - GRASS_H
         while x < W:
-            cx = ((x + off) // TILE) & 1
-            on = cx == 0
-            # grass band
-            lcd.fillRect(x, grass_y, TILE, GRASS_H - 2, COL_GRASS if on else COL_GRASS_DK)
-            # bevelled dirt cell
+            world = x + off_i
+            on = ((world // cell) & 1) == 0
+            fill_rect_clip(
+                lcd, x, grass_top, cell, GRASS_H - 2,
+                COL_GRASS if on else COL_GRASS_DK,
+            )
             base = COL_DIRT if on else COL_DIRT_DK
-            lcd.fillRect(x, dirt_y, TILE, 3, base)
-            lcd.fillRect(x, dirt_y, TILE, 1, COL_DIRT_HI if on else COL_DIRT)
-            lcd.fillRect(x, dirt_y + 2, TILE, 1, COL_DIRT_SH)
-            lcd.fillRect(x, dirt_y, 1, 3, COL_MORTAR)
-            x += TILE
+            hi = COL_DIRT_HI if on else COL_DIRT
+            fill_rect_clip(lcd, x, dirt_top, cell, cell, base)
+            fill_rect_clip(lcd, x, dirt_top, cell, 1, hi)
+            fill_rect_clip(lcd, x, dirt_top + cell - 1, cell, 1, COL_DIRT_SH)
+            fill_rect_clip(lcd, x, dirt_top, 1, cell, COL_MORTAR)
+            x += cell
         # vertical grass blades so the crown reads after-like at 128
         bx = -(off % 3)
         while bx < W:
             h = 3 + ((bx + off) & 3)
             col = COL_GRASS_BL if ((bx + off) & 1) == 0 else COL_GRASS
-            lcd.fillRect(bx, grass_y - h + 2, 1, h, col)
+            fill_rect_clip(lcd, bx, grass_top - h + 2, 1, h, col)
             bx += 3
 
         for fx, col in FLOWERS:
-            for x in self._wrapped(fx, 3, off):
-                lcd.fillRect(x, gy - GRASS_H - 1, 2, 2, col)
+            for x in self._wrapped(fx, 2, off):
+                fill_rect_clip(lcd, x, gy - GRASS_H - 1, 2, 2, col)
 
         for sx, sh in SUNFLOWERS:
-            for x in self._wrapped(sx, 8, off):
+            for x in self._wrapped_center(sx, 4, off):
                 self._draw_sunflower(lcd, x, gy - GRASS_H, sh)
 
         for rx, ry, rrx, rry in FIELD_RINGS:
-            for x in self._wrapped(rx, rrx * 2, off):
+            for x in self._wrapped_center(rx, rrx, off):
                 self._draw_field_ring(lcd, x, ry, rrx, rry)
 
     def _draw_loop(self, lcd, cx, gy):
