@@ -520,7 +520,8 @@ CHAO_BOB_JOIN = 3
 CHAO_BOB_HOVER = 8
 CHAO_BOB_PERIOD_MS = 2400
 # Packed art faces left. Face right (mirror) when traveling right.
-CHAO_LEFT_X = SONIC_X - 10
+# Body centre. Close enough that the right-facing hover sits against Sonic.
+CHAO_LEFT_X = SONIC_X + 2
 CHAO_RIGHT_X = SONIC_X + SONIC_W + 8
 CHAO_HEAD_Y = SONIC_HEAD_Y
 CHAO_OFF_LEFT = -20
@@ -2166,18 +2167,20 @@ SKY_BLUE_888 = (0 << 16) | (174 << 8) | 255
 SKY_CAP_BLUE_888 = (0 << 16) | (134 << 8) | 255
 
 
-def repair_ocean_tile(tile, tw, th):
-    """Fix sky and sea seams in the prepared tile. pixidx.bin is not rewritten.
+# Open water used for the horizon band. Not a copy of the neighbour,
+# which smeared leaf pixels along the sea-sky join.
+SEA_BLUE_888 = (49 << 16) | (195 << 8) | 255
 
-    Rows 0-11 become the sky blue. The dark-blue band on sea rows 32-35
-    is filled from the pixel to its left. Full-height columns that copy
-    an earlier column are replaced by the column just before the copy,
-    so the loop does not echo that stripe.
+
+def repair_ocean_tile(tile, tw, th):
+    """Paint the sky cap. Does not sample neighbouring pixels.
+
+    Rows 0-11 of the pack are a darker blue than the sky below them.
+    pixidx.bin is not rewritten.
     """
     if tile is None or tw <= 1 or th <= 0:
         return
     sky = _rgb888_to_565(SKY_BLUE_888)
-    cap = _rgb888_to_565(SKY_CAP_BLUE_888)
     y = 0
     cap_n = SKY_CAP_ROWS
     if cap_n > th:
@@ -2188,63 +2191,142 @@ def repair_ocean_tile(tile, tw, th):
             _set_565(tile, tw, x, y, sky)
             x += 1
         y += 1
-    y0 = HORIZON_Y
-    y1 = GRASS_Y
-    if y1 > th:
-        y1 = th
+
+
+def _band_diff(tile, tw, a, b, y0, y1):
+    d = 0
     y = y0
-    while y < y1 and y < th:
-        last = None
+    while y < y1:
+        if _565_at(tile, tw, a, y) != _565_at(tile, tw, b, y):
+            d += 1
+        y += 1
+    return d
+
+
+def _close_band_tears(tile, tw, y0, y1, limit):
+    """Copy a column over the next one when the join is a tear, not a wave."""
+    if y1 <= y0 or tw < 2:
+        return
+    passes = 0
+    while passes < 6:
+        passes += 1
+        changed = False
         x = 0
         while x < tw:
-            cur = _565_at(tile, tw, x, y)
-            if cur == cap and last is not None:
-                _set_565(tile, tw, x, y, last)
-            else:
-                last = _565_at(tile, tw, x, y)
+            nxt = x + 1
+            if nxt >= tw:
+                nxt = 0
+            if _band_diff(tile, tw, x, nxt, y0, y1) > limit:
+                y = y0
+                while y < y1:
+                    _set_565(tile, tw, nxt, y, _565_at(tile, tw, x, y))
+                    y += 1
+                changed = True
+            x += 1
+        if not changed:
+            return
+
+
+def finish_ocean_background(tile, tw, th):
+    """After the hill stamps are lifted out, clean the tile they leave behind.
+
+    Leftover palm pixels above the grass become sky or sea. The horizon
+    rows are a solid sea colour, not a smear of the pixel to their left.
+    Hard joins in the water and the grass are closed so a scroll does not
+    show a doubled column or a hole.
+    """
+    if tile is None or tw <= 1 or th <= 0:
+        return
+    sky = _rgb888_to_565(SKY_BLUE_888)
+    sea = _rgb888_to_565(SEA_BLUE_888)
+    grass_y = GRASS_Y if GRASS_Y < th else th
+    y = SKY_CAP_ROWS
+    if y < 0:
+        y = 0
+    while y < grass_y:
+        x = 0
+        while x < tw:
+            c = _rgb565_to_888(_565_at(tile, tw, x, y))
+            if not _is_backdrop_888(c):
+                _set_565(tile, tw, x, y, sky if y < HORIZON_Y else sea)
             x += 1
         y += 1
-    cols = []
+    y = HORIZON_Y
+    y1 = HORIZON_Y + 4
+    if y1 > grass_y:
+        y1 = grass_y
+    while y < y1:
+        x = 0
+        while x < tw:
+            _set_565(tile, tw, x, y, sea)
+            x += 1
+        y += 1
+    sea_top = HORIZON_Y + 4
+    if sea_top < grass_y:
+        _replace_distant_echoes(tile, tw, sea_top, grass_y)
+    # Dirt rows 100-102 stay on the 12px checker. Only the grass above them
+    # is closed, so a tuft join cannot open a hole.
+    grass_bot = grass_y + 12
+    if grass_bot > 100:
+        grass_bot = 100
+    if grass_y < grass_bot:
+        _close_band_tears(tile, tw, grass_y, grass_bot, 8)
+
+
+def _replace_distant_echoes(tile, tw, y0, y1):
+    """Drop a sea column that copies one more than a few pixels away.
+
+    The copy is replaced by the column beside it, so the wrap is not a
+    doubled stripe. Nearby wave pixels are left alone.
+    """
+    if y1 <= y0 or tw < 2:
+        return
+    sigs = []
     x = 0
     while x < tw:
         raw = bytearray()
-        yy = 0
-        while yy < th:
-            i = (yy * tw + x) * 2
-            raw.append(tile[i])
-            raw.append(tile[i + 1])
-            yy += 1
-        cols.append(bytes(raw))
+        y = y0
+        while y < y1:
+            v = _565_at(tile, tw, x, y)
+            raw.append(v & 0xFF)
+            raw.append((v >> 8) & 0xFF)
+            y += 1
+        sigs.append(bytes(raw))
         x += 1
     seen = {}
     echo = []
     x = 0
     while x < tw:
-        sig = cols[x]
-        prev = seen.get(sig)
+        prev = seen.get(sigs[x])
         if prev is None:
-            seen[sig] = x
-        else:
+            seen[sigs[x]] = x
+        elif x - prev > 16:
             echo.append(x)
         x += 1
     for x in echo:
         src = x - 1
-        while src in echo and src > 0:
+        guard = 0
+        while src in echo and src > 0 and guard < tw:
             src -= 1
+            guard += 1
         if src < 0:
             continue
-        yy = 0
-        while yy < th:
-            _set_565(tile, tw, x, yy, _565_at(tile, tw, src, yy))
-            yy += 1
+        y = y0
+        while y < y1:
+            _set_565(tile, tw, x, y, _565_at(tile, tw, src, y))
+            y += 1
 
 
 def _keep_hill_loop(pts, tw):
-    """True for the wide green hill. Trees and bushes are narrower."""
-    if len(pts) < 8:
+    """True for a solid green hill. A palm bridge is wide but mostly empty."""
+    if len(pts) < 200:
         return False
-    width = _pts_bbox(pts, tw)[4]
-    if width < 40:
+    _x0, _x1, y0, y1, width, _wrapped = _pts_bbox(pts, tw)
+    height = y1 - y0 + 1
+    if width < 40 or height < 16:
+        return False
+    area = width * height
+    if area <= 0 or (len(pts) / float(area)) < 0.45:
         return False
     counts = _row_widths(pts, tw)
     mid = 0
@@ -2277,6 +2359,7 @@ def build_parallax_layers(tile, tw, th):
         factor = _classify(pts, tw, grass_y)
         stamps.extend(_make_stamp(tile, tw, pts, factor))
     _inpaint(tile, tw, th, all_pts, grass_y)
+    finish_ocean_background(tile, tw, th)
     return stamps
 
 
@@ -4693,6 +4776,7 @@ class Sprite:
         self.chao_side_to = 1
         self.chao_spd = None
         self.chao_spd_age = 0
+        self.chao_exit = 1
         self._spd_prev = None
         self.decel = 0.0
         self.ring_i = 0
@@ -5073,6 +5157,15 @@ class Sprite:
         else:
             self._hockey_arm = 0
 
+    def _chao_begin_leave(self, speed):
+        """Above 80 km/h the Chao falls behind off the left, still facing right."""
+        if speed >= SPEED_FAST:
+            self.chao_exit = -1
+        else:
+            self.chao_exit = 1
+        self.chao_face = 1
+        self._chao_start("leave")
+
     def _chao_start(self, phase):
         self.chao_phase = phase
         self.chao_x0 = int(self.chao_x)
@@ -5178,8 +5271,7 @@ class Sprite:
         if phase == "follow":
             self.chao_dwell += dt_ms
             if leave or self.chao_dwell >= CHAO_DWELL_MS:
-                self.chao_face = 1
-                self._chao_start("leave")
+                self._chao_begin_leave(speed)
                 self._chao_bob(dt_ms)
                 return
             else:
@@ -5189,8 +5281,7 @@ class Sprite:
                 return
         if phase == "join" or phase == "leave":
             if phase == "join" and leave:
-                self.chao_face = 1
-                self._chao_start("leave")
+                self._chao_begin_leave(speed)
                 self._chao_bob(dt_ms)
                 return
             limit = CHAO_JOIN_MS if phase == "join" else CHAO_LEAVE_MS
@@ -5200,6 +5291,9 @@ class Sprite:
             t = _chao_ease(self.chao_travel / float(limit if limit else 1))
             if phase == "join":
                 dest = CHAO_LEFT_X
+                self.chao_face = 1
+            elif self.chao_exit < 0:
+                dest = CHAO_OFF_LEFT
                 self.chao_face = 1
             else:
                 dest = CHAO_OFF_RIGHT
@@ -5730,6 +5824,32 @@ class Sprite:
                 self._band_mode[idx] = 1
             else:
                 self._band_mode[idx] = 2
+        self._repaint_horizon()
+
+    def _repaint_horizon(self):
+        """Redraw the sea-sky rows from the tile. A band shift must not keep them.
+
+        Sky and sea scroll at different speeds. The join rows are copied
+        again from the tile at the new offsets so a previous frame cannot
+        sit in that strip.
+        """
+        tile = self.ocean_rgb565
+        win = self.ocean_window
+        tw = self.ocean_tw
+        if tile is None or win is None or tw <= 0:
+            return
+        off_c = self._band_new[0]
+        off_w = self._band_new[1]
+        y = HORIZON_Y - 1
+        if y >= 0:
+            _copy_partial_row(tile, tw, y, off_c, win, 0, W)
+        y = HORIZON_Y
+        y1 = HORIZON_Y + 4
+        if y1 > self.ocean_th:
+            y1 = self.ocean_th
+        while y < y1:
+            _copy_partial_row(tile, tw, y, off_w, win, 0, W)
+            y += 1
 
     def _stamp_carried(self, oy, sh, d_stamp):
         """True when the shift already left this stamp on its new pixels.
@@ -6393,6 +6513,17 @@ class Sprite:
             if y1 <= y0:
                 continue
             self._shift_play_band(y0, y1, self._band_delta[idx])
+        if self.ocean_window is not None and self.play_window is not None:
+            y = HORIZON_Y - 1
+            if y < 0:
+                y = 0
+            y1 = HORIZON_Y + 4
+            if y1 > self.ocean_th:
+                y1 = self.ocean_th
+            while y < y1:
+                src = y * W * 2
+                self.play_window[src:src + W * 2] = self.ocean_window[src:src + W * 2]
+                y += 1
 
     def _note_stamp_part(self, kind, dt):
         if dt < 0:

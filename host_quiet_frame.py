@@ -615,6 +615,7 @@ def main():
     assert settle["rpm"] < fw.VTEC_OFF_RPM
     assert settle["clt"] == 96.0
     assert sum(stage[0] for stage in fw.Sweep.STAGES) == 9900
+    assert fw.CHAO_LEFT_X >= fw.SONIC_X
     assert fw.CHAO_BOB_JOIN < fw.CHAO_BOB_HOVER
     assert fw.CHAO_JOIN_MS >= 2000
     assert fw.CHAO_DWELL_MS == 5 * 60 * 1000
@@ -657,10 +658,10 @@ def main():
     over = fw.Sprite(None)
     over.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
     over.advance(85.0, 16, 5000.0, 0.0)
-    assert over.chao_phase == "leave"
+    assert over.chao_phase == "leave" and over.chao_face == 1 and over.chao_exit < 0
     over.advance(85.0, fw.CHAO_LEAVE_MS, 5000.0, 0.0)
     assert over.chao_phase == "off"
-    assert over.chao_x >= fw.W
+    assert over.chao_x <= 0
     dwell = fw.Sprite(None)
     dwell.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
     dwell.advance(40.0, fw.CHAO_DWELL_MS, 2000.0, 0.0)
@@ -732,29 +733,31 @@ def main():
         i = (y * otw) * 2
         assert obuf[i] == (sky & 0xFF) and obuf[i + 1] == ((sky >> 8) & 0xFF)
         y += 1
+    sea = fw._rgb888_to_565(fw.SEA_BLUE_888)
+    stamps = fw.build_parallax_layers(obuf, otw, oth)
     y = fw.HORIZON_Y
     while y < fw.HORIZON_Y + 4:
         x = 0
         while x < otw:
             i = (y * otw + x) * 2
             c = obuf[i] | (obuf[i + 1] << 8)
-            assert c != cap
+            assert c == sea
             x += 1
         y += 1
-    def _col(x):
-        raw_col = bytearray()
-        yy = 0
-        while yy < oth:
-            i = (yy * otw + x) * 2
-            raw_col.append(obuf[i])
-            raw_col.append(obuf[i + 1])
-            yy += 1
-        return bytes(raw_col)
-    # Distant copies of the sea cut are gone. A one-column continuation is fine.
-    assert _col(256) != _col(128)
-    assert _col(374) != _col(246)
-    assert _col(336) != _col(208)
-    stamps = fw.build_parallax_layers(bytearray(obuf), otw, oth)
+    # No foliage left in the water, and the grass join is not a tear.
+    foliage = 0
+    y = fw.HORIZON_Y
+    while y < fw.GRASS_Y:
+        x = 0
+        while x < otw:
+            c = fw._rgb565_to_888(fw._565_at(obuf, otw, x, y))
+            if not fw._is_backdrop_888(c):
+                foliage += 1
+            x += 1
+        y += 1
+    assert foliage == 0
+    assert fw._band_diff(obuf, otw, otw - 1, 0, fw.GRASS_Y, 100) <= 8
+    assert fw._band_diff(obuf, otw, 127, 128, fw.HORIZON_Y + 4, fw.GRASS_Y) <= 24
     assert stamps
     wide = 0
     for st in stamps:
