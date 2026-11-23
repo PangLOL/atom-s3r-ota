@@ -1812,6 +1812,15 @@ _blit_stamp_viper = None
 _blit_stamp_clip_viper = None
 # 0 unknown, 1 poll has reported writable, 2 this port has no poll.
 _STDOUT_POLL = 0
+# Flash quiet. tools/flash_com6.py writes FLASH_PREAMBLE between frames.
+# The loop answers FLASH_ACK once, then drops every later print so raw
+# REPL paste is not mixed with timing, brk, pause, or auto-sweep lines.
+FLASH_PREAMBLE = b"ATOMFLASH\n"
+FLASH_ACK = "flash-quiet"
+_SERIAL_QUIET = False
+_FLASH_BUF = b""
+_FLASH_POLLER = None
+_FLASH_POLL_DEAD = False
 
 
 def _stdout_can_write():
@@ -1832,6 +1841,8 @@ def _stdout_can_write():
 
 def _stdout_can_write_body():
     global _STDOUT_POLL
+    if _SERIAL_QUIET:
+        return False
     if _STDOUT_POLL == 2:
         return True
     try:
@@ -1861,6 +1872,91 @@ def _stdout_can_write_body():
     if _STDOUT_POLL == 1:
         return False
     return True
+
+
+def _enter_flash_quiet():
+    """One acknowledgement, then silence stdout for the rest of the session."""
+    global _SERIAL_QUIET
+    if _SERIAL_QUIET:
+        return
+    print(FLASH_ACK)
+    _SERIAL_QUIET = True
+    try:
+        import sys
+
+        class _QuietOut(object):
+            def write(self, data):
+                if data:
+                    return len(data)
+                return 0
+
+            def flush(self):
+                return None
+
+        sys.stdout = _QuietOut()
+    except Exception:
+        pass
+
+
+def _accept_flash_preamble(data):
+    """Fold serial input into the preamble buffer. ATOMFLASH enters quiet."""
+    global _FLASH_BUF
+    if _SERIAL_QUIET or not data:
+        return
+    if isinstance(data, str):
+        try:
+            data = data.encode("utf-8")
+        except Exception:
+            return
+    _FLASH_BUF = (_FLASH_BUF + data)[-48:]
+    if b"ATOMFLASH" in _FLASH_BUF:
+        _enter_flash_quiet()
+
+
+def _poll_flash_quiet():
+    """Non-blocking stdin check. A missing poller leaves the prints alone."""
+    global _FLASH_POLLER, _FLASH_POLL_DEAD
+    if _SERIAL_QUIET or _FLASH_POLL_DEAD:
+        return
+    try:
+        import sys
+        try:
+            import uselect as selectmod
+        except ImportError:
+            import select as selectmod
+    except Exception:
+        _FLASH_POLL_DEAD = True
+        return
+    if _FLASH_POLLER is None:
+        try:
+            poller = selectmod.poll()
+            poller.register(sys.stdin, selectmod.POLLIN)
+            _FLASH_POLLER = poller
+        except Exception:
+            _FLASH_POLL_DEAD = True
+            return
+    try:
+        if not _FLASH_POLLER.poll(0):
+            return
+    except Exception:
+        return
+    got = b""
+    while len(got) < 48:
+        try:
+            if not _FLASH_POLLER.poll(0):
+                break
+            chunk = sys.stdin.read(1)
+        except Exception:
+            break
+        if not chunk:
+            break
+        if isinstance(chunk, str):
+            try:
+                chunk = chunk.encode("utf-8")
+            except Exception:
+                break
+        got += chunk
+    _accept_flash_preamble(got)
 
 
 def _feed_wdt():
@@ -7924,6 +8020,7 @@ def main():
         frame_started = _mono_us()
         _report_presented(now)
         button.poll(now)
+        _poll_flash_quiet()
 
         if sweep.active:
             _brk_enter("sweep")

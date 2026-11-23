@@ -1018,6 +1018,15 @@ def main():
     assert sp.sparkles == []
     assert fw._BRK_PRINT_MS == 2000
 
+    assert fw.FLASH_PREAMBLE == b"ATOMFLASH\n"
+    assert fw.FLASH_ACK == "flash-quiet"
+    assert fw._SERIAL_QUIET is False
+    saved_out = sys.stdout
+    fw._accept_flash_preamble(b"xxATOMFLASH\n")
+    assert fw._SERIAL_QUIET is True
+    assert fw._stdout_can_write() is False
+    sys.stdout = saved_out
+    fw._SERIAL_QUIET = False
     print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped, "vtec", int(peak_rpm))
 
 
