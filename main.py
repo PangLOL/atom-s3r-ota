@@ -8221,34 +8221,90 @@ def init_can():
     )
 
 
+# One frame buffer for the whole session. UiFlow CAN.recv allocates a
+# tuple and a bytes object when no list is passed, and its default
+# timeout is 5 seconds. On a live car bus that allocation repeats every
+# frame until a collect stalls the panel; the task watchdog then resets
+# the board. Off the car the queue is empty, so this path never runs.
+_CAN_DATA = bytearray(8)
+_CAN_FRAME = [0, False, False, 0, memoryview(_CAN_DATA)]
+
+
+def _can_recover(bus):
+    """Restart a stopped or bus-off controller. A running bus is left alone."""
+    state = getattr(bus, "state", None)
+    restart = getattr(bus, "restart", None)
+    if state is None or restart is None:
+        return
+    try:
+        st = state()
+    except Exception:
+        return
+    # CAN.STOPPED is 0, CAN.BUS_OFF is 4. RECOVERING (5) is already in progress.
+    if st != 0 and st != 4:
+        return
+    try:
+        restart()
+    except Exception:
+        pass
+
+
 def pull_frames(bus, values):
+    """Drain queued CAN frames without waiting and without allocating.
+
+    At most 64 frames. timeout is always 0. A bare recv() is never used,
+    because that call waits up to five seconds and the picture freezes
+    for the wait. An empty read or a driver error ends the drain.
+    """
+    _can_recover(bus)
     n = 0
-    while True:
-        waiting = False
+    frame = _CAN_FRAME
+    data = frame[4]
+    while n < 64:
         try:
             waiting = bus.any(0)
         except TypeError:
-            waiting = bus.any()
+            try:
+                waiting = bus.any()
+            except Exception:
+                return n
+        except Exception:
+            return n
         if not waiting:
-            break
+            return n
+        i = 0
+        while i < 8:
+            data[i] = 0
+            i += 1
+        got = None
         try:
-            msg = bus.recv(0, timeout=0)
+            got = bus.recv(0, frame, timeout=0)
         except TypeError:
-            msg = bus.recv()
-        if not msg:
-            break
-        data = msg[-1]
-        decoded = decode_frame(msg[0], data)
+            try:
+                got = bus.recv(0, timeout=0)
+            except Exception:
+                return n
+        except Exception:
+            return n
+        if not got:
+            return n
+        can_id = got[0]
+        payload = got[4]
+        try:
+            decoded = decode_frame(can_id, payload)
+        except Exception:
+            decoded = None
         if decoded is not None:
             values[decoded[0]] = decoded[1]
         # Brake switch lives on the same 0x17C frame as RPM.
-        if msg[0] == ID_RPM and data is not None and len(data) >= 5:
-            values["brk"] = 1.0 if (data[4] & 0x01) else 0.0
+        if can_id == ID_RPM and payload is not None and len(payload) >= 5:
+            try:
+                values["brk"] = 1.0 if (payload[4] & 0x01) else 0.0
+            except Exception:
+                pass
         n += 1
         if (n & 7) == 0:
             _service()
-        if n >= 64:
-            break
     return n
 
 

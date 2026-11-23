@@ -1123,6 +1123,64 @@ def main():
     assert fw._BRK_PRINT_MS == 2000
 
     assert fw.OTA_ENABLED is False
+
+    class _CanBus(object):
+        def __init__(self, frames, sticky=False, state=6):
+            self.frames = frames
+            self.i = 0
+            self.sticky = sticky
+            self._state = state
+            self.timeouts = []
+            self.restarts = 0
+
+        def any(self, fifo=0):
+            return self.sticky or self.i < len(self.frames)
+
+        def state(self):
+            return self._state
+
+        def restart(self):
+            self.restarts += 1
+            self._state = 6
+
+        def recv(self, fifo, lst=None, timeout=5000):
+            self.timeouts.append(timeout)
+            if timeout != 0:
+                raise AssertionError(timeout)
+            if self.i >= len(self.frames):
+                return None
+            src = self.frames[self.i]
+            self.i += 1
+            if lst is None:
+                return src
+            lst[0] = src[0]
+            raw = src[4]
+            view = lst[4]
+            j = 0
+            while j < len(raw) and j < len(view):
+                view[j] = raw[j]
+                j += 1
+            return lst
+
+    # 0x03E8 = 1000 -> 10.00 km/h. Brake bit is data[4] of 0x17C.
+    speed = (0x158, False, False, 0, bytes((0x03, 0xE8, 0, 0, 0, 0, 0, 0)))
+    rpm = (0x17C, False, False, 0, bytes((0, 0, 0x0B, 0xB8, 0x01, 0, 0, 0)))
+    values = {}
+    bus = _CanBus([speed, rpm])
+    assert fw.pull_frames(bus, values) == 2
+    assert values["spd"] == 10.0
+    assert values["rpm"] == 3000.0
+    assert values["brk"] == 1.0
+    assert bus.timeouts == [0, 0]
+    assert bus.restarts == 0
+    flooded = _CanBus([speed] * 80, sticky=True)
+    assert fw.pull_frames(flooded, values) == 64
+    assert flooded.timeouts == [0] * 64
+    dead = _CanBus([], sticky=True)
+    assert fw.pull_frames(dead, values) == 0
+    off = _CanBus([], state=4)
+    assert fw.pull_frames(off, values) == 0
+    assert off.restarts == 1
     class _RingPack(object):
         by_name = {}
         cycles = {}
