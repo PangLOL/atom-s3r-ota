@@ -35,8 +35,8 @@ It is not the published Pages payload.
 Official mouths and boost rips are not packed yet, packing is allowed.
 The three hockey-stop frames are packed and face right.
 Chao cycles are normal_chao, amy_chao, knuckles_chao, sonic_chao, and
-tails_chao. Frames 0 and 1 are the join and leave. Frames 2 and 3 hover
-at Sonic's head while speed is under 80 km/h. One Chao, at 2 fps.
+tails_chao. Frames 0 and 1 join, switch sides, and leave. Frames 2 and 3
+hover at Sonic's head. One Chao, at 2 fps, for up to five minutes.
 Aura, shockwave, sound barrier, and full-speed sparks are V2 primitives
 drawn on top of Sonic. The native path saturating-adds them in RGB565.
 FACE_ENABLED stays off.
@@ -507,9 +507,21 @@ CHAO_TYPES = (
 CHAO_MOVE = (0, 1)
 CHAO_HOVER = (2, 3)
 CHAO_FRAME_MS = 500  # 2 fps
-CHAO_TRAVEL_MS = 1000
-# Body centre sits just behind the sprite, level with the head.
-CHAO_FOLLOW_X = SONIC_X - 10
+# Approach is long enough to see the chase pair. Leave is shorter.
+CHAO_JOIN_MS = 2600
+CHAO_LEAVE_MS = 1600
+CHAO_SIDE_HOLD_MS = 4500
+CHAO_SIDE_MS = 1400
+CHAO_DWELL_MS = 5 * 60 * 1000
+# 30 km/h inside 500 ms is a kickdown or a hard brake, not cruise noise.
+CHAO_DRASTIC_KMH = 30.0
+CHAO_DRASTIC_MS = 500
+CHAO_BOB_JOIN = 3
+CHAO_BOB_HOVER = 8
+CHAO_BOB_PERIOD_MS = 2400
+# Packed art faces left. Face right (mirror) when traveling right.
+CHAO_LEFT_X = SONIC_X - 10
+CHAO_RIGHT_X = SONIC_X + SONIC_W + 8
 CHAO_HEAD_Y = SONIC_HEAD_Y
 CHAO_OFF_LEFT = -20
 CHAO_OFF_RIGHT = W + 20
@@ -733,7 +745,7 @@ class PixIdx:
         return self.palettes[pal_id]
 
 
-def blit_frame(lcd, pack, frame, dest_x, dest_y, pal, clip_t=0, clip_b=103, use_origin=True):
+def blit_frame(lcd, pack, frame, dest_x, dest_y, pal, clip_t=0, clip_b=103, use_origin=True, flip=False):
     """Interpreter: walk packed indices, skip 0, fillRect horizontal spans. V2 Lcd path."""
     if frame is None:
         return
@@ -756,21 +768,23 @@ def blit_frame(lcd, pack, frame, dest_x, dest_y, pal, clip_t=0, clip_b=103, use_
         row = base + y * row_bytes
         x = 0
         while x < w:
+            sx = (w - 1 - x) if flip else x
             if bpp4:
-                b = data[row + (x >> 1)]
-                idx = (b >> 4) if (x & 1) == 0 else (b & 0x0F)
+                b = data[row + (sx >> 1)]
+                idx = (b >> 4) if (sx & 1) == 0 else (b & 0x0F)
             else:
-                idx = data[row + x]
+                idx = data[row + sx]
             if idx == 0:
                 x += 1
                 continue
             x1 = x + 1
             while x1 < w:
+                sx1 = (w - 1 - x1) if flip else x1
                 if bpp4:
-                    b2 = data[row + (x1 >> 1)]
-                    i2 = (b2 >> 4) if (x1 & 1) == 0 else (b2 & 0x0F)
+                    b2 = data[row + (sx1 >> 1)]
+                    i2 = (b2 >> 4) if (sx1 & 1) == 0 else (b2 & 0x0F)
                 else:
-                    i2 = data[row + x1]
+                    i2 = data[row + sx1]
                 if i2 != idx:
                     break
                 x1 += 1
@@ -2087,8 +2101,165 @@ def _blit_stamp(window, vw, tw, stamp, scroll):
     _blit_stamp_py(window, vw, tw, stamp, scroll)
 
 
+def _mirror_baked(rgb, mask, w, h):
+    """Mirror a baked RGB565 sprite and its 1-bit mask inside the same box."""
+    n = w * h
+    out = bytearray(n * 2)
+    bits = bytearray((n + 7) // 8)
+    y = 0
+    while y < h:
+        x = 0
+        while x < w:
+            src = y * w + (w - 1 - x)
+            dst = y * w + x
+            out[dst * 2] = rgb[src * 2]
+            out[dst * 2 + 1] = rgb[src * 2 + 1]
+            if mask[src >> 3] & (1 << (src & 7)):
+                bits[dst >> 3] |= 1 << (dst & 7)
+            x += 1
+        y += 1
+    return out, bits
+
+
+def _chao_ease(t):
+    """Smoothstep. Slow at both ends, no step in velocity."""
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _mirror_runs(fr):
+    """Horizontal mirror of a PIX6 run table. Same box, facing the other way."""
+    cached = getattr(fr, "_flip_runs", None)
+    if cached is not None:
+        return cached
+    w = fr.w
+    runs = fr.runs
+    n = fr.nruns
+    out = bytearray(n * 5)
+    i = 0
+    while i < n:
+        o = i * 5
+        x = runs[o] | (runs[o + 1] << 8)
+        y = runs[o + 2]
+        ln = runs[o + 3]
+        idx = runs[o + 4]
+        nx = w - (x + ln)
+        if nx < 0:
+            nx = 0
+        out[o] = nx & 0xFF
+        out[o + 1] = (nx >> 8) & 0xFF
+        out[o + 2] = y & 0xFF
+        out[o + 3] = ln & 0xFF
+        out[o + 4] = idx & 0xFF
+        i += 1
+    fr._flip_runs = (out, n)
+    return fr._flip_runs
+
+
+SKY_CAP_ROWS = 12
+# Packed sky below the cap. Rows 0-11 are a darker blue strip.
+SKY_BLUE_888 = (0 << 16) | (174 << 8) | 255
+# Darker blue that also sits on the sea side of the horizon.
+SKY_CAP_BLUE_888 = (0 << 16) | (134 << 8) | 255
+
+
+def repair_ocean_tile(tile, tw, th):
+    """Fix sky and sea seams in the prepared tile. pixidx.bin is not rewritten.
+
+    Rows 0-11 become the sky blue. The dark-blue band on sea rows 32-35
+    is filled from the pixel to its left. Full-height columns that copy
+    an earlier column are replaced by the column just before the copy,
+    so the loop does not echo that stripe.
+    """
+    if tile is None or tw <= 1 or th <= 0:
+        return
+    sky = _rgb888_to_565(SKY_BLUE_888)
+    cap = _rgb888_to_565(SKY_CAP_BLUE_888)
+    y = 0
+    cap_n = SKY_CAP_ROWS
+    if cap_n > th:
+        cap_n = th
+    while y < cap_n:
+        x = 0
+        while x < tw:
+            _set_565(tile, tw, x, y, sky)
+            x += 1
+        y += 1
+    y0 = HORIZON_Y
+    y1 = GRASS_Y
+    if y1 > th:
+        y1 = th
+    y = y0
+    while y < y1 and y < th:
+        last = None
+        x = 0
+        while x < tw:
+            cur = _565_at(tile, tw, x, y)
+            if cur == cap and last is not None:
+                _set_565(tile, tw, x, y, last)
+            else:
+                last = _565_at(tile, tw, x, y)
+            x += 1
+        y += 1
+    cols = []
+    x = 0
+    while x < tw:
+        raw = bytearray()
+        yy = 0
+        while yy < th:
+            i = (yy * tw + x) * 2
+            raw.append(tile[i])
+            raw.append(tile[i + 1])
+            yy += 1
+        cols.append(bytes(raw))
+        x += 1
+    seen = {}
+    echo = []
+    x = 0
+    while x < tw:
+        sig = cols[x]
+        prev = seen.get(sig)
+        if prev is None:
+            seen[sig] = x
+        else:
+            echo.append(x)
+        x += 1
+    for x in echo:
+        src = x - 1
+        while src in echo and src > 0:
+            src -= 1
+        if src < 0:
+            continue
+        yy = 0
+        while yy < th:
+            _set_565(tile, tw, x, yy, _565_at(tile, tw, src, yy))
+            yy += 1
+
+
+def _keep_hill_loop(pts, tw):
+    """True for the wide green hill. Trees and bushes are narrower."""
+    if len(pts) < 8:
+        return False
+    width = _pts_bbox(pts, tw)[4]
+    if width < 40:
+        return False
+    counts = _row_widths(pts, tw)
+    mid = 0
+    for y, c in counts.items():
+        if 30 <= y <= 68:
+            mid += c
+    return mid >= 200
+
+
 def build_parallax_layers(tile, tw, th):
-    """In-place inpaint of tile plus a list of stamps. Runs once at pack load."""
+    """In-place inpaint of tile plus a list of stamps. Runs once at pack load.
+
+    Only the green hill loop is stamped back. Other scenery is painted
+    out of the tile and not drawn.
+    """
     grass_y = GRASS_Y if th >= GRASS_Y else th
     mask = _object_mask(tile, tw, th, grass_y)
     comps = _components(mask, tw, grass_y)
@@ -2100,9 +2271,11 @@ def build_parallax_layers(tile, tw, th):
     for pts in parts:
         if len(pts) < 8:
             continue
+        all_pts.extend(pts)
+        if not _keep_hill_loop(pts, tw):
+            continue
         factor = _classify(pts, tw, grass_y)
         stamps.extend(_make_stamp(tile, tw, pts, factor))
-        all_pts.extend(pts)
     _inpaint(tile, tw, th, all_pts, grass_y)
     return stamps
 
@@ -4508,7 +4681,18 @@ class Sprite:
         self.chao_accum = 0
         self.chao_x = 0
         self.chao_x0 = 0
+        self.chao_y = CHAO_HEAD_Y
         self.chao_travel = 0
+        self.chao_face = 1
+        self.chao_bob_p = 0
+        self.chao_dwell = 0
+        self.chao_side = 0
+        self.chao_side_phase = "hold"
+        self.chao_side_t = 0
+        self.chao_side_from = 0
+        self.chao_side_to = 1
+        self.chao_spd = None
+        self.chao_spd_age = 0
         self._spd_prev = None
         self.decel = 0.0
         self.ring_i = 0
@@ -4665,6 +4849,7 @@ class Sprite:
             return
         try:
             buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+            repair_ocean_tile(buf, tw, th)
             window = bytearray(W * th * 2)
         except MemoryError:
             print("ocean rgb565 alloc failed")
@@ -4682,12 +4867,14 @@ class Sprite:
             print("ocean parallax alloc failed, using 1.0 scroll")
             try:
                 buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+                repair_ocean_tile(buf, tw, th)
             except Exception:
                 pass
         except Exception as e:
             print("ocean parallax failed:", e)
             try:
                 buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+                repair_ocean_tile(buf, tw, th)
             except Exception:
                 pass
         _continue_dirt_checker(buf, tw, th)
@@ -4901,21 +5088,76 @@ class Sprite:
                 self.chao_accum = CHAO_FRAME_MS
             self.chao_i = (self.chao_i + 1) & 1
 
+    def _chao_bob(self, dt_ms):
+        """Wander around head height. Approach stays tighter than a hover."""
+        if self.chao_phase == "follow" and self.chao_side_phase == "hold":
+            amp = CHAO_BOB_HOVER
+        else:
+            amp = CHAO_BOB_JOIN
+        self.chao_bob_p += dt_ms
+        period = CHAO_BOB_PERIOD_MS
+        if period < 1:
+            period = 1
+        if self.chao_bob_p >= period * 4:
+            self.chao_bob_p -= period * 4
+        ang = (self.chao_bob_p % period) * 6.28318530718 / float(period)
+        ang2 = ((self.chao_bob_p // 2) % period) * 6.28318530718 / float(period)
+        dy = math.sin(ang) * amp + math.sin(ang2 + 1.3) * (amp * 0.35)
+        if dy > amp:
+            dy = amp
+        elif dy < -amp:
+            dy = -amp
+        self.chao_y = CHAO_HEAD_Y + dy
+        self.chao_bob_amp = amp
+
+    def _chao_drastic(self, speed, dt_ms):
+        """True when speed jumps by CHAO_DRASTIC_KMH inside CHAO_DRASTIC_MS."""
+        if self.chao_spd is None:
+            self.chao_spd = speed
+            self.chao_spd_age = 0
+            return False
+        self.chao_spd_age += dt_ms
+        delta = speed - self.chao_spd
+        if delta < 0:
+            delta = -delta
+        if delta >= CHAO_DRASTIC_KMH and self.chao_spd_age <= CHAO_DRASTIC_MS:
+            self.chao_spd = speed
+            self.chao_spd_age = 0
+            return True
+        if self.chao_spd_age >= CHAO_DRASTIC_MS:
+            self.chao_spd = speed
+            self.chao_spd_age = 0
+        return False
+
     def _chao_key(self):
         if self.chao_phase == "off":
             return None
-        return (self.chao_phase, self.chao_type, self.chao_i, int(self.chao_x))
+        return (
+            self.chao_phase,
+            self.chao_type,
+            self.chao_i,
+            int(self.chao_x),
+            int(self.chao_y),
+            self.chao_face,
+            self.chao_side,
+        )
+
+    def _chao_flipped_runs(self, fr):
+        if self.chao_face:
+            return _mirror_runs(fr)
+        return fr.runs, fr.nruns
 
     def _step_chao(self, speed, dt_ms):
-        """Join from the left under 80 km/h, hover, then leave off the right.
+        """Join from the left, hover on both sides, then leave off the right.
 
-        Stopped and full-speed driving keep the slot empty. A cruise that
-        returns during the exit turns back into a join of the same type.
+        Stays up to five minutes. Leaves early above 80 km/h or when speed
+        jumps by CHAO_DRASTIC_KMH within CHAO_DRASTIC_MS. Travel eases in
+        and out. The packed sprites face left, so a rightward move is mirrored.
         """
         cruise = speed >= 1.0 and speed < SPEED_FAST
-        phase = self.chao_phase
-        if phase == "off":
+        if self.chao_phase == "off":
             if not cruise:
+                self._chao_drastic(speed, dt_ms)
                 return
             if self.chao_joined:
                 self.chao_type = (self.chao_type + 1) % len(CHAO_TYPES)
@@ -4923,43 +5165,92 @@ class Sprite:
                 self.chao_type = 0
                 self.chao_joined = True
             self.chao_x = CHAO_OFF_LEFT
+            self.chao_dwell = 0
+            self.chao_side = 0
+            self.chao_side_phase = "hold"
+            self.chao_side_t = 0
+            self.chao_face = 1
             self._chao_start("join")
+        phase = self.chao_phase
+        if phase == "off":
             return
+        leave = speed >= SPEED_FAST or self._chao_drastic(speed, dt_ms)
         if phase == "follow":
-            if not cruise:
+            self.chao_dwell += dt_ms
+            if leave or self.chao_dwell >= CHAO_DWELL_MS:
+                self.chao_face = 1
                 self._chao_start("leave")
-                phase = "leave"
+                self._chao_bob(dt_ms)
+                return
             else:
+                self._chao_follow(dt_ms)
                 self._chao_step_frame(dt_ms)
+                self._chao_bob(dt_ms)
                 return
-        if phase != "join" and phase != "leave":
-            return
-        self.chao_travel += dt_ms
-        if self.chao_travel > CHAO_TRAVEL_MS:
-            self.chao_travel = CHAO_TRAVEL_MS
-        t = self.chao_travel / float(CHAO_TRAVEL_MS)
-        if self.chao_phase == "join":
-            dest = CHAO_FOLLOW_X
-            self.chao_x = self.chao_x0 + (dest - self.chao_x0) * t
-            if not cruise:
+        if phase == "join" or phase == "leave":
+            if phase == "join" and leave:
+                self.chao_face = 1
                 self._chao_start("leave")
+                self._chao_bob(dt_ms)
                 return
-        else:
-            dest = CHAO_OFF_RIGHT
-            self.chao_x = self.chao_x0 + (dest - self.chao_x0) * t
-            if cruise:
-                self._chao_start("join")
-                return
-        if t >= 1.0:
-            if self.chao_phase == "join":
-                self.chao_phase = "follow"
-                self.chao_x = CHAO_FOLLOW_X
-                self.chao_i = 0
-                self.chao_accum = 0
+            limit = CHAO_JOIN_MS if phase == "join" else CHAO_LEAVE_MS
+            self.chao_travel += dt_ms
+            if self.chao_travel > limit:
+                self.chao_travel = limit
+            t = _chao_ease(self.chao_travel / float(limit if limit else 1))
+            if phase == "join":
+                dest = CHAO_LEFT_X
+                self.chao_face = 1
             else:
-                self.chao_phase = "off"
+                dest = CHAO_OFF_RIGHT
+                self.chao_face = 1
+            self.chao_x = self.chao_x0 + (dest - self.chao_x0) * t
+            if t >= 1.0:
+                if phase == "join":
+                    self.chao_phase = "follow"
+                    self.chao_x = CHAO_LEFT_X
+                    self.chao_side = 0
+                    self.chao_side_phase = "hold"
+                    self.chao_side_t = 0
+                    self.chao_dwell = 0
+                    self.chao_i = 0
+                    self.chao_accum = 0
+                    self.chao_face = 1
+                else:
+                    self.chao_phase = "off"
+                self._chao_bob(dt_ms)
+                return
+            self._chao_step_frame(dt_ms)
+            self._chao_bob(dt_ms)
+
+    def _chao_follow(self, dt_ms):
+        """Hold one side, then ease across to the other."""
+        self.chao_side_t += dt_ms
+        if self.chao_side_phase == "hold":
+            if self.chao_side == 0:
+                self.chao_x = CHAO_LEFT_X
+            else:
+                self.chao_x = CHAO_RIGHT_X
+            if self.chao_side_t >= CHAO_SIDE_HOLD_MS:
+                self.chao_side_from = self.chao_side
+                self.chao_side_to = 0 if self.chao_side else 1
+                self.chao_side_phase = "move"
+                self.chao_side_t = 0
+                self.chao_x0 = int(self.chao_x)
             return
-        self._chao_step_frame(dt_ms)
+        limit = CHAO_SIDE_MS
+        if limit < 1:
+            limit = 1
+        t = _chao_ease(self.chao_side_t / float(limit))
+        x_from = CHAO_LEFT_X if self.chao_side_from == 0 else CHAO_RIGHT_X
+        x_to = CHAO_LEFT_X if self.chao_side_to == 0 else CHAO_RIGHT_X
+        self.chao_x = x_from + (x_to - x_from) * t
+        self.chao_face = 1 if x_to >= x_from else 0
+        if self.chao_side_t >= limit:
+            self.chao_side = self.chao_side_to
+            self.chao_side_phase = "hold"
+            self.chao_side_t = 0
+            self.chao_x = x_to
 
     def _chao_stamp(self):
         """(frame, top-left x, top-left y), or None when the slot is empty."""
@@ -4970,14 +5261,17 @@ class Sprite:
         frames = self._cycle_frames(CHAO_TYPES[self.chao_type])
         if not frames:
             return None
-        if self.chao_phase == "follow":
+        if self.chao_phase == "follow" and self.chao_side_phase == "hold":
             idx = CHAO_HOVER[self.chao_i & 1]
         else:
             idx = CHAO_MOVE[self.chao_i & 1]
         if idx >= len(frames):
             return None
         fr = frames[idx]
-        return fr, int(self.chao_x) - fr.origin_x, CHAO_HEAD_Y - fr.origin_y
+        y = self.chao_y
+        if y is None:
+            y = CHAO_HEAD_Y
+        return fr, int(self.chao_x) - fr.origin_x, int(y) - fr.origin_y
 
     def _cycle_frames(self, tag):
         pack = self.pack
@@ -5305,7 +5599,10 @@ class Sprite:
         chao = self._chao_stamp()
         if chao is not None:
             fr, x0, y0 = chao
-            blit_frame(lcd, pack, fr, x0, y0, pack.pal(fr.pal_id), 0, GAUGE_Y, False)
+            blit_frame(
+                lcd, pack, fr, x0, y0, pack.pal(fr.pal_id), 0, GAUGE_Y, False,
+                self.chao_face,
+            )
 
     def _can_retain(self):
         if not (
@@ -5804,7 +6101,7 @@ class Sprite:
         self._sprites_on = True
         return True
 
-    def _stamp_frame(self, window, vw, vh, fr, dest_x, dest_y, use_origin, amount, save_under=False):
+    def _stamp_frame(self, window, vw, vh, fr, dest_x, dest_y, use_origin, amount, save_under=False, flip=False):
         at = self._bake_at.get(fr.name)
         if at is None:
             raise KeyError(fr.name)
@@ -5826,6 +6123,8 @@ class Sprite:
         y0 = int(y0)
         if save_under:
             self._save_underlay(x0, y0, fr.w, fr.h, vw, vh)
+        if flip:
+            rgb, mask = _mirror_baked(rgb, mask, fr.w, fr.h)
         stamp_baked(window, vw, vh, rgb, mask, fr.w, fr.h, x0, y0)
 
     def _plan_places(self, amount):
@@ -6211,7 +6510,9 @@ class Sprite:
         chao = self._chao_stamp()
         if chao is not None:
             fr, x0, y0 = chao
-            self._stamp_frame(window, vw, vh, fr, x0, y0, False, 0, save_under)
+            self._stamp_frame(
+                window, vw, vh, fr, x0, y0, False, 0, save_under, self.chao_face
+            )
         bar = pack.by_name.get("hud_bar")
         if bar is not None:
             self._stamp_frame(
@@ -6527,11 +6828,17 @@ class Sprite:
                         if pal_id < 0 or pal_id >= len(self.pack.pair_bytes):
                             pal_id = 0
                         pairs = self.pack.pair_bytes[pal_id]
+                    runs = fr.runs
+                    nruns = fr.nruns
+                    if p[0] == "chao" and self.chao_face:
+                        runs, nruns = self._chao_flipped_runs(fr)
                     gh.stamp_runs(
-                        window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2, p[1], p[2]
+                        window, vw, vh, runs, nruns, pairs, len(pairs) // 2, p[1], p[2]
                     )
                 else:
                     rgb, mask = self._native_views(fr, p[6])
+                    if p[0] == "chao" and self.chao_face:
+                        rgb, mask = _mirror_baked(rgb, mask, fr.w, fr.h)
                     gh.stamp(window, vw, vh, rgb, mask, fr.w, fr.h, p[1], p[2])
             finally:
                 _brk_exit()

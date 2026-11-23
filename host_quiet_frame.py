@@ -615,30 +615,74 @@ def main():
     assert settle["rpm"] < fw.VTEC_OFF_RPM
     assert settle["clt"] == 96.0
     assert sum(stage[0] for stage in fw.Sweep.STAGES) == 9900
+    assert fw.CHAO_BOB_JOIN < fw.CHAO_BOB_HOVER
+    assert fw.CHAO_JOIN_MS >= 2000
+    assert fw.CHAO_DWELL_MS == 5 * 60 * 1000
+    assert fw.CHAO_DRASTIC_KMH == 30.0 and fw.CHAO_DRASTIC_MS == 500
+    assert fw._chao_ease(0.0) == 0.0 and fw._chao_ease(1.0) == 1.0
+    assert abs(fw._chao_ease(0.5) - 0.5) < 1e-6
+    assert fw._chao_ease(0.25) < 0.25
     parked = fw.Sprite(None)
     parked.advance(0.0, 500, 800.0, 0.0)
     assert parked.chao_phase == "off"
     fast = fw.Sprite(None)
     fast.advance(80.0, 200, 5000.0, 0.0)
     assert fast.chao_phase == "off"
+    span = fw.CHAO_LEFT_X - fw.CHAO_OFF_LEFT
+    early = fw.Sprite(None)
+    early.advance(40.0, fw.CHAO_JOIN_MS // 4, 2000.0, 0.0)
+    assert early.chao_phase == "join" and early.chao_face == 1
+    eased_x = fw.CHAO_OFF_LEFT + fw._chao_ease(0.25) * span
+    assert abs(early.chao_x - eased_x) < 1.5
+    assert abs(early.chao_y - fw.CHAO_HEAD_Y) <= fw.CHAO_BOB_JOIN + 0.01
     pet = fw.Sprite(None)
-    pet.advance(50.0, 16, 2000.0, 0.0)
-    assert pet.chao_phase == "join" and pet.chao_type == 0
-    assert pet._chao_stamp() is None
-    pet.advance(50.0, fw.CHAO_TRAVEL_MS, 2000.0, 0.0)
-    assert pet.chao_phase == "follow" and int(pet.chao_x) == fw.CHAO_FOLLOW_X
+    pet.advance(50.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    assert pet.chao_phase == "follow" and pet.chao_type == 0
+    assert pet.chao_side == 0 and int(pet.chao_x) == fw.CHAO_LEFT_X
+    assert pet.chao_face == 1
     pet.chao_i = 0
     pet.chao_accum = 0
     pet.advance(50.0, fw.CHAO_FRAME_MS - 1, 2000.0, 0.0)
-    assert pet.chao_i == 0
+    assert pet.chao_i == 0 and abs(pet.chao_y - fw.CHAO_HEAD_Y) <= fw.CHAO_BOB_HOVER + 0.01
     pet.advance(50.0, 1, 2000.0, 0.0)
     assert pet.chao_i == 1 and pet.chao_phase == "follow"
-    pet.advance(80.0, 16, 5000.0, 0.0)
-    assert pet.chao_phase == "leave"
-    pet.advance(80.0, fw.CHAO_TRAVEL_MS, 5000.0, 0.0)
-    assert pet.chao_phase == "off"
-    pet.advance(40.0, 16, 2000.0, 0.0)
-    assert pet.chao_phase == "join" and pet.chao_type == 1
+    soft = fw.Sprite(None)
+    soft.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    soft.advance(50.0, 16, 2000.0, 0.0)
+    assert soft.chao_phase == "follow"
+    jump = fw.Sprite(None)
+    jump.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    jump.advance(70.0, 16, 3000.0, 0.0)
+    assert jump.chao_phase == "leave" and jump.chao_face == 1
+    over = fw.Sprite(None)
+    over.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    over.advance(85.0, 16, 5000.0, 0.0)
+    assert over.chao_phase == "leave"
+    over.advance(85.0, fw.CHAO_LEAVE_MS, 5000.0, 0.0)
+    assert over.chao_phase == "off"
+    assert over.chao_x >= fw.W
+    dwell = fw.Sprite(None)
+    dwell.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    dwell.advance(40.0, fw.CHAO_DWELL_MS, 2000.0, 0.0)
+    assert dwell.chao_phase == "leave" and dwell.chao_face == 1
+    side = fw.Sprite(None)
+    side.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    side.advance(40.0, fw.CHAO_SIDE_HOLD_MS, 2000.0, 0.0)
+    assert side.chao_phase == "follow" and side.chao_side_phase == "move"
+    side.advance(40.0, fw.CHAO_SIDE_MS, 2000.0, 0.0)
+    assert side.chao_side == 1 and int(side.chao_x) == fw.CHAO_RIGHT_X
+    assert side.chao_face == 1
+    side.advance(40.0, fw.CHAO_SIDE_HOLD_MS, 2000.0, 0.0)
+    assert side.chao_side_phase == "move"
+    side.advance(40.0, 16, 2000.0, 0.0)
+    assert side.chao_face == 0 and side.chao_x < fw.CHAO_RIGHT_X
+    again = fw.Sprite(None)
+    again.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    again.advance(85.0, 16, 5000.0, 0.0)
+    again.advance(85.0, fw.CHAO_LEAVE_MS, 5000.0, 0.0)
+    assert again.chao_phase == "off"
+    again.advance(40.0, 16, 2000.0, 0.0)
+    assert again.chao_phase == "join" and again.chao_type == 1
 
     class _ChaoFr(object):
         def __init__(self, name):
@@ -657,16 +701,69 @@ def main():
 
     drawn = fw.Sprite(_ChaoPack())
     drawn.chao_phase = "join"
+    drawn.chao_side_phase = "move"
     drawn.chao_type = 0
     drawn.chao_i = 1
-    drawn.chao_x = fw.CHAO_FOLLOW_X
+    drawn.chao_x = fw.CHAO_LEFT_X
+    drawn.chao_y = fw.CHAO_HEAD_Y
+    drawn.chao_face = 1
+    fr0 = drawn.pack.cycles["normal_chao"][0]
+    fr0.nruns = 1
+    fr0.runs = bytes([0, 0, 0, 4, 1])
     joined = drawn._chao_stamp()
     assert joined[0].name == "normal_chao_1"
+    runs, nruns = fw._mirror_runs(fr0)
+    assert nruns == 1 and runs[0] == fr0.w - 4
     drawn.chao_phase = "follow"
+    drawn.chao_side_phase = "hold"
     drawn.chao_i = 0
+    drawn.chao_face = 0
     hovering = drawn._chao_stamp()
     assert hovering[0].name == "normal_chao_2"
     assert hovering[2] == fw.CHAO_HEAD_Y - 11
+    raw = open(os.path.join(ROOT, "pixidx.bin"), "rb").read()
+    opack = fw.PixIdx(raw)
+    obuf, otw, oth = fw.prerender_ocean_rgb565(opack, opack.by_name["ocean"])
+    fw.repair_ocean_tile(obuf, otw, oth)
+    sky = fw._rgb888_to_565(fw.SKY_BLUE_888)
+    cap = fw._rgb888_to_565(fw.SKY_CAP_BLUE_888)
+    y = 0
+    while y < fw.SKY_CAP_ROWS:
+        i = (y * otw) * 2
+        assert obuf[i] == (sky & 0xFF) and obuf[i + 1] == ((sky >> 8) & 0xFF)
+        y += 1
+    y = fw.HORIZON_Y
+    while y < fw.HORIZON_Y + 4:
+        x = 0
+        while x < otw:
+            i = (y * otw + x) * 2
+            c = obuf[i] | (obuf[i + 1] << 8)
+            assert c != cap
+            x += 1
+        y += 1
+    def _col(x):
+        raw_col = bytearray()
+        yy = 0
+        while yy < oth:
+            i = (yy * otw + x) * 2
+            raw_col.append(obuf[i])
+            raw_col.append(obuf[i + 1])
+            yy += 1
+        return bytes(raw_col)
+    # Distant copies of the sea cut are gone. A one-column continuation is fine.
+    assert _col(256) != _col(128)
+    assert _col(374) != _col(246)
+    assert _col(336) != _col(208)
+    stamps = fw.build_parallax_layers(bytearray(obuf), otw, oth)
+    assert stamps
+    wide = 0
+    for st in stamps:
+        stamp_w, stamp_h = st[3], st[4]
+        # Trees were narrow and tall. A wrapped hill may leave a short sliver.
+        assert not (stamp_w <= 28 and stamp_h >= 40)
+        if stamp_w >= 40 and stamp_h >= 20:
+            wide += 1
+    assert wide >= 1
 
     class _Rects(object):
         def __init__(self):
