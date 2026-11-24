@@ -77,6 +77,7 @@ sweat droplets are not drawn.
 """
 
 import math
+import sys
 import time
 
 import M5
@@ -484,6 +485,7 @@ PIX6_MAGIC = b"PIX6"
 
 SPEED_SLOW = 40.0
 SPEED_FAST = 80.0
+_RUN_TAGS = ("run_slow", "run_medium", "run_fast")
 IDLE_TRIGGER_AFTER_MS = 3500
 
 # Locked after-preview layout (128x128). Sonic sprite is 39x36 at top-left
@@ -5170,6 +5172,7 @@ class Sprite:
         self._ring_seen = 0
         self._ring_got = 0
         self.anim_tag = "idle"
+        self._run_pending = None
         self.anim_i = 0
         self.anim_accum = 0
         self.idle_wait = 0
@@ -5789,6 +5792,8 @@ class Sprite:
         return fr, int(self.chao_x) - fr.origin_x, int(y) - fr.origin_y
 
     def _cycle_frames(self, tag):
+        if not isinstance(tag, str):
+            return None
         pack = self.pack
         if pack is None:
             return None
@@ -5829,6 +5834,22 @@ class Sprite:
             frames = self._cycle_frames(tag)
         if not frames:
             return
+        # A run-to-run speed change waits until this cycle wraps. Switching
+        # the tag in the middle left the draw with the previous frames list.
+        if (
+            isinstance(tag, str)
+            and isinstance(self.anim_tag, str)
+            and tag in _RUN_TAGS
+            and self.anim_tag in _RUN_TAGS
+        ):
+            if tag != self.anim_tag:
+                self._run_pending = tag
+            tag = self.anim_tag
+            frames = self._cycle_frames(tag)
+            if not frames:
+                return
+        else:
+            self._run_pending = None
         if tag != self.anim_tag:
             # Show the first frame of the new cycle for this present.
             self.anim_tag = tag
@@ -5855,6 +5876,17 @@ class Sprite:
                         self.triggering = False
                         self.anim_tag = "idle"
                         self.idle_wait = 0
+                    pending = self._run_pending
+                    if (
+                        isinstance(pending, str)
+                        and pending in _RUN_TAGS
+                        and pending != self.anim_tag
+                    ):
+                        self.anim_tag = pending
+                        self._run_pending = None
+                        frames = self._cycle_frames(self.anim_tag)
+                        if not frames:
+                            return
         # World-ring spin at 15 fps. Its clock is not the present quantum
         # and not the character tag change, so a speed-band swap does not
         # freeze the spin. A late paint still takes one step.
@@ -8571,6 +8603,7 @@ def main():
                     loop_err_ms = err_now
                     if _stdout_can_write():
                         print("loop", e)
+                        sys.print_exception(e)
             except Exception:
                 pass
             _sleep_us(20000)
