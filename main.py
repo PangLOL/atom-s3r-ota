@@ -485,7 +485,7 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "aff2df4c1b04d216341506391f4035fc353aae300c5ff2cc011977e1dd09454d"
+PIXIDX_SHA256 = "10f844338e5a16790ec4194d457520744ee440efe33571c0e1b293ab9996a744"
 PIXIDX_SIZE = 390010
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
@@ -531,7 +531,7 @@ CHAO_DRASTIC_MS = 500
 CHAO_BOB_JOIN = 3
 CHAO_BOB_HOVER = 8
 CHAO_BOB_PERIOD_MS = 2400
-# Packed art faces left. Face right (mirror) when traveling right.
+# Packed art faces right. Mirror when traveling left.
 # Body centre. Close enough that the right-facing hover sits against Sonic.
 CHAO_LEFT_X = SONIC_X + 2
 CHAO_RIGHT_X = SONIC_X + SONIC_W + 8
@@ -5890,7 +5890,8 @@ class Sprite:
         )
 
     def _chao_flipped_runs(self, fr):
-        if self.chao_face:
+        # chao_face 1 means facing right, which is how the art is stored.
+        if not self.chao_face:
             return _mirror_runs(fr)
         return fr.runs, fr.nruns
 
@@ -5899,7 +5900,7 @@ class Sprite:
 
         Stays up to five minutes. Leaves early above 80 km/h or when speed
         jumps by CHAO_DRASTIC_KMH within CHAO_DRASTIC_MS. Travel eases in
-        and out. The packed sprites face left, so a rightward move is mirrored.
+        and out. The packed sprites face right, so a leftward move is mirrored.
         """
         cruise = speed >= 1.0 and speed < SPEED_FAST
         if self.chao_phase == "off":
@@ -6393,7 +6394,7 @@ class Sprite:
             fr, x0, y0 = chao
             blit_frame(
                 lcd, pack, fr, x0, y0, pack.pal(fr.pal_id), 0, GAUGE_Y, False,
-                self.chao_face,
+                not self.chao_face,
             )
 
     def _can_retain(self):
@@ -7348,7 +7349,7 @@ class Sprite:
         if chao is not None:
             fr, x0, y0 = chao
             self._stamp_frame(
-                window, vw, vh, fr, x0, y0, False, 0, save_under, self.chao_face
+                window, vw, vh, fr, x0, y0, False, 0, save_under, not self.chao_face
             )
         gauge = pack.by_name.get("hud_gauge")
         if gauge is not None:
@@ -7730,14 +7731,14 @@ class Sprite:
                         pairs = self.pack.pair_bytes[pal_id]
                     runs = fr.runs
                     nruns = fr.nruns
-                    if p[0] == "chao" and self.chao_face:
+                    if p[0] == "chao" and not self.chao_face:
                         runs, nruns = self._chao_flipped_runs(fr)
                     gh.stamp_runs(
                         window, vw, vh, runs, nruns, pairs, len(pairs) // 2, p[1], p[2]
                     )
                 else:
                     rgb, mask = self._native_views(fr, p[6])
-                    if p[0] == "chao" and self.chao_face:
+                    if p[0] == "chao" and not self.chao_face:
                         rgb, mask = _mirror_baked(rgb, mask, fr.w, fr.h)
                     gh.stamp(window, vw, vh, rgb, mask, fr.w, fr.h, p[1], p[2])
             finally:
