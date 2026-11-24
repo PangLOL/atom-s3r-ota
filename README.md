@@ -26,14 +26,21 @@ firmware fetches it over Wi-Fi after boot.
 
 `.nojekyll` keeps GitHub Pages from running Jekyll.
 
-## Version 12 is not published
+## Version 13
 
-This branch is **2026.11.21-v12** (version **12**). It is not the live
-GitHub Pages payload. Do not treat this branch as an OTA update until it
-is merged and the owner publishes it.
+This branch is **2026.11.25-v13** (version **13**). It becomes the live
+OTA payload when it is merged and published.
 
-Version 12 keeps the V11 playfield. The 384×103 ocean and the sprite
-cache are still built once when the pack loads. Each frame still pushes
+Version 13 keeps the V12 playfield. Official Sega artwork may be packed
+into `pixidx.bin` and flashed. The device keeps a `pixidx.bin` already
+on the device: hash, byte size, and sprite size do not reject a PIX6
+pack, and the hosted file is not downloaded over it. Mouth frames (`mouth_closed`,
+`mouth_open`, `mouth_locked`), Chao cycles (`chao_normal`, `chao_amy`,
+`chao_knuckles`, `chao_sonic`, `chao_tails`), and boost FX cycles
+(`aura`, `sw`, `bar`) are drawn when the pack contains them. The hosted
+`pixidx.bin` in this repository is still the previous asset.
+
+The 384×103 ocean and the sprite cache are still built once when the pack loads. Each frame still pushes
 one 128×103 image. A parallax band is recopied only when
 `int(scroll * factor)` changes. Scenery is restamped only inside the
 rectangles a shifted band or a moved stamp actually dirtied, so the
@@ -59,7 +66,7 @@ compose. If a later stamp fails, the bake flag is cleared and drawing
 stays on the `fillRect` interpreter. Aura, shockwave, and the gauges are
 unchanged.
 
-`pixidx.bin` is unchanged
+`pixidx.bin` in this repository is unchanged
 (`dda4ea1e1f3249adc8bccb8fc9fe07bb446fb569d5abb884bd1bf83cfe4ba47e`,
-107656 bytes). The device only replaces `main.py`. Device secrets are
-never stored here.
+107656 bytes). A different PIX6 file flashed on the device is kept.
+Device secrets are never stored here.
