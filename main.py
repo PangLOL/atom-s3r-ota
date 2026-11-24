@@ -485,8 +485,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "fc957f6b48dbf4000c47f88c451cc14bc617bc8bea114fbd5aa7623a4a7ec12e"
-PIXIDX_SIZE = 485167
+PIXIDX_SHA256 = "e0c4af289f50680ee0544e2d985854b7f51ee28689ed8235433946a9704b913f"
+PIXIDX_SIZE = 380934
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -548,7 +548,7 @@ BAR_TIP_X = 68            # 8 px left of the shockwave tip
 BAR_TIP_Y = SONIC_MID_Y   # 72
 SPARK_FRONT_X = 22
 SPARK_MID_Y = 88
-SPARK_FRAMES = 4
+SPARK_FRAMES = 5
 HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
 GROUND_SURFACE_IN_TILE = 0  # unused; feet dest is locked, backdrop includes ground
@@ -572,14 +572,13 @@ _SPARK_PLACE_KEYS = tuple("k%d" % i for i in range(12))
 FIELD_RING_Y = 78
 
 # Scenery is baked into the 384x103 backdrop. These names are the
-# fallback if a pack has no ocean frame. The first palm only, and the
-# third tiny-flower frame. The loose coconut and the grass-top frame
-# strip are not in this list.
+# fallback if a pack has no ocean frame. The isolated palm, and the
+# third tiny-flower frame. The old ground, palms, island, bush, and
+# flower strips are not in the pack.
 SCENERY_PROPS = (
-    ("palm_0", 5),
-    ("island_0", 65),
-    ("bush_0", 0),
-    ("tiny_flowers_2", 102),
+    ("prop_palm", 5),
+    ("prop_sun", 65),
+    ("prop_fl_2", 102),
 )
 
 
@@ -933,21 +932,22 @@ def _install_sheet_backdrop(tile, tw, th, pack):
     """
     if tile is None or pack is None or tw < 1 or th < 1:
         return
-    bg = pack.by_name.get("gh_bg_0")
+    # The ocean frame is the first sea picture, already 384x103.
+    # Copy it back over the sky and water so the flat sky fill does not
+    # cover it. The grass and checker below are painted after this.
+    bg = pack.by_name.get("ocean")
     if bg is not None and bg.w > 0 and bg.h > 0:
-        # Source horizon sits near y 70. Line that up with HORIZON_Y.
-        src0 = 70 - HORIZON_Y
         y = 0
         limit = GRASS_Y if GRASS_Y < th else th
+        if limit > bg.h:
+            limit = bg.h
         while y < limit:
-            sy = src0 + y
-            if sy >= 0 and sy < bg.h:
-                x = 0
-                while x < tw:
-                    col = _frame_at_565(pack, bg, x % bg.w, sy)
-                    if col is not None:
-                        _set_565(tile, tw, x, y, col)
-                    x += 1
+            x = 0
+            while x < tw:
+                col = _frame_at_565(pack, bg, x % bg.w, y)
+                if col is not None:
+                    _set_565(tile, tw, x, y, col)
+                x += 1
             y += 1
     grass = pack.by_name.get("gnd_grass")
     check = pack.by_name.get("gnd_check")
@@ -5184,7 +5184,7 @@ def draw_sparks(lcd, front_x, mid_y, frame):
         ((-1, 2, 5, COL_AURA_W), (-6, -1, 5, COL_AURA_I), (-4, 5, 3, COL_AURA_W), (-9, -3, 3, COL_AURA_I)),
         ((-2, -2, 4, COL_AURA_I), (-5, 2, 6, COL_AURA_W), (-8, -5, 3, COL_AURA_I), (-3, 5, 4, COL_AURA_W)),
     )
-    for dx, dy, length, col in shards[frame % SPARK_FRAMES]:
+    for dx, dy, length, col in shards[frame % 4]:
         fill_triangle(
             lcd,
             front_x + dx, mid_y + dy,
@@ -5561,7 +5561,8 @@ class Sprite:
                 pass
         _continue_dirt_checker(buf, tw, th)
         _install_sheet_backdrop(buf, tw, th, pack)
-        stamps.extend(_sheet_prop_stamps(pack, th))
+        # The sea picture has no hill stamps. Keep the packed ground props.
+        stamps = _sheet_prop_stamps(pack, th)
         self.ocean_rgb565 = buf
         self.ocean_tw = tw
         self.ocean_th = th

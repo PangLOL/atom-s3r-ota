@@ -610,6 +610,8 @@ def main():
     fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
     assert fast.spark_i == 3
     fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 4
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
     assert fast.spark_i == 0
     fast.tick(fw.SPEED_FAST - 1.0, 10, 0.0)
     assert fast.spark_i < 0
@@ -626,7 +628,8 @@ def main():
     assert len(fw.PALMS) == 1 and fw.PALMS[0][0] == 10
     assert fw.BG_FRAME == 0 and fw.SEA_SHIFT == 0
     assert "palm_1" not in [name for name, _x in fw.SCENERY_PROPS]
-    assert "tiny_flowers_2" in [name for name, _x in fw.SCENERY_PROPS]
+    assert "prop_fl_2" in [name for name, _x in fw.SCENERY_PROPS]
+    assert "prop_palm" in [name for name, _x in fw.SCENERY_PROPS]
     assert fw.HOCKEY_MIN_KMH == 25.0
     assert 150 <= fw.HOCKEY_ARM_MS <= 200
     assert fw.HOCKEY_FRAMES == 3
@@ -806,11 +809,14 @@ def main():
     opack = fw.PixIdx(raw)
     for _name in (
         "fx_spark_0", "fx_bar_0", "fx_aura_0", "fx_boot_0",
-        "gnd_grass", "gnd_check", "prop_palm", "prop_fl_2", "gh_bg_0",
+        "gnd_grass", "gnd_check", "prop_palm", "prop_fl_2", "fx_spark_4",
+        "spindash_0", "spindash_7", "look_0",
     ):
         assert _name in opack.by_name, _name
-    assert opack.by_name["gh_bg_0"].w == 256
-    assert opack.by_name["fx_boot_0"].h % 2 == 0
+    for _gone in ("ground", "palm_0", "palm_1", "island_0", "bush_0", "flowers_0", "tiny_flowers_0", "gh_bg_0"):
+        assert _gone not in opack.by_name, _gone
+    assert opack.by_name["ocean"].w == 384 and opack.by_name["ocean"].h == 103
+    assert opack.by_name["fx_spark_4"].w > 8
     assert len(raw) == fw.PIXIDX_SIZE
     obuf, otw, oth = fw.prerender_ocean_rgb565(opack, opack.by_name["ocean"])
     fw.repair_ocean_tile(obuf, otw, oth)
@@ -846,7 +852,7 @@ def main():
     assert foliage == 0
     assert fw._band_diff(obuf, otw, otw - 1, 0, fw.GRASS_Y, 100) <= 8
     assert fw._band_diff(obuf, otw, 127, 128, fw.HORIZON_Y + 4, fw.GRASS_Y) <= 24
-    assert stamps
+    # The packed ocean is the sea picture, so there is no hill loop to lift.
     wide = 0
     for st in stamps:
         stamp_w, stamp_h = st[3], st[4]
@@ -881,7 +887,8 @@ def main():
                     body += 1
                 y += 1
             assert body >= 8
-    assert wide >= 1
+    if stamps:
+        assert wide >= 1
     sea_top = fw.HORIZON_Y + 4
     sea_scores = fw._sea_boundary(obuf, otw, sea_top, fw.GRASS_Y)
     assert sea_scores[otw - 1] < 200, sea_scores[otw - 1]
