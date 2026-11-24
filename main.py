@@ -485,8 +485,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "6da5767b2f2ec4207c2f37d1e7a3f23ad87c1f9fd968433061c0eed809c7c0f2"
-PIXIDX_SIZE = 386912
+PIXIDX_SHA256 = "aff2df4c1b04d216341506391f4035fc353aae300c5ff2cc011977e1dd09454d"
+PIXIDX_SIZE = 390010
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -550,6 +550,8 @@ SPARK_MID_Y = 88
 SPARK_FRAMES = 5
 HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
+# One sprite replaces the separate ring and bar. Digits still anchor on the bar.
+HUD_GAUGE_POS = (4, 2)
 GROUND_SURFACE_IN_TILE = 0  # unused; feet dest is locked, backdrop includes ground
 PROP_PERIOD = 256   # sea source width; the tile loops when the islands meet
 # V2 fallback ratios, applied to bands split from the prerendered ocean.
@@ -3781,12 +3783,16 @@ def _underlay_budget(pack):
     rings = max_bytes(pack.cycles.get("rings"))
     spark = max_bytes(pack.cycles.get("rings_sparkle"))
     extra = 0
-    bar = pack.by_name.get("hud_bar")
-    hud = pack.by_name.get("hud_ring")
-    if bar is not None:
-        extra += bar.w * bar.h * 2
-    if hud is not None:
-        extra += hud.w * hud.h * 2
+    gauge = pack.by_name.get("hud_gauge")
+    if gauge is not None:
+        extra += gauge.w * gauge.h * 2
+    else:
+        bar = pack.by_name.get("hud_bar")
+        hud = pack.by_name.get("hud_ring")
+        if bar is not None:
+            extra += bar.w * bar.h * 2
+        if hud is not None:
+            extra += hud.w * hud.h * 2
     return sonic + chao + extra + _UNDER_RINGS * rings + _UNDER_SPARKS * spark + 64
 
 
@@ -4034,7 +4040,7 @@ _BAKE_REQUIRED = (
     "run_fast",
     "rings",
 )
-_BAKE_NAMED = ("hud_ring", "hud_bar")
+_BAKE_NAMED = ("hud_gauge",)
 _STAMP_KIND = None
 _stamp_viper = None
 
@@ -4049,9 +4055,14 @@ def _bake_frame_list(pack):
         frames.extend(cyc)
     for name in _BAKE_NAMED:
         fr = pack.by_name.get(name)
-        if fr is None:
-            return None
-        frames.append(fr)
+        if fr is not None:
+            frames.append(fr)
+    if pack.by_name.get("hud_gauge") is None:
+        for name in ("hud_ring", "hud_bar"):
+            fr = pack.by_name.get(name)
+            if fr is None:
+                return None
+            frames.append(fr)
     spark = pack.cycles.get("rings_sparkle")
     if spark:
         frames.extend(spark)
@@ -6243,15 +6254,22 @@ class Sprite:
         pack = self.pack
         if pack is not None:
             bx, by = HUD_BAR_POS
-            # Ring and bar were already stamped into the pushed playfield.
+            # The gauge was already stamped into the pushed playfield.
             if not self._playfield_stamped:
-                pal = pack.pal(1)
-                bar = pack.by_name.get("hud_bar")
-                ring = pack.by_name.get("hud_ring")
-                if bar is not None:
-                    blit_frame(lcd, pack, bar, bx, by, pal, 0, GAUGE_Y, False)
-                if ring is not None:
-                    blit_frame(lcd, pack, ring, HUD_RING_POS[0], HUD_RING_POS[1], pal, 0, GAUGE_Y, False)
+                gauge = pack.by_name.get("hud_gauge")
+                if gauge is not None:
+                    blit_frame(
+                        lcd, pack, gauge, HUD_GAUGE_POS[0], HUD_GAUGE_POS[1],
+                        pack.pal(gauge.pal_id), 0, GAUGE_Y, False,
+                    )
+                else:
+                    pal = pack.pal(1)
+                    bar = pack.by_name.get("hud_bar")
+                    ring = pack.by_name.get("hud_ring")
+                    if bar is not None:
+                        blit_frame(lcd, pack, bar, bx, by, pal, 0, GAUGE_Y, False)
+                    if ring is not None:
+                        blit_frame(lcd, pack, ring, HUD_RING_POS[0], HUD_RING_POS[1], pal, 0, GAUGE_Y, False)
             self._draw_hud_digits(lcd, bx, by)
             return
         # V2 primitive fallback
@@ -6992,16 +7010,23 @@ class Sprite:
         if chao is not None:
             fr, x0, y0 = chao
             self._emit_place(out, "chao", x0, y0, fr.w, fr.h, fr, 0, "chao")
-        bar = pack.by_name.get("hud_bar")
-        if bar is not None:
+        gauge = pack.by_name.get("hud_gauge")
+        if gauge is not None:
             self._emit_place(
-                out, "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
+                out, "hud_gauge", HUD_GAUGE_POS[0], HUD_GAUGE_POS[1],
+                gauge.w, gauge.h, gauge, 0, "hud",
             )
-        ring = pack.by_name.get("hud_ring")
-        if ring is not None:
-            self._emit_place(
-                out, "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
-            )
+        else:
+            bar = pack.by_name.get("hud_bar")
+            if bar is not None:
+                self._emit_place(
+                    out, "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
+                )
+            ring = pack.by_name.get("hud_ring")
+            if ring is not None:
+                self._emit_place(
+                    out, "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
+                )
         return out
 
     def _emit_place(self, out, key, x, y, w, h, fr, extra, kind):
@@ -7325,16 +7350,23 @@ class Sprite:
             self._stamp_frame(
                 window, vw, vh, fr, x0, y0, False, 0, save_under, self.chao_face
             )
-        bar = pack.by_name.get("hud_bar")
-        if bar is not None:
+        gauge = pack.by_name.get("hud_gauge")
+        if gauge is not None:
             self._stamp_frame(
-                window, vw, vh, bar, HUD_BAR_POS[0], HUD_BAR_POS[1], False, 0, save_under
+                window, vw, vh, gauge, HUD_GAUGE_POS[0], HUD_GAUGE_POS[1],
+                False, 0, save_under,
             )
-        ring = pack.by_name.get("hud_ring")
-        if ring is not None:
-            self._stamp_frame(
-                window, vw, vh, ring, HUD_RING_POS[0], HUD_RING_POS[1], False, 0, save_under
-            )
+        else:
+            bar = pack.by_name.get("hud_bar")
+            if bar is not None:
+                self._stamp_frame(
+                    window, vw, vh, bar, HUD_BAR_POS[0], HUD_BAR_POS[1], False, 0, save_under
+                )
+            ring = pack.by_name.get("hud_ring")
+            if ring is not None:
+                self._stamp_frame(
+                    window, vw, vh, ring, HUD_RING_POS[0], HUD_RING_POS[1], False, 0, save_under
+                )
 
     def _note_timing(self, compose_us, stamp_us, push_us, held):
         if compose_us < 0:
