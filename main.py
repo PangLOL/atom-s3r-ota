@@ -7699,10 +7699,12 @@ class Sprite:
             self._play_valid = False
             self._sprites_on = False
             push_buf = self.ocean_window
-        if window_ready and self._sprite_bake and not stamped:
+        if window_ready and not stamped and push_buf is not None and self._sprite_bake:
             try:
                 t0 = _mono_us()
-                self._stamp_playfield_sprites(amount, False)
+                # Characters go into the same buffer as the backdrop, after
+                # it, so the push already has Sonic and Chao on top.
+                self._stamp_playfield_sprites(amount, False, push_buf)
                 stamp_us = _us_diff(_mono_us(), t0)
                 stamped = True
             except Exception as e:
@@ -7711,6 +7713,10 @@ class Sprite:
                 window_ready = False
                 stamped = False
                 print("sprite stamp failed:", e)
+        # Do not present a scenery-only frame. If the sprites are not in
+        # the buffer, skip the push and draw background then characters.
+        if window_ready and not stamped:
+            window_ready = False
         if window_ready:
             t0 = _mono_us()
             hand = self._present_copy(push_buf)
