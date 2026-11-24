@@ -809,7 +809,7 @@ def main():
     opack = fw.PixIdx(raw)
     for _name in (
         "fx_spark_0", "fx_bar_0", "fx_aura_0", "fx_boot_0",
-        "gnd_grass", "gnd_check", "prop_palm", "prop_fl_2", "fx_spark_4",
+        "gnd_grass", "gnd_check", "gnd_floor", "prop_palm", "prop_fl_2", "fx_spark_4",
         "spindash_0", "spindash_7", "look_0",
     ):
         assert _name in opack.by_name, _name
@@ -853,18 +853,22 @@ def main():
             x += 1
         y += 1
     assert foliage == 0
-    # The row under the full grass repeats one light square, not the checker.
+    # The dark strip is one 8px block. The checker starts on the next row
+    # and shares those edges, so it repeats every 16px and is not one shade.
     ground = bytearray(obuf)
     fw._install_sheet_backdrop(ground, otw, oth, opack)
-    grass = opack.by_name["gnd_grass"]
-    cell = fw.SURFACE_ROWS
-    sy = fw.GRASS_Y + grass.h
+    sy = fw.GRASS_Y + fw.BLADE_ROWS + 7
+    cell = 8
     tmpl = bytes(ground[(sy * otw) * 2:(sy * otw + cell) * 2])
     x = 0
     while x < otw:
         got = bytes(ground[(sy * otw + x) * 2:(sy * otw + x + cell) * 2])
         assert got == tmpl
         x += cell
+    cy = sy + 1
+    left = bytes(ground[(cy * otw) * 2:(cy * otw + cell) * 2])
+    right = bytes(ground[(cy * otw + cell) * 2:(cy * otw + cell * 2) * 2])
+    assert left != right
     # The sea picture's own waves step by about this much between columns.
     assert fw._band_diff(obuf, otw, 127, 128, fw.HORIZON_Y + 4, fw.GRASS_Y) <= 32
     # The packed ocean is the sea picture, so there is no hill loop to lift.

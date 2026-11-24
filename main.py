@@ -485,8 +485,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "0855c0f9166e290cc557dfc0b95e739add1eee4b1a9260d70d16d50cf7e60ce0"
-PIXIDX_SIZE = 375365
+PIXIDX_SHA256 = "6da5767b2f2ec4207c2f37d1e7a3f23ad87c1f9fd968433061c0eed809c7c0f2"
+PIXIDX_SIZE = 386912
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -559,10 +559,9 @@ PARALLAX_WATER = 0.6
 PARALLAX_GROUND = 1.0
 # far_bg is everything above the line where the distant islands meet the sea.
 HORIZON_Y = 53
-# Full grass, then one same-shade square row, then one checker row.
+# Grass blades, then the dark strip and the checker as one sprite.
 GRASS_Y = 88
-SURFACE_ROWS = 8
-CHECKER_BAND = 8
+BLADE_ROWS = 16
 RING_PERIOD = 1536  # long gaps between groups of 3-8
 RING_FPS_MS = 1000 // 30  # 33
 
@@ -969,12 +968,10 @@ def _frame_at_565(pack, fr, x, y):
 
 
 def _install_sheet_backdrop(tile, tw, th, pack):
-    """Paint far_bg, mid_bg, the full grass, then the dirt rows.
+    """Paint far_bg, mid_bg, the grass blades, then the ground sprite.
 
-    The grass sprite is drawn at its full height so the blades are not
-    covered. Under it, one row of squares repeats the light checker cell
-    (the whole row is that one shade). The alternating checker starts
-    below that row.
+    gnd_floor is the dark strip under the grass and the checker under
+    that strip, on one 8px block grid.
     """
     if tile is None or pack is None or tw < 1 or th < 1:
         return
@@ -986,54 +983,33 @@ def _install_sheet_backdrop(tile, tw, th, pack):
         dest = far.h if far is not None else HORIZON_Y
         _blit_indexed_565(tile, tw, th, pack, mid, dest)
     grass = pack.by_name.get("gnd_grass")
-    check = pack.by_name.get("gnd_check")
-    grass_h = 0
+    floor = pack.by_name.get("gnd_floor")
     if grass is not None and grass.w > 0 and grass.h > 0 and GRASS_Y < th:
-        grass_h = grass.h
-        if GRASS_Y + grass_h > th:
-            grass_h = th - GRASS_Y
+        blades = BLADE_ROWS
+        if blades > grass.h:
+            blades = grass.h
+        period = floor.w if floor is not None and floor.w > 0 else grass.w
         y = 0
-        while y < grass_h:
+        while y < blades and GRASS_Y + y < th:
             x = 0
             while x < tw:
-                col = _frame_at_565(pack, grass, x % grass.w, y)
+                sx = x % period
+                if sx >= grass.w:
+                    sx -= 8
+                col = _frame_at_565(pack, grass, sx, y)
                 if col is not None:
                     _set_565(tile, tw, x, GRASS_Y + y, col)
                 x += 1
             y += 1
-    if check is None or check.w < 1 or check.h < 1:
+    if floor is None or floor.w < 1 or floor.h < 1:
         return
-    cell = SURFACE_ROWS
-    if cell < 1:
-        cell = 1
-    if cell > check.w:
-        cell = check.w
-    if cell > check.h:
-        cell = check.h
-    y = GRASS_Y + grass_h
-    surface_end = y + cell
-    if surface_end > th:
-        surface_end = th
-    while y < surface_end:
-        sy = (y - (GRASS_Y + grass_h)) % cell
+    y = 0
+    while y < floor.h and GRASS_Y + BLADE_ROWS + y < th:
         x = 0
         while x < tw:
-            col = _frame_at_565(pack, check, x % cell, sy)
+            col = _frame_at_565(pack, floor, x % floor.w, y)
             if col is not None:
-                _set_565(tile, tw, x, y, col)
-            x += 1
-        y += 1
-    # One checker row under the surface. It leads with the dark square.
-    checker_end = y + CHECKER_BAND
-    if checker_end > th:
-        checker_end = th
-    while y < checker_end:
-        sy = (y - surface_end + cell) % check.h
-        x = 0
-        while x < tw:
-            col = _frame_at_565(pack, check, x % check.w, sy)
-            if col is not None:
-                _set_565(tile, tw, x, y, col)
+                _set_565(tile, tw, x, GRASS_Y + BLADE_ROWS + y, col)
             x += 1
         y += 1
 
