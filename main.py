@@ -1,5 +1,13 @@
 """GE8 Fit F-CAN gauges + engine-sheet Sonic for M5Stack Atom S3R + Atomic CAN Base.
 
+V13: the V12 picture. Official Sega artwork may be packed into pixidx.bin
+and flashed. A local pixidx.bin is kept as flashed: hash, byte size, and
+sprite size do not reject a PIX6 pack, and a later fetch does not
+overwrite the file.
+Chao, mouth, aura, shockwave, and barrier frames in that pack are drawn.
+FACE_ENABLED is on, so a packed mouth follows speed. When those frames
+are absent, aura / shockwave / barrier stay on the V2 primitives.
+
 V12: the V11 picture, with on-device timing and skipped redraws.
 Same pre-scaled PIX6 art (Sonic 39x36, playfield 128x103, rings 14x14).
 At pack load the 384x103 ocean tile is pre-rendered into an RGB565 buffer
@@ -19,15 +27,13 @@ milliseconds, one GC sample, total, fps, and how many frames held the
 backdrop. That print does not rebuild the ocean or the sprite cache.
 If the underlay cannot be allocated, drawing stays on the V11 full
 compose. If a stamp fails later, the bake flag is cleared and drawing
-stays on the fillRect interpreter. This file is version 12; it is not
-the published Pages payload until the owner ships it.
+stays on the fillRect interpreter. This file is version 13.
 The face button is polled every main-loop iteration and during a draw, so a
 450 ms double-press can be caught even if a frame runs long.
-Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
-barrier still use V2 primitives, layered on top of Sonic at tip (66, 72),
-alpha 178. FACE_ENABLED stays off.
-Companion asset pixidx.bin is fetched from the OTA host if missing, stale, or
-the wrong size / geometry (a leftover V6 pack must not be used).
+Packed boost FX is layered on top of Sonic at tip (66, 72). Primitive
+aura still uses alpha 178 when the pack has no aura frames.
+Companion asset pixidx.bin is fetched from the OTA host only when the
+device has no usable local PIX6 file.
 
 Layout: animation in the top four-fifths. Bottom fifth is a 2-by-2
 grid of horizontal gauges, no labels. Upper left is RPM, upper right
@@ -88,8 +94,8 @@ REFRESH_MS = 50
 INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 DBL_TAP_MS = 450
-APP_VERSION = 12
-APP_VERSION_NAME = "2026.11.21-v12"
+APP_VERSION = 13
+APP_VERSION_NAME = "2026.11.25-v13"
 BREATH_MS = 1600
 BOOST_SPEED = 100.0
 BOOST_END_MS = 2000
@@ -97,7 +103,15 @@ FX_FRAME_MS = 1000 // 15  # 15 fps, same as S3Vec run_fast
 SONIC_MID_Y = 72
 AURA_TIP_X = 66
 SW_TIP_X = 76
-FACE_ENABLED = False      # sheet has no face / mouth layer; stay off
+FACE_ENABLED = True       # draw mouth_* frames when the pack includes them
+CHAO_FRAME_MS = 500
+CHAO_FOLLOW_X = 10
+CHAO_KINDS = ("normal", "amy", "knuckles", "sonic", "tails")
+MOUTH_FRAMES = {
+    "closed": "mouth_closed",
+    "open": "mouth_open",
+    "locked_open": "mouth_locked",
+}
 
 W, H = 128, 128
 GAUGE_H = H // 5
@@ -1659,36 +1673,15 @@ except Exception:
     _stamp_viper = None
 
 
-def _pixidx_geometry_ok(pack):
-    """V7/V8 art: 384x103 backdrop and 39x36 Sonic. A leftover V6 pack fails this."""
-    ocean = pack.by_name.get("ocean")
-    sonic = pack.by_name.get("run_fast_0")
-    if sonic is None:
-        sonic = pack.by_name.get("idle_0")
-    if ocean is None or ocean.w != 384 or ocean.h != 103:
-        return False
-    if sonic is None or sonic.w != 39 or sonic.h != 36:
-        return False
-    return True
-
-
-def _pixidx_is_current(data, pack=None):
-    """Accept only the published V7/V8 pixel-index file.
-
-    Hash is required to match when a sha256 API is available. If hashing is
-    unavailable, size plus frame geometry still reject a leftover V6 pack.
-    """
-    if not data or len(data) != PIXIDX_SIZE:
-        return False
-    got = _sha256_hex(data)
-    if got is not None and got != PIXIDX_SHA256:
-        return False
-    if pack is None:
-        try:
-            pack = PixIdx(data)
-        except Exception:
-            return False
-    return _pixidx_geometry_ok(pack)
+def _parse_pixidx(data):
+    """Return a PIX6 pack, or None. Frame size is not a reason to refuse art."""
+    if not data or len(data) < 32 or data[:4] != PIX6_MAGIC:
+        return None
+    try:
+        return PixIdx(data)
+    except Exception as e:
+        print("pixidx parse failed:", e)
+        return None
 
 
 def _read_local_pixidx():
@@ -1700,25 +1693,16 @@ def _read_local_pixidx():
 
 
 def try_load_pixidx():
+    """Load a flashed pixidx.bin.
+
+    Any PIX6 file is kept, including official Sega artwork. Hash, byte
+    size, and sprite dimensions do not reject it. The hosted pack is
+    not downloaded over a file that parses.
+    """
     data = _read_local_pixidx()
     if not data:
         return None
-    got = _sha256_hex(data)
-    if got is not None and got != PIXIDX_SHA256:
-        print("pixidx.bin sha256 mismatch")
-        return None
-    if len(data) != PIXIDX_SIZE:
-        print("pixidx.bin size mismatch")
-        return None
-    try:
-        pack = PixIdx(data)
-    except Exception as e:
-        print("pixidx parse failed:", e)
-        return None
-    if not _pixidx_is_current(data, pack):
-        print("pixidx.bin is not the current pack")
-        return None
-    return pack
+    return _parse_pixidx(data)
 
 
 def try_fetch_pixidx():
@@ -1727,9 +1711,13 @@ def try_fetch_pixidx():
     Does not touch secrets.py. Relies on ota_client having joined the hotspot,
     or on whatever STA is already connected. Safe to call when the file is
     not yet published — the request fails and V2 primitives keep drawing.
-    A leftover local pack is never treated as success; only the current
-    sha256 / size / geometry is saved and used.
+    A file already on the device is never replaced, so flashed artwork
+    stays even when this build does not understand it yet. The hosted
+    bytes still have to match the published digest and size before they
+    are saved. Sprite dimensions are not checked.
     """
+    if _read_local_pixidx() is not None:
+        return None
     try:
         import ota_client
         if hasattr(ota_client, "wifi_connected") and not ota_client.wifi_connected():
@@ -1776,9 +1764,6 @@ def try_fetch_pixidx():
         pack = PixIdx(data)
     except Exception as e:
         print("fetched pixidx parse failed:", e)
-        return None
-    if not _pixidx_is_current(data, pack):
-        print("fetched pixidx.bin is not the current pack")
         return None
     try:
         with open(PIXIDX_NAME, "wb") as f:
@@ -1880,7 +1865,7 @@ class Sweep:
 
 
 
-# Mid-ground gold rings in the 180 px period (drawn, not ripped).
+# Mid-ground gold rings in the 180 px period.
 # x, y, rx, ry
 FIELD_RINGS = (
     (36, 78, 7, 8),
@@ -2137,6 +2122,68 @@ class BoostFX:
             draw_barrier(lcd, tip_x, tip_y, self.bar_i)
 
 
+class ChaoBuddy:
+    """Chao from the pack. Hover at head height while cruising below 80 km/h."""
+
+    def __init__(self):
+        self.state = "idle"
+        self.kind = 0
+        self.x = -16.0
+        self.y = float(SONIC_HEAD_Y)
+        self.accum = 0
+        self.frame = 0
+        self.follow_ms = 0
+        self.cooldown = 2500
+        self._rng = 7
+
+    def _rand(self, n):
+        self._rng = (1103515245 * self._rng + 12345) & 0x7FFFFFFF
+        return self._rng % n
+
+    def tick(self, speed, dt_ms):
+        cruise = speed >= 1.0 and speed < INF_SPEED
+        self.accum += dt_ms
+        while self.accum >= CHAO_FRAME_MS:
+            self.accum -= CHAO_FRAME_MS
+            self.frame ^= 1
+        self.y = float(SONIC_HEAD_Y)
+        if self.state == "idle":
+            if self.cooldown > 0:
+                self.cooldown -= dt_ms
+            elif cruise and self.cooldown <= 0:
+                self.kind = self._rand(5)
+                self.state = "join"
+                self.x = -16.0
+                self.follow_ms = 4000 + self._rand(4000)
+        elif not cruise and self.state in ("join", "follow"):
+            self.state = "leave"
+        if self.state == "join":
+            self.x += dt_ms * 0.045
+            if self.x >= CHAO_FOLLOW_X:
+                self.x = float(CHAO_FOLLOW_X)
+                self.state = "follow"
+        elif self.state == "follow":
+            self.follow_ms -= dt_ms
+            if self.follow_ms <= 0:
+                self.state = "leave"
+        elif self.state == "leave":
+            self.x += dt_ms * 0.08
+            if self.x > W + 16:
+                self.state = "idle"
+                self.cooldown = 5000 + self._rand(5000)
+
+    def frame_for(self, pack):
+        if pack is None or self.state == "idle":
+            return None
+        name = CHAO_KINDS[self.kind % 5]
+        frames = pack.cycles.get("chao_" + name)
+        if not frames:
+            frames = pack.cycles.get("chao")
+        if not frames:
+            return None
+        return frames[self.frame % len(frames)]
+
+
 class Sprite:
     """Composited chibi Sonic: separate pieces, swapped by speed, retimed by phase."""
 
@@ -2146,6 +2193,7 @@ class Sprite:
         self.ground_y = GAUGE_Y - 2
         self.body_col = COL_SONIC
         self.boost = BoostFX()
+        self.chao = ChaoBuddy()
         self.pack = pack
         self.rings = 0
         self._ring_seen = 0
@@ -2371,6 +2419,7 @@ class Sprite:
         else:
             self.phase = (self.phase + dt_ms * (0.002 + 0.00035 * speed)) % 4.0
         self.boost.tick(speed, dt_ms)
+        self.chao.tick(speed, dt_ms)
         self._step_anim(speed, dt_ms)
         self._collect_rings()
         self._step_sparkles(dt_ms)
@@ -2559,9 +2608,7 @@ class Sprite:
             self._draw_background(lcd)
             tip_y = SONIC_MID_Y
             self._draw_sonic(lcd, speed, tps, clt)
-            # Aura is layered on top of Sonic at the locked tip.
-            self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
-            self.boost.draw_front(lcd, SW_TIP_X, tip_y)
+            self._draw_artwork_overlay(lcd, speed, tip_y)
         self._draw_ring_hud(lcd)
 
     def _field_ring_xs(self, off):
@@ -2593,6 +2640,62 @@ class Sprite:
         if frames:
             fr = frames[self.anim_i % len(frames)]
             blit_frame(lcd, pack, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, pal_c, 0, GAUGE_Y, True)
+
+    def _blit_packed(self, lcd, fr, dest_x, dest_y, use_origin=True):
+        pack = self.pack
+        if pack is None or fr is None:
+            return False
+        blit_frame(
+            lcd, pack, fr, dest_x, dest_y, pack.pal(fr.pal_id), 0, GAUGE_Y, use_origin
+        )
+        return True
+
+    def _blit_cycle_index(self, lcd, key, index, dest_x, dest_y):
+        if index is None or index < 0:
+            return False
+        frames = self._cycle_frames(key)
+        if not frames:
+            return False
+        return self._blit_packed(lcd, frames[index % len(frames)], dest_x, dest_y, True)
+
+    def _draw_mouth(self, lcd, speed):
+        """Packed official mouth. Origin sits on the muzzle. No frame, no draw."""
+        if not FACE_ENABLED or self.pack is None:
+            return
+        mode = mouth_mode(speed, self.scroll)
+        name = MOUTH_FRAMES.get(mode)
+        if name is None:
+            return
+        fr = self.pack.by_name.get(name)
+        if fr is None and mode == "locked_open":
+            fr = self.pack.by_name.get("mouth_locked_open")
+        self._blit_packed(lcd, fr, SONIC_X + 22, SONIC_HEAD_Y + 8, True)
+
+    def _draw_chao(self, lcd):
+        fr = self.chao.frame_for(self.pack)
+        if fr is None:
+            return
+        y = int(self.chao.y)
+        if self.chao.frame:
+            y -= 2
+        self._blit_packed(lcd, fr, int(self.chao.x), y, True)
+
+    def _draw_boost_layers(self, lcd, tip_x, tip_y):
+        """Packed aura / shockwave / barrier when the pack has them."""
+        if not self._blit_cycle_index(lcd, "aura", self.boost.aura_i, tip_x, tip_y):
+            self.boost.draw_behind(lcd, tip_x, tip_y)
+        sw_tip = SW_TIP_X
+        if not self._blit_cycle_index(lcd, "sw", self.boost.sw_i, sw_tip, tip_y):
+            if self.boost.sw_i >= 0:
+                draw_shockwave(lcd, sw_tip, tip_y, self.boost.sw_i)
+        if not self._blit_cycle_index(lcd, "bar", self.boost.bar_i, sw_tip, tip_y):
+            if self.boost.bar_i >= 0:
+                draw_barrier(lcd, sw_tip, tip_y, self.boost.bar_i)
+
+    def _draw_artwork_overlay(self, lcd, speed, tip_y):
+        self._draw_chao(lcd)
+        self._draw_mouth(lcd, speed)
+        self._draw_boost_layers(lcd, AURA_TIP_X, tip_y)
 
     def _can_retain(self):
         return (
@@ -3207,9 +3310,9 @@ class Sprite:
                 if ocean is not None:
                     blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
             self._blit_playfield_sprites(lcd, pal_s, pal_c, off)
-        # Aura / shockwave on top of Sonic, after the playfield push.
-        self.boost.draw_behind(lcd, AURA_TIP_X, AURA_TIP_Y)
-        self.boost.draw_front(lcd, SW_TIP_X, AURA_TIP_Y)
+        # Aura / shockwave / Chao / mouth on top of Sonic, after the playfield push.
+        # Packed frames are used when the file contains them.
+        self._draw_artwork_overlay(lcd, speed, AURA_TIP_Y)
 
     def _wrapped(self, x, w, off):
         xx = (x - off) % PERIOD
@@ -3675,8 +3778,8 @@ def main():
                 pass
 
         if ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
-            # Keep retrying while the current pack is missing or was rejected
-            # (a leftover V6 file must not block the download).
+            # Keep retrying while no usable local pack is loaded.
+            # A flashed PIX6 file, including official artwork, is left alone.
             wifi_ok = False
             if ota_client is not None and hasattr(ota_client, "wifi_connected"):
                 try:
