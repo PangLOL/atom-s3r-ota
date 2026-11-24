@@ -1214,9 +1214,10 @@ def main():
     bad += _sea_shift_probe(lib)
     tw = sprite.ocean_tw
     tile = sprite.ocean_rgb565
-    # Packed checker is a 16px cell, two rows tall, repeated under the grass.
+    # The alternating checker starts under the same-shade square row.
     period = 16
-    src = (fw.GRASS_Y + 8) * tw * 2
+    grass = sprite.pack.by_name["gnd_grass"]
+    src = (fw.GRASS_Y + grass.h + fw.SURFACE_ROWS) * tw * 2
     tmpl = bytes(tile[src:src + period * 2])
     x = 0
     dirt_bad = 0

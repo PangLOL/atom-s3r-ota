@@ -616,10 +616,10 @@ def main():
     fast.tick(fw.SPEED_FAST - 1.0, 10, 0.0)
     assert fast.spark_i < 0
     assert not hasattr(fw, "AURA_ALPHA")
-    assert fw.BAR_TIP_X == 68 and fw.BAR_TIP_Y == 85
-    assert fw.AURA_TIP_X == 66 and fw.AURA_TIP_Y == 85
+    assert fw.BAR_TIP_X == 68 and fw.BAR_TIP_Y == 63
+    assert fw.AURA_TIP_X == 66 and fw.AURA_TIP_Y == 63
     assert fw.SW_TIP_X == 76
-    assert fw.SPARK_FRONT_X == 22 and fw.SPARK_MID_Y == 101
+    assert fw.SPARK_FRONT_X == 22 and fw.SPARK_MID_Y == 79
     assert fw.FX_FRAME_MS == 1000 // 15
     assert fw.HOCKEY_ON_DECEL == 5.0 and fw.HOCKEY_OFF_DECEL == 6.0
     assert fw.BOOT_DY == fw.SONIC_FEET_Y - fw.SONIC_MID_Y
@@ -815,10 +815,13 @@ def main():
         assert _name in opack.by_name, _name
     for _gone in ("ground", "palm_0", "palm_1", "island_0", "bush_0", "flowers_0", "tiny_flowers_0", "gh_bg_0"):
         assert _gone not in opack.by_name, _gone
-    assert opack.by_name["ocean"].w == 256 and opack.by_name["ocean"].h == 128
+    far = opack.by_name["far_bg"]
+    mid = opack.by_name["mid_bg"]
+    assert far.w == 256 and far.h == fw.HORIZON_Y
+    assert mid.w == 256 and far.h + mid.h == 128
     assert opack.by_name["fx_spark_4"].w > 8
     assert len(raw) == fw.PIXIDX_SIZE
-    obuf, otw, oth = fw.prerender_ocean_rgb565(opack, opack.by_name["ocean"])
+    obuf, otw, oth = fw.prerender_sea_rgb565(opack)
     fw.repair_ocean_tile(obuf, otw, oth)
     sky = fw._rgb888_to_565(fw.SKY_BLUE_888)
     cap = fw._rgb888_to_565(fw.SKY_CAP_BLUE_888)
@@ -850,7 +853,18 @@ def main():
             x += 1
         y += 1
     assert foliage == 0
-    assert fw._band_diff(obuf, otw, otw - 1, 0, fw.GRASS_Y, 100) <= 8
+    # The row under the full grass repeats one light square, not the checker.
+    ground = bytearray(obuf)
+    fw._install_sheet_backdrop(ground, otw, oth, opack)
+    grass = opack.by_name["gnd_grass"]
+    cell = fw.SURFACE_ROWS
+    sy = fw.GRASS_Y + grass.h
+    tmpl = bytes(ground[(sy * otw) * 2:(sy * otw + cell) * 2])
+    x = 0
+    while x < otw:
+        got = bytes(ground[(sy * otw + x) * 2:(sy * otw + x + cell) * 2])
+        assert got == tmpl
+        x += cell
     # The sea picture's own waves step by about this much between columns.
     assert fw._band_diff(obuf, otw, 127, 128, fw.HORIZON_Y + 4, fw.GRASS_Y) <= 32
     # The packed ocean is the sea picture, so there is no hill loop to lift.

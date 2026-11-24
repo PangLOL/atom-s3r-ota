@@ -160,9 +160,9 @@ def main():
     assert fw.REFRESH_MS == 50
     assert not hasattr(fw, "DBL_TAP_MS")
     assert fw.SONIC_W == 39 and fw.SONIC_H == 36
-    assert fw.SONIC_X == 16 and fw.SONIC_Y == 68
-    assert fw.SONIC_FEET_Y == 103
-    assert fw.SONIC_FEET_DEST_X == 35 and fw.SONIC_FEET_DEST_Y == 91
+    assert fw.SONIC_X == 16 and fw.SONIC_Y == 46
+    assert fw.SONIC_FEET_Y == 81
+    assert fw.SONIC_FEET_DEST_X == 35 and fw.SONIC_FEET_DEST_Y == 82
     assert fw.HUD_RING_POS == (4, 3)
     assert fw.HUD_BAR_POS == (14, 6)
     assert fw.W == 128 and fw.GAUGE_Y == 103
@@ -171,8 +171,7 @@ def main():
     assert digest == fw.PIXIDX_SHA256, digest
     assert len(raw) == fw.PIXIDX_SIZE
     pack = fw.PixIdx(raw)
-    ocean = pack.by_name["ocean"]
-    tile, tw, th = fw.prerender_ocean_rgb565(pack, ocean)
+    tile, tw, th = fw.prerender_sea_rgb565(pack)
     stamps = fw.build_parallax_layers(tile, tw, th)
     print("stamps", len(stamps), "tile", tw, th)
 

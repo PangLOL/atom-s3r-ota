@@ -4,9 +4,9 @@ V15: the V14 packed picture, composited so a scroll does not restamp
 sprites that did not change. Same pre-scaled PIX6 art (Sonic 39x36,
 playfield 128x103, rings 14x14). The four reference sheets are packed
 into pixidx.bin. At pack load the
-256x103 ocean tile is pre-rendered into an RGB565 buffer and split into
-parallax layers: sky/clouds at 0.25, water and islands at 0.6, ground and
-near palms at 1.0. The packed art has no mountain band, so 0.4 is unused.
+256-wide sea is pre-rendered into an RGB565 buffer and split into
+parallax layers: far_bg (sky and the distant islands) at 0.25, mid_bg
+(the water) at 0.6, ground and near palms at 1.0.
 Scenery stamps (loop island, palms, bushes) blit through the same kind of
 viper loop Sonic and the HUD already use. A viper self-test failure stays
 on the V12 Python blit, so the pixels do not change. That self-test runs
@@ -187,7 +187,7 @@ HOCKEY_ON_DECEL = 5.0
 HOCKEY_OFF_DECEL = 6.0
 HOCKEY_ARM_MS = 180
 HOCKEY_FRAMES = 3
-SONIC_MID_Y = 85
+SONIC_MID_Y = 63
 AURA_TIP_X = 66
 SW_TIP_X = 76
 FACE_ENABLED = False      # sheet has no face / mouth layer; stay off
@@ -485,8 +485,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "a1711bdbdcf4e7f5033c2c797e61e57002761a80e047d3dc85fe67918babe8ee"
-PIXIDX_SIZE = 375331
+PIXIDX_SHA256 = "aede50b2e7ed39739475db88b47aa1d69f6d2e52f781285d1531a8588fe32380"
+PIXIDX_SIZE = 375365
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -496,15 +496,14 @@ SPEED_FAST = 80.0
 _RUN_TAGS = ("run_slow", "run_medium", "run_fast")
 IDLE_TRIGGER_AFTER_MS = 3500
 
-# 13 rows of sky were restored above the old crop, so the picture sits
-# 13 px lower. Sonic is 39x36. Feet plant on y 103. The gauge still
-# paints over y 103-127 until it is toggled off.
+# Sonic is 39x36. Feet plant on the grass top. The gauge still paints
+# over y 103-127 until it is toggled off.
 SONIC_X = 16
-SONIC_Y = 68
+SONIC_Y = 46
 SONIC_W = 39
 SONIC_H = 36
-SONIC_FEET_Y = 103
-SONIC_HEAD_Y = 76
+SONIC_FEET_Y = 81
+SONIC_HEAD_Y = 54
 SONIC_FRONT_X = 54
 # One Chao at a time, cruise only (moving, and under 80 km/h). The pack
 # has four frames per type. 0 and 1 are the side-view chase pair used to
@@ -547,7 +546,7 @@ AURA_TIP_Y = SONIC_MID_Y  # 72
 BAR_TIP_X = 68            # 8 px left of the shockwave tip
 BAR_TIP_Y = SONIC_MID_Y   # 72
 SPARK_FRONT_X = 22
-SPARK_MID_Y = 101
+SPARK_MID_Y = 79
 SPARK_FRAMES = 5
 HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
@@ -555,12 +554,14 @@ GROUND_SURFACE_IN_TILE = 0  # unused; feet dest is locked, backdrop includes gro
 PROP_PERIOD = 256   # sea source width; the tile loops when the islands meet
 # V2 fallback ratios, applied to bands split from the prerendered ocean.
 PARALLAX_CLOUDS = 0.25
-PARALLAX_MOUNTAINS = 0.4  # packed art has no mountain band
+PARALLAX_MOUNTAINS = 0.4  # far_bg keeps the islands with the sky
 PARALLAX_WATER = 0.6
 PARALLAX_GROUND = 1.0
-# 13 px of sky above the old crop, then 12 px of checker under the grass.
-HORIZON_Y = 45   # sky/clouds above; water and the horizon line from here
-GRASS_Y = 101    # near ground (grass, dirt, planted palms) from here
+# far_bg is everything above the line where the distant islands meet the sea.
+HORIZON_Y = 53
+# Full grass, then one same-shade square row, then the checker.
+GRASS_Y = 79
+SURFACE_ROWS = 8
 RING_PERIOD = 1536  # long gaps between groups of 3-8
 RING_FPS_MS = 1000 // 30  # 33
 
@@ -570,7 +571,7 @@ FIELD_RING_X = (66, 82, 97, 866, 882, 898, 914, 930)
 # Stable place keys. Formatting "r%d" on every present was garbage.
 _RING_PLACE_KEYS = tuple("r%d" % i for i in range(len(FIELD_RING_X)))
 _SPARK_PLACE_KEYS = tuple("k%d" % i for i in range(12))
-FIELD_RING_Y = 91
+FIELD_RING_Y = 69
 
 # Scenery is baked into the 256x128 backdrop. These names are the
 # fallback if a pack has no ocean frame. The isolated palm, and the
@@ -838,15 +839,14 @@ def _rgb888_to_565(c):
     return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
 
 
-def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
-    """Bake the ocean tile into a little-endian RGB565 buffer once at pack load.
-
-    Index 0 (transparent in the sprite blitter) is filled with the sky
-    background so a window copy is fully opaque.
-    """
+def _blit_indexed_565(buf, tw, th, pack, frame, dest_y, bg_color=COL_BG):
+    """Copy one indexed frame into a little-endian RGB565 buffer."""
+    if buf is None or pack is None or frame is None or tw <= 0 or th <= 0:
+        return
     w = frame.w
     h = frame.h
-    buf = bytearray(w * h * 2)
+    if w <= 0 or h <= 0:
+        return
     pal_id = frame.pal_id
     if pal_id < 0 or pal_id >= len(pack.palettes_565):
         pal_id = 0
@@ -860,10 +860,15 @@ def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
     base = pack.pix_off + frame.data_offset
     bpp4 = pack.bpp == 4
     row_bytes = ((w + 1) // 2) if bpp4 else w
-    di = 0
-    for y in range(h):
+    y = 0
+    while y < h:
+        dy = dest_y + y
+        if dy < 0 or dy >= th:
+            y += 1
+            continue
         row = base + y * row_bytes
-        for x in range(w):
+        x = 0
+        while x < w and x < tw:
             if bpp4:
                 b = data[row + (x >> 1)]
                 idx = (b >> 4) if (x & 1) == 0 else (b & 0x0F)
@@ -872,10 +877,47 @@ def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
             if idx >= len(pairs):
                 idx = 0
             pair = pairs[idx]
+            di = (dy * tw + x) * 2
             buf[di] = pair[0]
             buf[di + 1] = pair[1]
-            di += 2
+            x += 1
+        y += 1
+
+
+def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
+    """Bake one tile into a little-endian RGB565 buffer once at pack load.
+
+    Index 0 (transparent in the sprite blitter) is filled with the sky
+    background so a window copy is fully opaque.
+    """
+    if pack is None or frame is None:
+        return bytearray(0), 0, 0
+    w = frame.w
+    h = frame.h
+    if w <= 0 or h <= 0:
+        return bytearray(0), 0, 0
+    buf = bytearray(w * h * 2)
+    _blit_indexed_565(buf, w, h, pack, frame, 0, bg_color)
     return buf, w, h
+
+
+def prerender_sea_rgb565(pack, bg_color=COL_BG):
+    """Stack far_bg and mid_bg into one 256-wide sea tile."""
+    if pack is None:
+        return bytearray(0), 0, 0
+    far = pack.by_name.get("far_bg")
+    mid = pack.by_name.get("mid_bg")
+    if far is None or mid is None or far.w <= 0 or far.h <= 0 or mid.w <= 0 or mid.h <= 0:
+        ocean = pack.by_name.get("ocean")
+        if ocean is None:
+            return bytearray(0), 0, 0
+        return prerender_ocean_rgb565(pack, ocean, bg_color)
+    tw = far.w
+    th = far.h + mid.h
+    buf = bytearray(tw * th * 2)
+    _blit_indexed_565(buf, tw, th, pack, far, 0, bg_color)
+    _blit_indexed_565(buf, tw, th, pack, mid, far.h, bg_color)
+    return buf, tw, th
 
 
 def _continue_dirt_checker(tile, tw, th):
@@ -926,55 +968,71 @@ def _frame_at_565(pack, fr, x, y):
 
 
 def _install_sheet_backdrop(tile, tw, th, pack):
-    """Paint the packed sea and the two-row checker into the prepared tile.
+    """Paint far_bg, mid_bg, the full grass, then the dirt rows.
 
-    The animated sea stays packed as the first frame only. Hill stamps were
-    already lifted, so they still scroll on top of this picture.
+    The grass sprite is drawn at its full height so the blades are not
+    covered. Under it, one row of squares repeats the light checker cell
+    (the whole row is that one shade). The alternating checker starts
+    below that row.
     """
     if tile is None or pack is None or tw < 1 or th < 1:
         return
-    # The ocean frame is one loop of the sea, 256 wide, so the islands meet.
-    # Copy it back over the sky and water so the flat sky fill does not
-    # cover it. The grass and checker below are painted after this.
-    bg = pack.by_name.get("ocean")
-    if bg is not None and bg.w > 0 and bg.h > 0:
-        y = 0
-        limit = GRASS_Y if GRASS_Y < th else th
-        if limit > bg.h:
-            limit = bg.h
-        while y < limit:
-            x = 0
-            while x < tw:
-                col = _frame_at_565(pack, bg, x % bg.w, y)
-                if col is not None:
-                    _set_565(tile, tw, x, y, col)
-                x += 1
-            y += 1
+    far = pack.by_name.get("far_bg")
+    mid = pack.by_name.get("mid_bg")
+    if far is not None and far.w > 0 and far.h > 0:
+        _blit_indexed_565(tile, tw, th, pack, far, 0)
+    if mid is not None and mid.w > 0 and mid.h > 0:
+        dest = far.h if far is not None else HORIZON_Y
+        _blit_indexed_565(tile, tw, th, pack, mid, dest)
     grass = pack.by_name.get("gnd_grass")
     check = pack.by_name.get("gnd_check")
-    grass_h = 8
+    grass_h = 0
     if grass is not None and grass.w > 0 and grass.h > 0 and GRASS_Y < th:
+        grass_h = grass.h
+        if GRASS_Y + grass_h > th:
+            grass_h = th - GRASS_Y
         y = 0
-        while y < grass_h and GRASS_Y + y < th:
-            sy = y if y < grass.h else grass.h - 1
+        while y < grass_h:
             x = 0
             while x < tw:
-                col = _frame_at_565(pack, grass, x % grass.w, sy)
+                col = _frame_at_565(pack, grass, x % grass.w, y)
                 if col is not None:
                     _set_565(tile, tw, x, GRASS_Y + y, col)
                 x += 1
             y += 1
-    if check is not None and check.w > 0 and check.h > 0:
-        y = GRASS_Y + grass_h
-        while y < th:
-            sy = (y - (GRASS_Y + grass_h)) % check.h
-            x = 0
-            while x < tw:
-                col = _frame_at_565(pack, check, x % check.w, sy)
-                if col is not None:
-                    _set_565(tile, tw, x, y, col)
-                x += 1
-            y += 1
+    if check is None or check.w < 1 or check.h < 1:
+        return
+    cell = SURFACE_ROWS
+    if cell < 1:
+        cell = 1
+    if cell > check.w:
+        cell = check.w
+    if cell > check.h:
+        cell = check.h
+    y = GRASS_Y + grass_h
+    surface_end = y + cell
+    if surface_end > th:
+        surface_end = th
+    while y < surface_end:
+        sy = (y - (GRASS_Y + grass_h)) % cell
+        x = 0
+        while x < tw:
+            col = _frame_at_565(pack, check, x % cell, sy)
+            if col is not None:
+                _set_565(tile, tw, x, y, col)
+            x += 1
+        y += 1
+    # The next checker row leads with the dark square, so it alternates
+    # against the solid light row above it.
+    while y < th:
+        sy = (y - surface_end + cell) % check.h
+        x = 0
+        while x < tw:
+            col = _frame_at_565(pack, check, x % check.w, sy)
+            if col is not None:
+                _set_565(tile, tw, x, y, col)
+            x += 1
+        y += 1
 
 
 # World x of the packed ground props. Feet sit on the Sonic plant line.
@@ -4659,12 +4717,15 @@ except Exception:
 
 
 def _pixidx_geometry_ok(pack):
-    """Sea loop is 256x128, plus 39x36 Sonic."""
-    ocean = pack.by_name.get("ocean")
+    """far_bg and mid_bg are one 256-wide loop, plus 39x36 Sonic."""
+    far = pack.by_name.get("far_bg")
+    mid = pack.by_name.get("mid_bg")
     sonic = pack.by_name.get("run_fast_0")
     if sonic is None:
         sonic = pack.by_name.get("idle_0")
-    if ocean is None or ocean.w != 256 or ocean.h != 128:
+    if far is None or mid is None or far.w != 256 or mid.w != 256:
+        return False
+    if far.h != HORIZON_Y or far.h + mid.h != H:
         return False
     if sonic is None or sonic.w != 39 or sonic.h != 36:
         return False
@@ -5501,7 +5562,7 @@ class Sprite:
         self._prepare_sprites(force=True)
 
     def _prepare_ocean(self, force=False):
-        """Pre-render the 256x128 ocean tile into RGB565 once per pack load."""
+        """Pre-render far_bg and mid_bg into one RGB565 tile per pack load."""
         if (
             not force
             and self.ocean_rgb565 is not None
@@ -5527,11 +5588,12 @@ class Sprite:
         pack = self.pack
         if pack is None:
             return
-        ocean = pack.by_name.get("ocean")
-        if ocean is None or ocean.w <= 0 or ocean.h <= 0:
+        far = pack.by_name.get("far_bg")
+        mid = pack.by_name.get("mid_bg")
+        if far is None or mid is None or far.w <= 0 or mid.w <= 0:
             return
         try:
-            buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+            buf, tw, th = prerender_sea_rgb565(pack)
             repair_ocean_tile(buf, tw, th)
             window = bytearray(W * th * 2)
         except MemoryError:
@@ -5549,14 +5611,14 @@ class Sprite:
         except MemoryError:
             print("ocean parallax alloc failed, using 1.0 scroll")
             try:
-                buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+                buf, tw, th = prerender_sea_rgb565(pack)
                 repair_ocean_tile(buf, tw, th)
             except Exception:
                 pass
         except Exception as e:
             print("ocean parallax failed:", e)
             try:
-                buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+                buf, tw, th = prerender_sea_rgb565(pack)
                 repair_ocean_tile(buf, tw, th)
             except Exception:
                 pass
@@ -7847,7 +7909,8 @@ class Sprite:
                 self._native_ready = False
                 self._fx_in_buffer = False
                 self._play_valid = False
-        ocean = pack.by_name.get("ocean")
+        far = pack.by_name.get("far_bg")
+        mid = pack.by_name.get("mid_bg")
         off = int(self.scroll)
         self._playfield_stamped = False
         # Backdrop already includes sky, water, scenery and the grass/dirt band.
@@ -7981,8 +8044,13 @@ class Sprite:
             self._note_timing(compose_us, stamp_us, push_us, held)
         if not self._playfield_stamped:
             if not window_ready:
-                if ocean is not None:
-                    blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
+                if far is not None:
+                    blit_tiled_x(lcd, pack, far, 0, off, pal_b, 0, GAUGE_Y)
+                if mid is not None:
+                    blit_tiled_x(
+                        lcd, pack, mid, far.h if far is not None else HORIZON_Y,
+                        off, pal_b, 0, GAUGE_Y,
+                    )
             self._blit_playfield_sprites(lcd, pal_s, pal_c, off)
         # Packed boost frames, or the procedural fallback, after the push.
         if not self._blit_packed_fx(lcd):
