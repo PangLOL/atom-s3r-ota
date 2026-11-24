@@ -654,7 +654,7 @@ def main():
     assert slow.hockey is False and slow._hockey_arm == 0
     stop.pack = type("Pack", (), {})()
     stop.pack.cycles = {
-        "hockey": [_Fr(), _Fr(), _Fr()],
+        "skid": [_Fr(), _Fr(), _Fr()],
         "run_fast": [_Fr(), _Fr()],
     }
     stop.hockey = True
@@ -666,7 +666,7 @@ def main():
     stop.idle_wait = 0
     stop.triggering = False
     stop._step_anim(70.0, 16)
-    assert stop.anim_tag == "hockey" and stop.anim_i == 1
+    assert stop.anim_tag == "skid" and stop.anim_i == 1
     fx.tick(20.0, 800, fw.VTEC_OFF_RPM)
     assert fx.phase == "run" and fx.below_ms == 0
     fx.tick(20.0, fw.BOOST_END_MS - 1, fw.VTEC_OFF_RPM - 1)
@@ -810,10 +810,10 @@ def main():
     for _name in (
         "fx_spark_0", "fx_bar_0", "fx_aura_0", "fx_boot_0",
         "gnd_grass", "gnd_check", "gnd_floor", "prop_palm", "prop_fl_2", "fx_spark_4",
-        "spindash_0", "spindash_7", "look_0",
+        "spindash_0", "spindash_7", "skid_0",
     ):
         assert _name in opack.by_name, _name
-    for _gone in ("ground", "palm_0", "palm_1", "island_0", "bush_0", "flowers_0", "tiny_flowers_0", "gh_bg_0"):
+    for _gone in ("ground", "palm_0", "palm_1", "island_0", "bush_0", "flowers_0", "tiny_flowers_0", "gh_bg_0", "hockey_0", "look_0"):
         assert _gone not in opack.by_name, _gone
     far = opack.by_name["far_bg"]
     mid = opack.by_name["mid_bg"]

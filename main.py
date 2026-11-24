@@ -37,7 +37,7 @@ The boost sheets are not packed. Sparks, the sound barrier, the aura,
 and the boot initiate stay procedural. The boot row is the top half
 only, so that half is flipped across the shoes. The sea stays on its
 first frame.
-The three hockey-stop frames are packed and face right.
+The brake plays the three skid frames. They face right, with the smoke from the old hockey row.
 Chao cycles are normal_chao, amy_chao, knuckles_chao, sonic_chao, and
 tails_chao. Frames 0 and 1 join, switch sides, and leave. Frames 2 and 3
 hover at Sonic's head. One Chao, at 2 fps, for up to five minutes.
@@ -180,7 +180,7 @@ FX_FRAME_MS = 1000 // 15  # 15 fps, same as S3Vec run_fast
 # Hockey stop. Brake bit plus a hard decel, then a 3-frame pose.
 # Enter only while brk is held, decel stays at or above 5 km/h per
 # second, and speed is still above 25 km/h, for HOCKEY_ARM_MS. Leave
-# when the brake releases or decel falls under 6. The three packed
+# when the brake releases or decel falls under 6. The three skid
 # frames face right.
 HOCKEY_MIN_KMH = 25.0
 HOCKEY_ON_DECEL = 5.0
@@ -485,8 +485,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "10f844338e5a16790ec4194d457520744ee440efe33571c0e1b293ab9996a744"
-PIXIDX_SIZE = 390010
+PIXIDX_SHA256 = "15e79d0e2d18f21e6a7f0f65ccdae01385518f8b4f0a9edbd7605031e08cf5ba"
+PIXIDX_SIZE = 381385
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -3775,7 +3775,7 @@ def _underlay_budget(pack):
         return best
 
     sonic = 0
-    for key in ("idle", "idle_trigger", "run_slow", "run_medium", "run_fast", "hockey"):
+    for key in ("idle", "idle_trigger", "run_slow", "run_medium", "run_fast", "skid"):
         sonic = max(sonic, max_bytes(pack.cycles.get(key)))
     chao = 0
     for key in CHAO_TYPES:
@@ -4067,9 +4067,9 @@ def _bake_frame_list(pack):
     if spark:
         frames.extend(spark)
     # Same C stamp path as the run cycle. Missing art just skips the bake.
-    hockey = pack.cycles.get("hockey")
-    if hockey:
-        frames.extend(hockey)
+    skid = pack.cycles.get("skid")
+    if skid:
+        frames.extend(skid)
     for key in CHAO_TYPES:
         cyc = pack.cycles.get(key)
         if cyc:
@@ -5776,8 +5776,7 @@ class Sprite:
         """Arm a 3-frame stop when the brake and the decel both stay hard.
 
         The pose faces the way the run faces. Nothing is drawn until a
-        `hockey` cycle exists in the pack, and that cycle has to be
-        facing right.
+        `skid` cycle exists in the pack.
         """
         prev = self._spd_prev
         self._spd_prev = speed
@@ -6036,9 +6035,9 @@ class Sprite:
             return
         hockey_frames = None
         if self.hockey:
-            hockey_frames = self._cycle_frames("hockey")
+            hockey_frames = self._cycle_frames("skid")
         if hockey_frames:
-            tag = "hockey"
+            tag = "skid"
         elif speed < 1.0:
             if self.triggering:
                 tag = "idle_trigger"
@@ -6084,12 +6083,12 @@ class Sprite:
         if tag != self.anim_tag:
             # Show the first frame of the new cycle for this present.
             self.anim_tag = tag
-            if tag == "hockey":
+            if tag == "skid":
                 self.anim_i = self.hockey_i if self.hockey_i >= 0 else 0
             else:
                 self.anim_i = 0
             self.anim_accum = 0
-        elif tag == "hockey":
+        elif tag == "skid":
             self.anim_i = self.hockey_i if self.hockey_i >= 0 else 0
             if self.anim_i >= len(frames):
                 self.anim_i = len(frames) - 1
