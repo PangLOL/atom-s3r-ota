@@ -187,7 +187,7 @@ HOCKEY_ON_DECEL = 5.0
 HOCKEY_OFF_DECEL = 6.0
 HOCKEY_ARM_MS = 180
 HOCKEY_FRAMES = 3
-SONIC_MID_Y = 63
+SONIC_MID_Y = 72
 AURA_TIP_X = 66
 SW_TIP_X = 76
 FACE_ENABLED = False      # sheet has no face / mouth layer; stay off
@@ -499,11 +499,11 @@ IDLE_TRIGGER_AFTER_MS = 3500
 # Sonic is 39x36. Feet plant on the grass top. The gauge still paints
 # over y 103-127 until it is toggled off.
 SONIC_X = 16
-SONIC_Y = 46
+SONIC_Y = 55
 SONIC_W = 39
 SONIC_H = 36
-SONIC_FEET_Y = 81
-SONIC_HEAD_Y = 54
+SONIC_FEET_Y = 90
+SONIC_HEAD_Y = 63
 SONIC_FRONT_X = 54
 # One Chao at a time, cruise only (moving, and under 80 km/h). The pack
 # has four frames per type. 0 and 1 are the side-view chase pair used to
@@ -546,7 +546,7 @@ AURA_TIP_Y = SONIC_MID_Y  # 72
 BAR_TIP_X = 68            # 8 px left of the shockwave tip
 BAR_TIP_Y = SONIC_MID_Y   # 72
 SPARK_FRONT_X = 22
-SPARK_MID_Y = 79
+SPARK_MID_Y = 88
 SPARK_FRAMES = 5
 HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
@@ -559,9 +559,10 @@ PARALLAX_WATER = 0.6
 PARALLAX_GROUND = 1.0
 # far_bg is everything above the line where the distant islands meet the sea.
 HORIZON_Y = 53
-# Full grass, then one same-shade square row, then the checker.
-GRASS_Y = 79
+# Full grass, then one same-shade square row, then one checker row.
+GRASS_Y = 88
 SURFACE_ROWS = 8
+CHECKER_BAND = 8
 RING_PERIOD = 1536  # long gaps between groups of 3-8
 RING_FPS_MS = 1000 // 30  # 33
 
@@ -571,7 +572,7 @@ FIELD_RING_X = (66, 82, 97, 866, 882, 898, 914, 930)
 # Stable place keys. Formatting "r%d" on every present was garbage.
 _RING_PLACE_KEYS = tuple("r%d" % i for i in range(len(FIELD_RING_X)))
 _SPARK_PLACE_KEYS = tuple("k%d" % i for i in range(12))
-FIELD_RING_Y = 69
+FIELD_RING_Y = 78
 
 # Scenery is baked into the 256x128 backdrop. These names are the
 # fallback if a pack has no ocean frame. The isolated palm, and the
@@ -1022,9 +1023,11 @@ def _install_sheet_backdrop(tile, tw, th, pack):
                 _set_565(tile, tw, x, y, col)
             x += 1
         y += 1
-    # The next checker row leads with the dark square, so it alternates
-    # against the solid light row above it.
-    while y < th:
+    # One checker row under the surface. It leads with the dark square.
+    checker_end = y + CHECKER_BAND
+    if checker_end > th:
+        checker_end = th
+    while y < checker_end:
         sy = (y - surface_end + cell) % check.h
         x = 0
         while x < tw:
