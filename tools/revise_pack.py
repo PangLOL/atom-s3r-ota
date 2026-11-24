@@ -184,8 +184,8 @@ def _replace_ocean(frames):
             ocean = fr
     if bg is None or ocean is None:
         raise SystemExit("ocean or gh_bg_0 missing")
-    tw, th = 256, 103
-    src0 = 70 - 32
+    tw, th = 256, 128
+    src0 = 35
     out = bytearray(tw * th)
     sw, sh = bg["w"], bg["h"]
     src = bg["idx"]
