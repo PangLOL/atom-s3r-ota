@@ -2,7 +2,8 @@
 
 V15: the V14 packed picture, composited so a scroll does not restamp
 sprites that did not change. Same pre-scaled PIX6 art (Sonic 39x36,
-playfield 128x103, rings 14x14). pixidx.bin is unchanged. At pack load the
+playfield 128x103, rings 14x14). The four reference sheets are packed
+into pixidx.bin. At pack load the
 384x103 ocean tile is pre-rendered into an RGB565 buffer and split into
 parallax layers: sky/clouds at 0.25, water and islands at 0.6, ground and
 near palms at 1.0. The packed art has no mountain band, so 0.4 is unused.
@@ -484,8 +485,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "8aeeecc3f98b5f3c233dc787ee794440e3e7810e5483a01dd8dac3a49940ab5d"
-PIXIDX_SIZE = 245053
+PIXIDX_SHA256 = "fc957f6b48dbf4000c47f88c451cc14bc617bc8bea114fbd5aa7623a4a7ec12e"
+PIXIDX_SIZE = 485167
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -909,6 +910,127 @@ def _continue_dirt_checker(tile, tw, th):
         dst = y * tw * 2
         tile[dst:dst + tw * 2] = tile[src:src + tw * 2]
         y += 1
+
+
+def _frame_at_565(pack, fr, x, y):
+    """One opaque RGB565 pixel, or None where the frame is transparent."""
+    if fr is None or x < 0 or y < 0 or x >= fr.w or y >= fr.h:
+        return None
+    idx = pack.data[pack.pix_off + fr.data_offset + y * fr.w + x]
+    if idx == 0:
+        return None
+    pal = pack.palettes_565[fr.pal_id]
+    if idx >= len(pal):
+        return None
+    return pal[idx]
+
+
+def _install_sheet_backdrop(tile, tw, th, pack):
+    """Paint the packed sea and the two-row checker into the prepared tile.
+
+    The animated sea stays packed as the first frame only. Hill stamps were
+    already lifted, so they still scroll on top of this picture.
+    """
+    if tile is None or pack is None or tw < 1 or th < 1:
+        return
+    bg = pack.by_name.get("gh_bg_0")
+    if bg is not None and bg.w > 0 and bg.h > 0:
+        # Source horizon sits near y 70. Line that up with HORIZON_Y.
+        src0 = 70 - HORIZON_Y
+        y = 0
+        limit = GRASS_Y if GRASS_Y < th else th
+        while y < limit:
+            sy = src0 + y
+            if sy >= 0 and sy < bg.h:
+                x = 0
+                while x < tw:
+                    col = _frame_at_565(pack, bg, x % bg.w, sy)
+                    if col is not None:
+                        _set_565(tile, tw, x, y, col)
+                    x += 1
+            y += 1
+    grass = pack.by_name.get("gnd_grass")
+    check = pack.by_name.get("gnd_check")
+    grass_h = 8
+    if grass is not None and grass.w > 0 and grass.h > 0 and GRASS_Y < th:
+        y = 0
+        while y < grass_h and GRASS_Y + y < th:
+            sy = y if y < grass.h else grass.h - 1
+            x = 0
+            while x < tw:
+                col = _frame_at_565(pack, grass, x % grass.w, sy)
+                if col is not None:
+                    _set_565(tile, tw, x, GRASS_Y + y, col)
+                x += 1
+            y += 1
+    if check is not None and check.w > 0 and check.h > 0:
+        y = GRASS_Y + grass_h
+        while y < th:
+            sy = (y - (GRASS_Y + grass_h)) % check.h
+            x = 0
+            while x < tw:
+                col = _frame_at_565(pack, check, x % check.w, sy)
+                if col is not None:
+                    _set_565(tile, tw, x, y, col)
+                x += 1
+            y += 1
+
+
+# World x of the packed ground props. Feet sit on the Sonic plant line.
+_SHEET_PROPS = (
+    ("prop_palm", 36),
+    ("prop_sun", 120),
+    ("prop_fl_0", 168),
+    ("prop_fl_1", 200),
+    ("prop_fl_2", 232),
+    ("prop_fl_3", 270),
+)
+
+
+def _sheet_prop_stamps(pack, th):
+    """Ground-speed stamps for the first palm, the sunflower, and the flowers."""
+    if pack is None:
+        return []
+    feet = SONIC_FEET_Y
+    if feet >= th:
+        feet = th - 1
+    if feet < 1:
+        return []
+    out = []
+    for name, world_x in _SHEET_PROPS:
+        fr = pack.by_name.get(name)
+        if fr is None or fr.w < 1 or fr.h < 1:
+            continue
+        src_y0 = 0
+        sh = fr.h
+        oy = feet - sh
+        if oy < 0:
+            src_y0 = -oy
+            sh = fr.h - src_y0
+            oy = 0
+        if oy + sh > th:
+            sh = th - oy
+        if sh < 1:
+            continue
+        sw = fr.w
+        sbuf = bytearray(sw * sh * 2)
+        mask = bytearray((sw * sh + 7) // 8)
+        dy = 0
+        while dy < sh:
+            dx = 0
+            while dx < sw:
+                col = _frame_at_565(pack, fr, dx, src_y0 + dy)
+                if col is not None:
+                    di = dy * sw + dx
+                    sbuf[di * 2] = col & 0xFF
+                    sbuf[di * 2 + 1] = (col >> 8) & 0xFF
+                    mask[di >> 3] |= 1 << (di & 7)
+                dx += 1
+            dy += 1
+        spans = _opaque_spans(mask, sw, sh)
+        ox = int(world_x) - sw // 2
+        out.append((PARALLAX_GROUND, ox, oy, sw, sh, sbuf, mask, spans))
+    return out
 
 
 def copy_ocean_window(tile, tw, th, scroll, out, vw=W):
@@ -5178,13 +5300,13 @@ class BoostFX:
             # All four aura frames, for the whole boost, at 15 fps.
             self.aura_i = (self.aura_i + 1) & 3
             if not self.start_sw_done:
-                if self.sw_i < 4:
+                if self.sw_i < 5:
                     self.sw_i += 1
                 else:
                     self.sw_i = -1
                     self.start_sw_done = True
         elif self.phase == "end_sw":
-            if self.sw_i < 4:
+            if self.sw_i < 5:
                 self.sw_i += 1
             else:
                 self.phase = "barrier"
@@ -5438,6 +5560,8 @@ class Sprite:
             except Exception:
                 pass
         _continue_dirt_checker(buf, tw, th)
+        _install_sheet_backdrop(buf, tw, th, pack)
+        stamps.extend(_sheet_prop_stamps(pack, th))
         self.ocean_rgb565 = buf
         self.ocean_tw = tw
         self.ocean_th = th
@@ -6160,8 +6284,9 @@ class Sprite:
                 tip_y = SONIC_MID_Y
                 self._draw_sonic(lcd, speed, tps, clt)
                 # Aura is layered on top of Sonic at the locked tip.
-                self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
-                self.boost.draw_front(lcd, SW_TIP_X, tip_y)
+                if not self._blit_packed_fx(lcd):
+                    self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
+                    self.boost.draw_front(lcd, SW_TIP_X, tip_y)
             self._draw_ring_hud(lcd)
         finally:
             _brk_exit()
@@ -7416,6 +7541,62 @@ class Sprite:
             prev.append((item[0], item[1], item[2]))
         self._native_ready = True
 
+    def _packed_fx_on(self):
+        pack = self.pack
+        return pack is not None and pack.by_name.get("fx_aura_0") is not None
+
+    def _stamp_packed_fx(self, window, vw, vh):
+        """Stamp the packed boost frames. Returns True when they replace gh.fx."""
+        gh = _GH
+        pack = self.pack
+        if gh is None or pack is None or not hasattr(gh, "stamp_runs"):
+            return False
+        if not self._packed_fx_on():
+            return False
+        boost = self.boost
+        specs = (
+            ("fx_aura", boost.aura_i, AURA_TIP_X, AURA_TIP_Y),
+            ("fx_boot", boost.sw_i, SW_TIP_X, AURA_TIP_Y + BOOT_DY),
+            ("fx_bar", boost.bar_i, BAR_TIP_X, BAR_TIP_Y),
+            ("fx_spark", boost.spark_i, SPARK_FRONT_X, SPARK_MID_Y),
+        )
+        for prefix, index, ax, ay in specs:
+            if index < 0:
+                continue
+            fr = pack.by_name.get("%s_%d" % (prefix, index))
+            if fr is None or not fr.nruns:
+                continue
+            pal_id = fr.pal_id
+            if pal_id < 0 or pal_id >= len(pack.pair_bytes):
+                pal_id = 0
+            pairs = pack.pair_bytes[pal_id]
+            gh.stamp_runs(
+                window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2,
+                ax - fr.origin_x, ay - fr.origin_y,
+            )
+        return True
+
+    def _blit_packed_fx(self, lcd):
+        """LCD fallback for the packed boost frames."""
+        pack = self.pack
+        if pack is None or not self._packed_fx_on():
+            return False
+        boost = self.boost
+        specs = (
+            ("fx_aura", boost.aura_i, AURA_TIP_X, AURA_TIP_Y),
+            ("fx_boot", boost.sw_i, SW_TIP_X, AURA_TIP_Y + BOOT_DY),
+            ("fx_bar", boost.bar_i, BAR_TIP_X, BAR_TIP_Y),
+            ("fx_spark", boost.spark_i, SPARK_FRONT_X, SPARK_MID_Y),
+        )
+        for prefix, index, ax, ay in specs:
+            if index < 0:
+                continue
+            fr = pack.by_name.get("%s_%d" % (prefix, index))
+            if fr is None:
+                continue
+            blit_frame(lcd, pack, fr, ax, ay, pack.pal(fr.pal_id), 0, GAUGE_Y, True)
+        return True
+
     def _paint_native(self, amount, with_fx, offs_ready=False):
         """Fill play_window. Fills _paint_us: compose, stamp, hud, sonic, rings, fx, digits.
 
@@ -7502,11 +7683,18 @@ class Sprite:
             t_fx = _mono_us()
             _brk_enter("fx")
             try:
+                if self._stamp_packed_fx(window, vw, vh):
+                    ai = si = bi = ki = -1
+                else:
+                    ai = boost.aura_i
+                    si = boost.sw_i
+                    bi = boost.bar_i
+                    ki = boost.spark_i
                 gh.fx(
                     window, vw, vh,
-                    boost.aura_i, boost.sw_i, boost.bar_i,
+                    ai, si, bi,
                     AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
-                    boost.spark_i, BAR_TIP_X, SPARK_FRONT_X, SPARK_MID_Y,
+                    ki, BAR_TIP_X, SPARK_FRONT_X, SPARK_MID_Y,
                 )
             finally:
                 _brk_exit()
@@ -7794,9 +7982,10 @@ class Sprite:
                 if ocean is not None:
                     blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
             self._blit_playfield_sprites(lcd, pal_s, pal_c, off)
-        # Aura / shockwave on top of Sonic, after the playfield push.
-        self.boost.draw_behind(lcd, AURA_TIP_X, AURA_TIP_Y)
-        self.boost.draw_front(lcd, SW_TIP_X, AURA_TIP_Y)
+        # Packed boost frames, or the procedural fallback, after the push.
+        if not self._blit_packed_fx(lcd):
+            self.boost.draw_behind(lcd, AURA_TIP_X, AURA_TIP_Y)
+            self.boost.draw_front(lcd, SW_TIP_X, AURA_TIP_Y)
 
     def _wrapped(self, x, w, off):
         """Screen left edges for a prop whose world left is x and width is w.

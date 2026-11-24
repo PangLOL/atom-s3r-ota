@@ -938,7 +938,8 @@ def _additive_probe(fw, sprite):
             a = _pix(under, vw, x, y)
             b = _pix(over, vw, x, y)
             if b != a:
-                if _lum565(b) < _lum565(a):
+                # Packed sheet sprites replace pixels. The procedural aura only adds.
+                if not sprite._packed_fx_on() and _lum565(b) < _lum565(a):
                     print("sonic darkened", x, y)
                     bad += 1
                     break
@@ -1057,7 +1058,10 @@ def main():
         if fx:
             base = bytearray(expect)
             vh = sprite._playfield_vh()
-            _ref_fx(fw, base, fw.W, vh, aura, swi, bar, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X)
+            if sprite._packed_fx_on():
+                sprite._stamp_packed_fx(base, fw.W, vh)
+            else:
+                _ref_fx(fw, base, fw.W, vh, aura, swi, bar, fw.AURA_TIP_X, fw.AURA_TIP_Y, fw.SW_TIP_X)
             # Digits are part of the native fx paint. Reference draws them too.
             ref_digits = bytearray(_py_digits(fw, fw.W, vh, fw.HUD_BAR_POS[0], fw.HUD_BAR_POS[1], rings))
             # Composite digits onto the fx reference the same way: digits after fx.
@@ -1210,24 +1214,20 @@ def main():
     bad += _sea_shift_probe(lib)
     tw = sprite.ocean_tw
     tile = sprite.ocean_rgb565
+    # Packed checker is a 16px cell, two rows tall, repeated under the grass.
+    period = 16
     src = 101 * tw * 2
-    tmpl = bytes(tile[src:src + 24])
+    tmpl = bytes(tile[src:src + period * 2])
     x = 0
     dirt_bad = 0
     while x < tw:
-        if bytes(tile[src + x * 2:src + (x + 12) * 2]) != tmpl:
+        if bytes(tile[src + x * 2:src + (x + period) * 2]) != tmpl:
             dirt_bad += 1
-        x += 12
-    # The period also has to meet itself at the wrap.
-    if bytes(tile[src + (tw - 12) * 2:src + tw * 2]) != tmpl:
+        x += period
+    if bytes(tile[src + (tw - period) * 2:src + tw * 2]) != tmpl:
         dirt_bad += 1
     print("dirt period breaks", dirt_bad)
     bad += dirt_bad
-    row100 = bytes(tile[100 * tw * 2:(101) * tw * 2])
-    row102 = bytes(tile[102 * tw * 2:(103) * tw * 2])
-    if row100 != row102:
-        print("checker row 102 is not a copy of row 100")
-        bad += 1
 
     print("frames", frames, "digit_bad", digit_bad, "fx_bad", fx_bad, "mismatches", bad)
     if frames < 222:

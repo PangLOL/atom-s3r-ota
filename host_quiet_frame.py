@@ -804,6 +804,14 @@ def main():
     assert hovering[2] == fw.CHAO_HEAD_Y - 11
     raw = open(os.path.join(ROOT, "pixidx.bin"), "rb").read()
     opack = fw.PixIdx(raw)
+    for _name in (
+        "fx_spark_0", "fx_bar_0", "fx_aura_0", "fx_boot_0",
+        "gnd_grass", "gnd_check", "prop_palm", "prop_fl_2", "gh_bg_0",
+    ):
+        assert _name in opack.by_name, _name
+    assert opack.by_name["gh_bg_0"].w == 256
+    assert opack.by_name["fx_boot_0"].h % 2 == 0
+    assert len(raw) == fw.PIXIDX_SIZE
     obuf, otw, oth = fw.prerender_ocean_rgb565(opack, opack.by_name["ocean"])
     fw.repair_ocean_tile(obuf, otw, oth)
     sky = fw._rgb888_to_565(fw.SKY_BLUE_888)
