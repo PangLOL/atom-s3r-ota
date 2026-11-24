@@ -485,8 +485,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "e0c4af289f50680ee0544e2d985854b7f51ee28689ed8235433946a9704b913f"
-PIXIDX_SIZE = 380934
+PIXIDX_SHA256 = "ae5637ac39d593ffc4a405adb3cf3aed67f171c41bbe5e87943faaf8631ce5dc"
+PIXIDX_SIZE = 382051
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"

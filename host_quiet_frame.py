@@ -851,7 +851,8 @@ def main():
         y += 1
     assert foliage == 0
     assert fw._band_diff(obuf, otw, otw - 1, 0, fw.GRASS_Y, 100) <= 8
-    assert fw._band_diff(obuf, otw, 127, 128, fw.HORIZON_Y + 4, fw.GRASS_Y) <= 24
+    # The sea picture's own waves step by about this much between columns.
+    assert fw._band_diff(obuf, otw, 127, 128, fw.HORIZON_Y + 4, fw.GRASS_Y) <= 32
     # The packed ocean is the sea picture, so there is no hill loop to lift.
     wide = 0
     for st in stamps:
