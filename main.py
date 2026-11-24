@@ -4,7 +4,7 @@ V15: the V14 packed picture, composited so a scroll does not restamp
 sprites that did not change. Same pre-scaled PIX6 art (Sonic 39x36,
 playfield 128x103, rings 14x14). The four reference sheets are packed
 into pixidx.bin. At pack load the
-384x103 ocean tile is pre-rendered into an RGB565 buffer and split into
+256x103 ocean tile is pre-rendered into an RGB565 buffer and split into
 parallax layers: sky/clouds at 0.25, water and islands at 0.6, ground and
 near palms at 1.0. The packed art has no mountain band, so 0.4 is unused.
 Scenery stamps (loop island, palms, bushes) blit through the same kind of
@@ -485,8 +485,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "ae5637ac39d593ffc4a405adb3cf3aed67f171c41bbe5e87943faaf8631ce5dc"
-PIXIDX_SIZE = 382051
+PIXIDX_SHA256 = "5e1eca6f6b9e91a2e0778c595ca0af30bf9c28e56b07787b47d9e43dac7c1a1e"
+PIXIDX_SIZE = 368867
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -552,7 +552,7 @@ SPARK_FRAMES = 5
 HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
 GROUND_SURFACE_IN_TILE = 0  # unused; feet dest is locked, backdrop includes ground
-PROP_PERIOD = 384   # 384x103 backdrop width
+PROP_PERIOD = 256   # sea source width; the tile loops when the islands meet
 # V2 fallback ratios, applied to bands split from the prerendered ocean.
 PARALLAX_CLOUDS = 0.25
 PARALLAX_MOUNTAINS = 0.4  # packed art has no mountain band
@@ -571,7 +571,7 @@ _RING_PLACE_KEYS = tuple("r%d" % i for i in range(len(FIELD_RING_X)))
 _SPARK_PLACE_KEYS = tuple("k%d" % i for i in range(12))
 FIELD_RING_Y = 78
 
-# Scenery is baked into the 384x103 backdrop. These names are the
+# Scenery is baked into the 256x103 backdrop. These names are the
 # fallback if a pack has no ocean frame. The isolated palm, and the
 # third tiny-flower frame. The old ground, palms, island, bush, and
 # flower strips are not in the pack.
@@ -932,7 +932,7 @@ def _install_sheet_backdrop(tile, tw, th, pack):
     """
     if tile is None or pack is None or tw < 1 or th < 1:
         return
-    # The ocean frame is the first sea picture, already 384x103.
+    # The ocean frame is one loop of the sea, 256 wide, so the islands meet.
     # Copy it back over the sky and water so the flat sky fill does not
     # cover it. The grass and checker below are painted after this.
     bg = pack.by_name.get("ocean")
@@ -1034,7 +1034,7 @@ def _sheet_prop_stamps(pack, th):
 
 
 def copy_ocean_window(tile, tw, th, scroll, out, vw=W):
-    """Wrap-copy a vw-wide window of the 384-wide RGB565 tile into out."""
+    """Wrap-copy a vw-wide window of the sea tile into out."""
     off = int(scroll) % tw
     if off < 0:
         off += tw
@@ -4658,12 +4658,12 @@ except Exception:
 
 
 def _pixidx_geometry_ok(pack):
-    """V7/V8 art: 384x103 backdrop and 39x36 Sonic. A leftover V6 pack fails this."""
+    """Sea loop is the source width, 256x103, plus 39x36 Sonic."""
     ocean = pack.by_name.get("ocean")
     sonic = pack.by_name.get("run_fast_0")
     if sonic is None:
         sonic = pack.by_name.get("idle_0")
-    if ocean is None or ocean.w != 384 or ocean.h != 103:
+    if ocean is None or ocean.w != 256 or ocean.h != 103:
         return False
     if sonic is None or sonic.w != 39 or sonic.h != 36:
         return False
@@ -5500,7 +5500,7 @@ class Sprite:
         self._prepare_sprites(force=True)
 
     def _prepare_ocean(self, force=False):
-        """Pre-render the 384x103 ocean tile into RGB565 once per pack load."""
+        """Pre-render the 256x103 ocean tile into RGB565 once per pack load."""
         if (
             not force
             and self.ocean_rgb565 is not None
