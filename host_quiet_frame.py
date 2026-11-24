@@ -620,6 +620,13 @@ def main():
     assert fw.SPARK_FRONT_X == 22 and fw.SPARK_MID_Y == 88
     assert fw.FX_FRAME_MS == 1000 // 15
     assert fw.HOCKEY_ON_DECEL == 5.0 and fw.HOCKEY_OFF_DECEL == 6.0
+    assert fw.BOOT_DY == fw.SONIC_FEET_Y - fw.SONIC_MID_Y
+    assert fw.FLOWER_FRAME == 2
+    assert fw.CHECKER_ROWS == 2
+    assert len(fw.PALMS) == 1 and fw.PALMS[0][0] == 10
+    assert fw.BG_FRAME == 0 and fw.SEA_SHIFT == 0
+    assert "palm_1" not in [name for name, _x in fw.SCENERY_PROPS]
+    assert "tiny_flowers_2" in [name for name, _x in fw.SCENERY_PROPS]
     assert fw.HOCKEY_MIN_KMH == 25.0
     assert 150 <= fw.HOCKEY_ARM_MS <= 200
     assert fw.HOCKEY_FRAMES == 3

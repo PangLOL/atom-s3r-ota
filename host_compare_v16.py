@@ -644,32 +644,44 @@ def _ref_aura(fw, buf, vw, vh, tip_x, tip_y, frame):
 def _ref_shock(fw, buf, vw, vh, tip_x, tip_y, frame):
     if frame < 0 or frame > 4:
         return
-    heights = (8, 14, 22, 30, 34)
-    widths = (6, 8, 10, 12, 14)
-    h = heights[frame]
-    w = widths[frame]
-    cw = _c565(fw, 0xFFFFFF)
-    ci = _c565(fw, 0xA8E8FF)
-    cm = _c565(fw, 0x3A98FF)
-    if frame < 4:
-        if frame >= 2:
-            _chevron(buf, vw, vh, tip_x + 3, tip_y, max(4, h - 8), 4, ci, 3)
-        _chevron(buf, vw, vh, tip_x - 11, tip_y, max(4, h - 6), max(3, w - 3), cm, 3)
-        _chevron(buf, vw, vh, tip_x - 6, tip_y, max(4, h - 3), w - 2, ci, 4)
-        _chevron(buf, vw, vh, tip_x - 1, tip_y, h, w, cw, 4 + frame)
-    else:
-        frags = (
-            (14, -20, 4, ci), (-14, 20, 4, cm), (6, 22, 3, cw),
-            (-24, -4, 4, ci), (12, 4, 5, cm), (8, 16, 4, ci),
-            (-8, 18, 6, cw), (-20, 8, 5, cm), (10, -8, 5, cw),
-            (4, -18, 5, cm), (-10, -22, 5, cw), (-18, -16, 6, ci),
-        )
-        for dx, dy, s, col in frags:
+    cols = (
+        _c565(fw, 0xFFFFFF),
+        _c565(fw, 0xA8E8FF),
+        _c565(fw, 0x3A98FF),
+    )
+    marks = (
+        ((0, -2, -5, -1, -1, -6, 0), (-4, -4, -8, -2, -5, -8, 1)),
+        (
+            (0, -3, -6, -1, -1, -8, 0),
+            (-4, -5, -9, -2, -5, -9, 1),
+            (3, -4, 0, -2, 4, -7, 2),
+        ),
+        (
+            (0, -4, -7, -1, -1, -10, 0),
+            (-5, -6, -10, -2, -6, -11, 1),
+            (3, -5, 0, -2, 5, -9, 2),
+        ),
+        (
+            (0, -5, -8, -1, -1, -12, 0),
+            (-5, -7, -11, -2, -6, -12, 1),
+            (4, -6, 1, -2, 6, -10, 2),
+        ),
+        (
+            (-2, -4, -6, -1, -3, -8, 0),
+            (3, -6, 1, -2, 5, -8, 1),
+            (-8, -3, -11, -1, -9, -6, 2),
+        ),
+    )
+    cy = tip_y + fw.BOOT_DY
+    for tri in marks[frame]:
+        x0, y0, x1, y1, x2, y2, ci = tri
+        col = cols[ci]
+        for mirror in (1, -1):
             _fill_triangle(
                 buf, vw, vh,
-                tip_x + dx, tip_y + dy,
-                tip_x + dx - s, tip_y + dy - 2,
-                tip_x + dx - 2, tip_y + dy + s,
+                tip_x + x0, cy + mirror * y0,
+                tip_x + x1, cy + mirror * y1,
+                tip_x + x2, cy + mirror * y2,
                 col,
             )
 
@@ -1211,6 +1223,11 @@ def main():
         dirt_bad += 1
     print("dirt period breaks", dirt_bad)
     bad += dirt_bad
+    row100 = bytes(tile[100 * tw * 2:(101) * tw * 2])
+    row102 = bytes(tile[102 * tw * 2:(103) * tw * 2])
+    if row100 != row102:
+        print("checker row 102 is not a copy of row 100")
+        bad += 1
 
     print("frames", frames, "digit_bad", digit_bad, "fx_bad", fx_bad, "mismatches", bad)
     if frames < 222:

@@ -984,49 +984,61 @@ static void draw_aura(uint8_t *buf, int vw, int vh, int tip_x, int tip_y, int fr
     fill_ellipse_clamped(buf, vw, vh, cx, cy, rx + 1, ry + 1, mid);
 }
 
+/* Boot initiate. Marks are the top half (y <= -1). The bottom is that
+   half flipped across the shoe center, BOOT_DY below the aura tip.
+   Same points as main.py _BOOT_MARKS. Not taken from the sheet. */
+static const int BOOT_DY = 18;
+
+static void boot_half(uint8_t *buf, int vw, int vh, int ox, int oy,
+                      int x0, int y0, int x1, int y1, int x2, int y2,
+                      uint16_t col, int mirror) {
+    int s = mirror ? -1 : 1;
+    gh_fill_triangle(buf, vw, vh,
+                     ox + x0, oy + s * y0,
+                     ox + x1, oy + s * y1,
+                     ox + x2, oy + s * y2,
+                     col);
+}
+
 static void draw_shockwave(uint8_t *buf, int vw, int vh, int tip_x, int tip_y, int frame) {
-    static const int heights[5] = {8, 14, 22, 30, 34};
-    static const int widths[5] = {6, 8, 10, 12, 14};
-    static const int frags[12][4] = {
-        {-18, -16, 6, 0}, {-10, -22, 5, 1}, {4, -18, 5, 2},
-        {10, -8, 5, 1}, {-20, 8, 5, 2}, {-8, 18, 6, 1},
-        {8, 16, 4, 0}, {12, 4, 5, 2}, {-24, -4, 4, 0},
-        {6, 22, 3, 1}, {-14, 20, 4, 2}, {14, -20, 4, 0},
+    static const int boot_n[5] = {2, 3, 3, 3, 3};
+    static const int boot_tri[][7] = {
+        {0, -2, -5, -1, -1, -6, 0},
+        {-4, -4, -8, -2, -5, -8, 1},
+        {0, -3, -6, -1, -1, -8, 0},
+        {-4, -5, -9, -2, -5, -9, 1},
+        {3, -4, 0, -2, 4, -7, 2},
+        {0, -4, -7, -1, -1, -10, 0},
+        {-5, -6, -10, -2, -6, -11, 1},
+        {3, -5, 0, -2, 5, -9, 2},
+        {0, -5, -8, -1, -1, -12, 0},
+        {-5, -7, -11, -2, -6, -12, 1},
+        {4, -6, 1, -2, 6, -10, 2},
+        {-2, -4, -6, -1, -3, -8, 0},
+        {3, -6, 1, -2, 5, -8, 1},
+        {-8, -3, -11, -1, -9, -6, 2},
     };
-    int h, w;
-    uint16_t cw, ci, cm;
+    uint16_t cols[3];
+    int cy, base, n, i, mirror;
     if (frame < 0 || frame > 4) {
         return;
     }
-    h = heights[frame];
-    w = widths[frame];
-    cw = gh_rgb888_to_565(COL_AURA_W);
-    ci = gh_rgb888_to_565(COL_AURA_I);
-    cm = gh_rgb888_to_565(COL_AURA_M);
+    cols[0] = gh_rgb888_to_565(COL_AURA_W);
+    cols[1] = gh_rgb888_to_565(COL_AURA_I);
+    cols[2] = gh_rgb888_to_565(COL_AURA_M);
+    cy = tip_y + BOOT_DY;
+    base = 0;
+    for (i = 0; i < frame; i++) {
+        base += boot_n[i];
+    }
+    n = boot_n[frame];
     gh_fx_cover_clear();
-    if (frame < 4) {
-        if (frame >= 2) {
-            chevron(buf, vw, vh, tip_x + 3, tip_y, imax(4, h - 8), 4, ci, 3);
-        }
-        chevron(buf, vw, vh, tip_x - 11, tip_y, imax(4, h - 6), imax(3, w - 3), cm, 3);
-        chevron(buf, vw, vh, tip_x - 6, tip_y, imax(4, h - 3), w - 2, ci, 4);
-        chevron(buf, vw, vh, tip_x - 1, tip_y, h, w, cw, 4 + frame);
-    } else {
-        int i;
-        uint16_t cols[3];
-        cols[0] = ci;
-        cols[1] = cw;
-        cols[2] = cm;
-        for (i = 11; i >= 0; i--) {
-            int dx = frags[i][0];
-            int dy = frags[i][1];
-            int s = frags[i][2];
-            uint16_t col = cols[frags[i][3]];
-            gh_fill_triangle(buf, vw, vh,
-                             tip_x + dx, tip_y + dy,
-                             tip_x + dx - s, tip_y + dy - 2,
-                             tip_x + dx - 2, tip_y + dy + s,
-                             col);
+    for (i = 0; i < n; i++) {
+        const int *t = boot_tri[base + i];
+        uint16_t col = cols[t[6]];
+        for (mirror = 0; mirror < 2; mirror++) {
+            boot_half(buf, vw, vh, tip_x, cy,
+                      t[0], t[1], t[2], t[3], t[4], t[5], col, mirror);
         }
     }
 }

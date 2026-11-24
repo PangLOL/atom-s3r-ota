@@ -32,7 +32,10 @@ The OTA client stays, on its existing schedule; its HTTP fetch cannot
 block forever. A machine.WDT is armed after the first heavy alloc, fed
 from the loop, and not used as a routine reboot. This file is version 15.
 It is not the published Pages payload.
-Official mouths and boost rips are not packed yet, packing is allowed.
+The boost sheets are not packed. Sparks, the sound barrier, the aura,
+and the boot initiate stay procedural. The boot row is the top half
+only, so that half is flipped across the shoes. The sea stays on its
+first frame.
 The three hockey-stop frames are packed and face right.
 Chao cycles are normal_chao, amy_chao, knuckles_chao, sonic_chao, and
 tails_chao. Frames 0 and 1 join, switch sides, and leave. Frames 2 and 3
@@ -284,6 +287,11 @@ WATER_Y = 54
 WATER_H = 12
 GRASS_H = 7
 TILE = 6
+# Two checker rows under the grass. A taller dirt band repeats that pair.
+CHECKER_ROWS = 2
+# The sea sheet has more frames. This board keeps the first one.
+BG_FRAME = 0
+SEA_SHIFT = 0
 
 # x, y, rx, ry
 CLOUDS = (
@@ -312,17 +320,16 @@ HILLS = (
     (82, 22, 10),
     (128, 14, 7),
 )
-# x, height
+# x, height. The first tree only. The loose coconut is not drawn.
 PALMS = (
     (10, 26),
-    (46, 18),
-    (98, 22),
-    (168, 28),
 )
 LOOP_X = 148
 LOOP_RO = 20
 LOOP_RI = 12
-# x, color
+# x, color. Tiny flowers have three poses. The stage holds the third.
+FLOWER_FRAME = 2
+_FLOWER_WH = ((1, 1), (2, 1), (2, 2))
 FLOWERS = (
     (18, 0xE04040),
     (24, 0xF0D030),
@@ -533,6 +540,8 @@ CHAO_OFF_LEFT = -20
 CHAO_OFF_RIGHT = W + 20
 SONIC_FEET_DEST_X = SONIC_X + SONIC_W // 2  # 35
 SONIC_FEET_DEST_Y = SONIC_Y + SONIC_H       # 91
+# Shoe line minus the aura tip. The boot initiate is centered here.
+BOOT_DY = SONIC_FEET_Y - SONIC_MID_Y        # 18
 AURA_TIP_Y = SONIC_MID_Y  # 72
 BAR_TIP_X = 68            # 8 px left of the shockwave tip
 BAR_TIP_Y = SONIC_MID_Y   # 72
@@ -561,14 +570,15 @@ _RING_PLACE_KEYS = tuple("r%d" % i for i in range(len(FIELD_RING_X)))
 _SPARK_PLACE_KEYS = tuple("k%d" % i for i in range(12))
 FIELD_RING_Y = 78
 
-# Scenery is baked into the 384x103 backdrop. These are kept as a fallback
-# only if a pack has no ocean frame (should not happen in V7).
+# Scenery is baked into the 384x103 backdrop. These names are the
+# fallback if a pack has no ocean frame. The first palm only, and the
+# third tiny-flower frame. The loose coconut and the grass-top frame
+# strip are not in this list.
 SCENERY_PROPS = (
     ("palm_0", 5),
     ("island_0", 65),
-    ("palm_1", 114),
     ("bush_0", 0),
-    ("flowers_0", 102),
+    ("tiny_flowers_2", 102),
 )
 
 
@@ -868,24 +878,36 @@ def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
 
 
 def _continue_dirt_checker(tile, tw, th):
-    """Keep the packed dirt checker in phase across the 128-wide joins.
+    """Two checker rows, then that pair repeats for the rest of the dirt.
 
-    Rows 100-102 of the 384-wide ocean are only the checker. The clean
-    left edge is a 12px cell, and 384 is a multiple of 12, so repeating
-    that cell removes the skipped columns at x=128, x=256, and the wrap.
-    The sea and the loops are not rewritten. pixidx.bin is not touched.
+    Rows 100 and 101 are the two rows. The clean left edge is a 12px
+    cell, and 384 is a multiple of 12, so that cell fills each of those
+    rows. Every later dirt row copies one of the two. The sea and the
+    loops are not rewritten. pixidx.bin is not touched.
     """
     if tile is None or tw < 12 or th < 103 or (tw % 12) != 0:
         return
     period = 12
-    y = 100
-    while y <= 102 and y < th:
+    rows = CHECKER_ROWS
+    if rows < 1:
+        rows = 1
+    base = 100
+    y = base
+    n = 0
+    while n < rows and y < th:
         src = y * tw * 2
         tmpl = bytes(tile[src:src + period * 2])
         x = 0
         while x < tw:
             tile[src + x * 2:src + (x + period) * 2] = tmpl
             x += period
+        y += 1
+        n += 1
+    while y < th:
+        src_y = base + ((y - base) % rows)
+        src = src_y * tw * 2
+        dst = y * tw * 2
+        tile[dst:dst + tw * 2] = tile[src:src + tw * 2]
         y += 1
 
 
@@ -4925,7 +4947,7 @@ def _chevron_column(lcd, x, cy, half_h, width, color, steps=4):
 
 
 def draw_aura(lcd, tip_x, tip_y, frame):
-    """Original 4-frame teardrop aura. Tip sits at Sonic mid-height."""
+    """Boost aura, the third row of the effect sheet. Four teardrop frames."""
     # 0 initiate (greener), 1 transition, 2-3 cycle (blue).
     pals = (
         (0xC8F090, 0x6ED050, 0xFFFFFF, 0xE8FFE0),
@@ -4953,34 +4975,61 @@ def draw_aura(lcd, tip_x, tip_y, frame):
         fill_triangle(lcd, back + 2, cy + dy, back - length, cy + dy, back + 2, cy + dy + 3, col)
 
 
+# Boot initiate, top half only. y is above the shoe center. The bottom
+# half is this same mark flipped. Not copied from the sheet.
+_BOOT_MARKS = (
+    (
+        (0, -2, -5, -1, -1, -6, COL_AURA_W),
+        (-4, -4, -8, -2, -5, -8, COL_AURA_I),
+    ),
+    (
+        (0, -3, -6, -1, -1, -8, COL_AURA_W),
+        (-4, -5, -9, -2, -5, -9, COL_AURA_I),
+        (3, -4, 0, -2, 4, -7, COL_AURA_M),
+    ),
+    (
+        (0, -4, -7, -1, -1, -10, COL_AURA_W),
+        (-5, -6, -10, -2, -6, -11, COL_AURA_I),
+        (3, -5, 0, -2, 5, -9, COL_AURA_M),
+    ),
+    (
+        (0, -5, -8, -1, -1, -12, COL_AURA_W),
+        (-5, -7, -11, -2, -6, -12, COL_AURA_I),
+        (4, -6, 1, -2, 6, -10, COL_AURA_M),
+    ),
+    (
+        (-2, -4, -6, -1, -3, -8, COL_AURA_W),
+        (3, -6, 1, -2, 5, -8, COL_AURA_I),
+        (-8, -3, -11, -1, -9, -6, COL_AURA_M),
+    ),
+)
+
+
+def _boot_half(lcd, ox, oy, tri, mirror):
+    s = -1 if mirror else 1
+    x0, y0, x1, y1, x2, y2, col = tri
+    fill_triangle(
+        lcd,
+        ox + x0, oy + s * y0,
+        ox + x1, oy + s * y1,
+        ox + x2, oy + s * y2,
+        col,
+    )
+
+
 def draw_shockwave(lcd, tip_x, tip_y, frame):
-    """Original 5-frame shockwave. Frame 5 (index 4) is the dissipating burst."""
+    """Boot initiate. The sheet row is the top half, flipped across the shoes."""
     if frame < 0 or frame > 4:
         return
-    heights = (8, 14, 22, 30, 34)
-    widths = (6, 8, 10, 12, 14)
-    h = heights[frame]
-    w = widths[frame]
-    if frame < 4:
-        _chevron_column(lcd, tip_x - 1, tip_y, h, w, COL_AURA_W, steps=4 + frame)
-        _chevron_column(lcd, tip_x - 6, tip_y, max(4, h - 3), w - 2, COL_AURA_I, steps=4)
-        _chevron_column(lcd, tip_x - 11, tip_y, max(4, h - 6), max(3, w - 3), COL_AURA_M, steps=3)
-        if frame >= 2:
-            _chevron_column(lcd, tip_x + 3, tip_y, max(4, h - 8), 4, COL_AURA_I, steps=3)
-    else:
-        # Dissipating burst: fragments around the mid-height tip.
-        frags = (
-            (-18, -16, 6, COL_AURA_I), (-10, -22, 5, COL_AURA_W), (4, -18, 5, COL_AURA_M),
-            (10, -8, 5, COL_AURA_W), (-20, 8, 5, COL_AURA_M), (-8, 18, 6, COL_AURA_W),
-            (8, 16, 4, COL_AURA_I), (12, 4, 5, COL_AURA_M), (-24, -4, 4, COL_AURA_I),
-            (6, 22, 3, COL_AURA_W), (-14, 20, 4, COL_AURA_M), (14, -20, 4, COL_AURA_I),
-        )
-        for dx, dy, s, col in frags:
-            fill_triangle(lcd, tip_x + dx, tip_y + dy, tip_x + dx - s, tip_y + dy - 2, tip_x + dx - 2, tip_y + dy + s, col)
+    cy = tip_y + BOOT_DY
+    marks = _BOOT_MARKS[frame]
+    for tri in marks:
+        _boot_half(lcd, tip_x, cy, tri, False)
+        _boot_half(lcd, tip_x, cy, tri, True)
 
 
 def draw_barrier(lcd, tip_x, tip_y, frame):
-    """Original sound barrier. Four frames: grow, peak, near streak, far streak."""
+    """Sound barrier, the second row of the effect sheet. Four frames."""
     if frame < 0 or frame > 3:
         return
     # Same shapes as the old frames 0, 2, 3, and 5.
@@ -4999,10 +5048,11 @@ def draw_barrier(lcd, tip_x, tip_y, frame):
 
 
 def draw_sparks(lcd, front_x, mid_y, frame):
-    """Original full-speed sparks. Short streaks trail left from the front.
+    """Full-speed sparks, the first row of the effect sheet.
 
-    Not a blue boost trail, and not copied from a ripped sheet. The panel
-    fallback replaces pixels. The native path saturating-adds them.
+    Short streaks trail left from the front. Not a blue boost trail, and
+    not copied from the sheet. The panel fallback replaces pixels. The
+    native path saturating-adds them.
     """
     if frame < 0:
         return
@@ -6239,6 +6289,7 @@ class Sprite:
             self.ocean_stamps,
             self.ocean_window,
             W,
+            SEA_SHIFT,
         )
         self._commit_offs()
         self._pf_valid = True
@@ -7685,6 +7736,7 @@ class Sprite:
                     self.ocean_stamps,
                     self.ocean_window,
                     W,
+                    SEA_SHIFT,
                 )
             else:
                 copy_ocean_window(
@@ -7798,19 +7850,26 @@ class Sprite:
 
         lcd.fillRect(0, WATER_Y, W, WATER_H, COL_WATER)
         lcd.fillRect(0, WATER_Y + 2, W, 1, COL_WATER_HI)
-        sh = int(self.scroll * 0.25) % 6
-        lcd.fillRect(0, WATER_Y + 5, W, 1, COL_WATER_HI if sh < 3 else COL_WATER)
-        lcd.fillRect(0, WATER_Y + 8, W, 1, COL_WATER if sh < 3 else COL_WATER_HI)
+        # First sea frame. Later frames of the sheet stay parked.
+        lcd.fillRect(0, WATER_Y + 5, W, 1, COL_WATER_HI)
+        lcd.fillRect(0, WATER_Y + 8, W, 1, COL_WATER)
 
         for ix, rx, ry in ISLANDS:
             for x in self._wrapped_center(ix, rx, off_i):
                 fill_ellipse(lcd, x, WATER_Y + 2, rx, ry, COL_MTN_GRASS)
                 fill_ellipse(lcd, x, WATER_Y, rx - 2, 2, COL_GRASS)
 
+        cell = TILE
+        checker_rows = CHECKER_ROWS if CHECKER_ROWS > 0 else 1
+        grass_band = GRASS_H - 2
+        dirt_top = gy - checker_rows * cell
+        grass_top = dirt_top - grass_band
+        surface = grass_top
+
         for hx, rx, ry in HILLS:
             for x in self._wrapped_center(hx, rx, off):
-                fill_ellipse(lcd, x, gy - GRASS_H + 2, rx, ry, COL_GRASS_DK)
-                fill_ellipse(lcd, x, gy - GRASS_H, rx - 2, ry - 2, COL_GRASS)
+                fill_ellipse(lcd, x, surface + 2, rx, ry, COL_GRASS_DK)
+                fill_ellipse(lcd, x, surface, rx - 2, ry - 2, COL_GRASS)
 
         # The island under the loop sticks out past the ring.
         loop_half = LOOP_RO + 6
@@ -7820,14 +7879,12 @@ class Sprite:
         for px, ph in PALMS:
             # Trunk x, fronds reach about 10 px to either side.
             for x in self._wrapped(px - 10, 22, off):
-                self._draw_palm(lcd, x + 10, gy - GRASS_H + 2, ph)
+                self._draw_palm(lcd, x + 10, surface + 2, ph)
 
-        # Square checker under the grass. TILE x TILE, clipped at the edges
-        # so a partial cell is not redrawn as a full one. World x picks the
-        # color, and 180 is a multiple of TILE, so the period wrap continues.
-        cell = TILE
-        dirt_top = gy - cell
-        grass_top = dirt_top - (GRASS_H - 2)
+        # Grass surface, then two checker rows. A taller band repeats the
+        # pair. The animated grass-top frame strip is not drawn. TILE x
+        # TILE, clipped at the edges. World x picks the color, and 180 is
+        # a multiple of TILE, so the period wrap continues.
         off_i = int(off)
         start = -(off_i % cell)
         if start > 0:
@@ -7837,17 +7894,23 @@ class Sprite:
             world = x + off_i
             on = ((world // cell) & 1) == 0
             fill_rect_clip(
-                lcd, x, grass_top, cell, GRASS_H - 2,
+                lcd, x, grass_top, cell, grass_band,
                 COL_GRASS if on else COL_GRASS_DK,
             )
-            base = COL_DIRT if on else COL_DIRT_DK
-            hi = COL_DIRT_HI if on else COL_DIRT
-            fill_rect_clip(lcd, x, dirt_top, cell, cell, base)
-            fill_rect_clip(lcd, x, dirt_top, cell, 1, hi)
-            fill_rect_clip(lcd, x, dirt_top + cell - 1, cell, 1, COL_DIRT_SH)
-            fill_rect_clip(lcd, x, dirt_top, 1, cell, COL_MORTAR)
+            row = 0
+            while row < checker_rows:
+                phase = (row & 1) == 0
+                cell_on = on if phase else (not on)
+                base = COL_DIRT if cell_on else COL_DIRT_DK
+                hi = COL_DIRT_HI if cell_on else COL_DIRT
+                y0 = dirt_top + row * cell
+                fill_rect_clip(lcd, x, y0, cell, cell, base)
+                fill_rect_clip(lcd, x, y0, cell, 1, hi)
+                fill_rect_clip(lcd, x, y0 + cell - 1, cell, 1, COL_DIRT_SH)
+                fill_rect_clip(lcd, x, y0, 1, cell, COL_MORTAR)
+                row += 1
             x += cell
-        # vertical grass blades so the crown reads after-like at 128
+        # Surface crown. Not the separate grass-top animation frames.
         bx = -(off % 3)
         while bx < W:
             h = 3 + ((bx + off) & 3)
@@ -7855,13 +7918,14 @@ class Sprite:
             fill_rect_clip(lcd, bx, grass_top - h + 2, 1, h, col)
             bx += 3
 
+        fw, fh = _FLOWER_WH[FLOWER_FRAME]
         for fx, col in FLOWERS:
-            for x in self._wrapped(fx, 2, off):
-                fill_rect_clip(lcd, x, gy - GRASS_H - 1, 2, 2, col)
+            for x in self._wrapped(fx, fw, off):
+                fill_rect_clip(lcd, x, surface - fh, fw, fh, col)
 
         for sx, sh in SUNFLOWERS:
             for x in self._wrapped_center(sx, 4, off):
-                self._draw_sunflower(lcd, x, gy - GRASS_H, sh)
+                self._draw_sunflower(lcd, x, surface, sh)
 
         for i, (rx, ry, rrx, rry) in enumerate(FIELD_RINGS):
             if self._ring_taken(i):
@@ -7897,7 +7961,6 @@ class Sprite:
         fill_triangle(lcd, tx, ty, tx + 10, ty + 2, tx + 4, ty - 6, COL_PALM)
         fill_triangle(lcd, tx, ty, tx - 6, ty - 8, tx + 6, ty - 8, COL_PALM_LT)
         fill_triangle(lcd, tx, ty, tx - 8, ty + 6, tx + 2, ty + 4, COL_PALM)
-        fill_ellipse(lcd, tx, ty, 2, 2, COL_TRUNK)
 
     def _draw_sonic(self, lcd, speed, tps, clt):
         # Two-head-tall chibi, facing right, centered in the playfield.
