@@ -958,6 +958,7 @@ def main():
     assert splash_mark.W == 128 and splash_mark.H == 128
     assert len(splash_mark.BITS) == 2048
     assert splash_mark.white_count() == 2512
+    assert splash_mark.DRAW_Y == -5
     png = open(os.path.join(ROOT, "splash_128.png"), "rb").read()
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     import struct
