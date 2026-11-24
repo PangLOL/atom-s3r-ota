@@ -3502,7 +3502,9 @@ AUTO_SWEEP_IDLE_MS = 20000
 # around 150–300 ms) and short enough that a single press still starts
 # the bench sweep before its first stage is noticeable.
 AUTO_SWEEP_DOUBLE_MS = 320
-_auto_sweep_enabled = True
+# Off until a double press turns it on. A desk or a car must not start
+# the bench sweep by itself.
+_auto_sweep_enabled = False
 
 
 def toggle_auto_sweep(now=None):
@@ -8326,11 +8328,28 @@ _CAN_DATA = bytearray(8)
 _CAN_FRAME = [0, False, False, 0, memoryview(_CAN_DATA)]
 
 
-def _can_recover(bus):
-    """Restart a stopped or bus-off controller. A running bus is left alone."""
+# Drain budget, restart spacing, and the pause after any() stays true
+# with no frame. A plugged bus that never delivers must not sit in the
+# driver ahead of ui.tick.
+CAN_DRAIN_US = 2500
+CAN_RESTART_MS = 500
+CAN_STICK_MS = 200
+CAN_INIT_MS = 2000
+CAN_TEL_MS = 2000
+_can_restart_ms = None
+_can_stick_until = None
+_can_tel_ms = 0
+_CAN_TEL = {"rx": 0, "err": 0}
+
+
+def _can_recover(bus, now):
+    """Restart a stopped or bus-off controller, at most twice a second."""
+    global _can_restart_ms
     state = getattr(bus, "state", None)
     restart = getattr(bus, "restart", None)
     if state is None or restart is None:
+        return
+    if _can_restart_ms is not None and time.ticks_diff(now, _can_restart_ms) < CAN_RESTART_MS:
         return
     try:
         st = state()
@@ -8339,35 +8358,65 @@ def _can_recover(bus):
     # CAN.STOPPED is 0, CAN.BUS_OFF is 4. RECOVERING (5) is already in progress.
     if st != 0 and st != 4:
         return
+    _can_restart_ms = now
     try:
         restart()
     except Exception:
         pass
 
 
-def pull_frames(bus, values):
+def _can_note(now):
+    """One short line every two seconds, and only if stdout will not block."""
+    global _can_tel_ms
+    if _can_tel_ms != 0 and time.ticks_diff(now, _can_tel_ms) < CAN_TEL_MS:
+        return
+    if not _stdout_can_write():
+        return
+    _can_tel_ms = now
+    print("can rx %d err %d" % (_CAN_TEL["rx"], _CAN_TEL["err"]))
+    _CAN_TEL["rx"] = 0
+    _CAN_TEL["err"] = 0
+
+
+def pull_frames(bus, values, now=None):
     """Drain queued CAN frames without waiting and without allocating.
 
-    At most 64 frames. timeout is always 0. A bare recv() is never used,
-    because that call waits up to five seconds and the picture freezes
-    for the wait. An empty read or a driver error ends the drain.
+    At most 64 frames or CAN_DRAIN_US, whichever comes first. timeout is
+    always 0. A bare recv() is never used. If any() stays true and recv
+    returns nothing, the next drains wait CAN_STICK_MS so a stuck flag
+    cannot call the driver on every frame.
     """
-    _can_recover(bus)
+    global _can_stick_until
+    if now is None:
+        now = time.ticks_ms()
+    if _can_stick_until is not None and time.ticks_diff(_can_stick_until, now) > 0:
+        return 0
+    try:
+        _can_recover(bus, now)
+    except Exception:
+        _CAN_TEL["err"] += 1
+        return 0
     n = 0
     frame = _CAN_FRAME
     data = frame[4]
+    t0 = _mono_us()
     while n < 64:
+        if _us_diff(_mono_us(), t0) >= CAN_DRAIN_US:
+            break
         try:
             waiting = bus.any(0)
         except TypeError:
             try:
                 waiting = bus.any()
             except Exception:
-                return n
+                _CAN_TEL["err"] += 1
+                break
         except Exception:
-            return n
+            _CAN_TEL["err"] += 1
+            break
         if not waiting:
-            return n
+            _can_stick_until = None
+            break
         i = 0
         while i < 8:
             data[i] = 0
@@ -8379,28 +8428,29 @@ def pull_frames(bus, values):
             try:
                 got = bus.recv(0, timeout=0)
             except Exception:
-                return n
+                _CAN_TEL["err"] += 1
+                break
         except Exception:
-            return n
+            _CAN_TEL["err"] += 1
+            break
         if not got:
-            return n
-        can_id = got[0]
-        payload = got[4]
+            _can_stick_until = _ticks_add(now, CAN_STICK_MS)
+            break
         try:
+            can_id = got[0]
+            payload = got[4]
             decoded = decode_frame(can_id, payload)
-        except Exception:
-            decoded = None
-        if decoded is not None:
-            values[decoded[0]] = decoded[1]
-        # Brake switch lives on the same 0x17C frame as RPM.
-        if can_id == ID_RPM and payload is not None and len(payload) >= 5:
-            try:
+            if decoded is not None:
+                values[decoded[0]] = decoded[1]
+            # Brake switch lives on the same 0x17C frame as RPM.
+            if can_id == ID_RPM and payload is not None and len(payload) >= 5:
                 values["brk"] = 1.0 if (payload[4] & 0x01) else 0.0
-            except Exception:
-                pass
+        except Exception:
+            _CAN_TEL["err"] += 1
         n += 1
         if (n & 7) == 0:
             _service()
+    _CAN_TEL["rx"] += n
     return n
 
 
@@ -8454,6 +8504,10 @@ def main():
         _install_ota_fetch_timeout(ota_client)
     else:
         print("ota off")
+    if _auto_sweep_enabled:
+        print("auto-sweep on")
+    else:
+        print("auto-sweep off")
     _last_fetch_ms = -PIXIDX_FETCH_EVERY_MS
 
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
@@ -8473,6 +8527,7 @@ def main():
 
     loop_err_ms = 0
     gc_room_ms = 0
+    can_init_ms = 0
     while True:
         try:
             iter_us = _mono_us()
@@ -8508,10 +8563,27 @@ def main():
             else:
                 _brk_enter("can")
                 try:
-                    if bus is not None:
-                        if pull_frames(bus, values):
-                            last_rx_ms = now
+                    try:
+                        if bus is None and (
+                            can_init_ms == 0 or time.ticks_diff(now, can_init_ms) >= CAN_INIT_MS
+                        ):
+                            can_init_ms = now
+                            try:
+                                bus = init_can()
+                            except Exception:
+                                bus = None
+                                _CAN_TEL["err"] += 1
+                        if bus is not None:
+                            nrx = pull_frames(bus, values, now)
+                            if nrx:
+                                last_rx_ms = now
+                    except Exception:
+                        _CAN_TEL["err"] += 1
                     fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
+                    try:
+                        _can_note(now)
+                    except Exception:
+                        pass
                 finally:
                     _brk_exit()
 

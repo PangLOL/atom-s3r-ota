@@ -213,17 +213,17 @@ def main():
     try:
         buf = io.StringIO()
         sys.stdout = buf
-        assert fw._auto_sweep_enabled is True
-        fw.toggle_auto_sweep()
         assert fw._auto_sweep_enabled is False
-        assert buf.getvalue() == "auto-sweep off\n"
-        buf.seek(0)
-        buf.truncate()
         fw.toggle_auto_sweep()
         assert fw._auto_sweep_enabled is True
         assert buf.getvalue() == "auto-sweep on\n"
+        buf.seek(0)
+        buf.truncate()
+        fw.toggle_auto_sweep()
+        assert fw._auto_sweep_enabled is False
+        assert buf.getvalue() == "auto-sweep off\n"
     finally:
-        fw._auto_sweep_enabled = True
+        fw._auto_sweep_enabled = False
         sys.stdout = saved
 
     class _Fr(object):
@@ -1166,20 +1166,31 @@ def main():
     speed = (0x158, False, False, 0, bytes((0x03, 0xE8, 0, 0, 0, 0, 0, 0)))
     rpm = (0x17C, False, False, 0, bytes((0, 0, 0x0B, 0xB8, 0x01, 0, 0, 0)))
     values = {}
+    fw._can_stick_until = None
+    fw._can_restart_ms = None
     bus = _CanBus([speed, rpm])
-    assert fw.pull_frames(bus, values) == 2
+    assert fw.pull_frames(bus, values, 1000) == 2
     assert values["spd"] == 10.0
     assert values["rpm"] == 3000.0
     assert values["brk"] == 1.0
     assert bus.timeouts == [0, 0]
     assert bus.restarts == 0
+    fw._can_stick_until = None
+    fw._can_restart_ms = None
     flooded = _CanBus([speed] * 80, sticky=True)
-    assert fw.pull_frames(flooded, values) == 64
+    assert fw.pull_frames(flooded, values, 2000) == 64
     assert flooded.timeouts == [0] * 64
+    fw._can_stick_until = None
     dead = _CanBus([], sticky=True)
-    assert fw.pull_frames(dead, values) == 0
+    assert fw.pull_frames(dead, values, 3000) == 0
+    assert fw.pull_frames(dead, values, 3000) == 0
+    assert len(dead.timeouts) == 1
+    fw._can_stick_until = None
+    fw._can_restart_ms = None
     off = _CanBus([], state=4)
-    assert fw.pull_frames(off, values) == 0
+    assert fw.pull_frames(off, values, 4000) == 0
+    assert off.restarts == 1
+    assert fw.pull_frames(off, values, 4200) == 0
     assert off.restarts == 1
     class _RingPack(object):
         by_name = {}
