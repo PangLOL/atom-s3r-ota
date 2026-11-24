@@ -41,9 +41,9 @@ The brake plays the three skid frames. They face right, with the smoke from the 
 Chao cycles are normal_chao, amy_chao, knuckles_chao, sonic_chao, and
 tails_chao. Frames 0 and 1 join, switch sides, and leave. Frames 2 and 3
 hover at Sonic's head. One Chao, at 2 fps, for up to five minutes.
-Aura, shockwave, sound barrier, and full-speed sparks are V2 primitives
-drawn on top of Sonic. The native path saturating-adds them in RGB565.
-FACE_ENABLED stays off.
+Aura, shockwave, sound barrier, and full-speed sparks stay in the draw
+path. BOOST_VFX is False, so none of them are drawn. Flip it to True
+to show them again. FACE_ENABLED stays off.
 Companion asset pixidx.bin is fetched from the OTA host if missing, stale, or
 the wrong size / geometry (a leftover V6 pack must not be used).
 
@@ -191,6 +191,9 @@ SONIC_MID_Y = 72
 AURA_TIP_X = 66
 SW_TIP_X = 76
 FACE_ENABLED = False      # sheet has no face / mouth layer; stay off
+# Additive aura, shockwave, sound barrier, and sparks. Off for now:
+# the saturating blend is too much on the Atom. Flip to True to draw.
+BOOST_VFX = False
 
 W, H = 128, 128
 GAUGE_H = H // 5
@@ -5371,10 +5374,13 @@ class BoostFX:
                 self.reset()
 
     def draw_behind(self, lcd, tip_x, tip_y):
-        if self.aura_i >= 0:
-            draw_aura(lcd, tip_x, tip_y, self.aura_i)
+        if not BOOST_VFX or self.aura_i < 0:
+            return
+        draw_aura(lcd, tip_x, tip_y, self.aura_i)
 
     def draw_front(self, lcd, tip_x, tip_y):
+        if not BOOST_VFX:
+            return
         if self.sw_i >= 0:
             draw_shockwave(lcd, tip_x, tip_y, self.sw_i)
         if self.bar_i >= 0:
@@ -7675,6 +7681,9 @@ class Sprite:
 
     def _stamp_packed_fx(self, window, vw, vh):
         """Stamp the packed boost frames. Returns True when they replace gh.fx."""
+        if not BOOST_VFX:
+            # True means the caller must not fall through to gh.fx either.
+            return True
         gh = _GH
         pack = self.pack
         if gh is None or pack is None or not hasattr(gh, "stamp_runs"):
@@ -7714,6 +7723,9 @@ class Sprite:
 
     def _blit_packed_fx(self, lcd):
         """LCD fallback for the packed boost frames."""
+        if not BOOST_VFX:
+            # True means the caller must not fall through to the LCD primitives.
+            return True
         pack = self.pack
         if pack is None or not self._packed_fx_on():
             return False
@@ -7819,19 +7831,22 @@ class Sprite:
             t_fx = _mono_us()
             _brk_enter("fx")
             try:
-                if self._stamp_packed_fx(window, vw, vh):
-                    ai = si = bi = ki = -1
-                else:
-                    ai = boost.aura_i
-                    si = boost.sw_i
-                    bi = boost.bar_i
-                    ki = boost.spark_i
-                gh.fx(
-                    window, vw, vh,
-                    ai, si, bi,
-                    AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
-                    ki, BAR_TIP_X, SPARK_FRONT_X, SPARK_MID_Y,
-                )
+                # BOOST_VFX False skips the additive aura, shockwave, barrier,
+                # and sparks. Digits below still draw. Flip the flag to draw.
+                if BOOST_VFX:
+                    if self._stamp_packed_fx(window, vw, vh):
+                        ai = si = bi = ki = -1
+                    else:
+                        ai = boost.aura_i
+                        si = boost.sw_i
+                        bi = boost.bar_i
+                        ki = boost.spark_i
+                    gh.fx(
+                        window, vw, vh,
+                        ai, si, bi,
+                        AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
+                        ki, BAR_TIP_X, SPARK_FRONT_X, SPARK_MID_Y,
+                    )
             finally:
                 _brk_exit()
             fx_us = _us_diff(_mono_us(), t_fx)

@@ -959,8 +959,12 @@ def _additive_probe(fw, sprite):
             y += 1
             continue
         break
-    print("sonic box brightened", brighter)
-    if brighter < 1:
+    print("sonic box brightened", brighter, "vfx", fw.BOOST_VFX)
+    if fw.BOOST_VFX:
+        if brighter < 1:
+            bad += 1
+    elif brighter:
+        print("boost vfx drew while off")
         bad += 1
     return bad
 
