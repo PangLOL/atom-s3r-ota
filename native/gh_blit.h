@@ -42,6 +42,11 @@ void gh_stamp_runs(uint8_t *window, int vw, int vh,
                    const uint8_t *pairs, int ncolors,
                    int dest_x, int dest_y);
 
+/* Saturating add for the packed boost sprites. One sprite claims each
+   pixel once. Call end before the next sprite so they stack. */
+void gh_add_begin(int vw, int vh);
+void gh_add_end(void);
+
 /* Opaque spans in a scenery stamp: 4 bytes each, x u16 LE, y u8, len u8.
    Colors are copied from sbuf. Same wrap candidates as gh_blit_stamp. */
 void gh_blit_span_runs(uint8_t *window, int vw, int vh, int tw,

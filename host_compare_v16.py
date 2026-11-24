@@ -118,6 +118,16 @@ class Native(object):
             cw, int(vw), int(vh), cr, int(nruns), cp, int(ncolors), int(x), int(y)
         )
 
+    def add_begin(self, vw, vh):
+        self.lib.gh_add_begin.argtypes = [ctypes.c_int, ctypes.c_int]
+        self.lib.gh_add_begin.restype = None
+        self.lib.gh_add_begin(int(vw), int(vh))
+
+    def add_end(self):
+        self.lib.gh_add_end.argtypes = []
+        self.lib.gh_add_end.restype = None
+        self.lib.gh_add_end()
+
     def stamp(self, window, vw, vh, rgb, mask, sw, sh, x, y):
         cw = _cbuf(window, True)
         cr = _cbuf(rgb, False)

@@ -485,7 +485,7 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "978ceebecfb053247da20f8f3b78e5c8aa9cd20262411d75ca474e78516340a2"
+PIXIDX_SHA256 = "a90307a2dc2a0264b9a43f737f6b9ea1d4d2d60c407e889abffe95c694474e15"
 PIXIDX_SIZE = 381230
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
@@ -5383,6 +5383,59 @@ class BoostFX:
             draw_sparks(lcd, SPARK_FRONT_X, SPARK_MID_Y, self.spark_i)
 
 
+def _add565(dst, src):
+    """Saturating RGB565 add. Same channels as the native boost blend."""
+    r = ((dst >> 11) & 31) + ((src >> 11) & 31)
+    g = ((dst >> 5) & 63) + ((src >> 5) & 63)
+    b = (dst & 31) + (src & 31)
+    if r > 31:
+        r = 31
+    if g > 63:
+        g = 63
+    if b > 31:
+        b = 31
+    return (r << 11) | (g << 5) | b
+
+
+def _add_fx_runs(window, vw, vh, fr, pairs, x0, y0):
+    """Add one packed boost sprite. Overlapping runs inside it count once."""
+    runs = fr.runs
+    n = fr.nruns
+    if not runs or n < 1:
+        return
+    seen = {}
+    i = 0
+    while i < n:
+        o = i * 5
+        rx = runs[o] | (runs[o + 1] << 8)
+        ry = runs[o + 2]
+        ln = runs[o + 3]
+        idx = runs[o + 4]
+        i += 1
+        if ln < 1 or idx <= 0:
+            continue
+        col = pairs[idx * 2] | (pairs[idx * 2 + 1] << 8)
+        y = y0 + ry
+        if y < 0 or y >= vh:
+            continue
+        x = x0 + rx
+        k = 0
+        while k < ln:
+            xx = x + k
+            k += 1
+            if xx < 0 or xx >= vw:
+                continue
+            key = y * vw + xx
+            if key in seen:
+                continue
+            seen[key] = 1
+            di = key * 2
+            dst = window[di] | (window[di + 1] << 8)
+            out = _add565(dst, col)
+            window[di] = out & 0xFF
+            window[di + 1] = (out >> 8) & 0xFF
+
+
 class Sprite:
     """Composited chibi Sonic: separate pieces, swapped by speed, retimed by phase."""
 
@@ -7645,10 +7698,18 @@ class Sprite:
             if pal_id < 0 or pal_id >= len(pack.pair_bytes):
                 pal_id = 0
             pairs = pack.pair_bytes[pal_id]
-            gh.stamp_runs(
-                window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2,
-                ax - fr.origin_x, ay - fr.origin_y,
-            )
+            x0 = ax - fr.origin_x
+            y0 = ay - fr.origin_y
+            # Each sprite adds once onto what is already there.
+            if hasattr(gh, "add_begin"):
+                gh.add_begin(vw, vh)
+                gh.stamp_runs(
+                    window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2,
+                    x0, y0,
+                )
+                gh.add_end()
+            else:
+                _add_fx_runs(window, vw, vh, fr, pairs, x0, y0)
         return True
 
     def _blit_packed_fx(self, lcd):

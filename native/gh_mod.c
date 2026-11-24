@@ -218,6 +218,18 @@ static mp_obj_t gh_stamp_runs_fn(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_stamp_runs_obj, 9, 9, gh_stamp_runs_fn);
 
+static mp_obj_t gh_add_begin_fn(mp_obj_t vw_in, mp_obj_t vh_in) {
+    gh_add_begin(arg_int(vw_in), arg_int(vh_in));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(gh_add_begin_obj, gh_add_begin_fn);
+
+static mp_obj_t gh_add_end_fn(void) {
+    gh_add_end();
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(gh_add_end_obj, gh_add_end_fn);
+
 static mp_obj_t gh_push_in(void) {
     if (gh_trace) {
         mp_printf(&mp_plat_print, "push-in\n");
@@ -332,6 +344,8 @@ mp_obj_t mpy_init(mp_obj_fun_bc_t *self, size_t n_args, size_t n_kw, mp_obj_t *a
     mp_store_global(MP_QSTR_copy, MP_OBJ_FROM_PTR(&gh_copy_obj));
     mp_store_global(MP_QSTR_stamp, MP_OBJ_FROM_PTR(&gh_stamp_obj));
     mp_store_global(MP_QSTR_stamp_runs, MP_OBJ_FROM_PTR(&gh_stamp_runs_obj));
+    mp_store_global(MP_QSTR_add_begin, MP_OBJ_FROM_PTR(&gh_add_begin_obj));
+    mp_store_global(MP_QSTR_add_end, MP_OBJ_FROM_PTR(&gh_add_end_obj));
     mp_store_global(MP_QSTR_push_in, MP_OBJ_FROM_PTR(&gh_push_in_obj));
     mp_store_global(MP_QSTR_expand, MP_OBJ_FROM_PTR(&gh_expand_obj));
     mp_store_global(MP_QSTR_fx, MP_OBJ_FROM_PTR(&gh_fx_obj));

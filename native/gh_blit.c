@@ -680,11 +680,27 @@ static void fill_run565(uint8_t *window, int vw, int vh,
         return;
     }
     p = window + ((y * vw + x) * 2);
+    if (gh_fx_add) {
+        uint16_t c = (uint16_t)lo | ((uint16_t)hi << 8);
+        for (i = 0; i < len; i++) {
+            write565(p, x + i, y, c);
+            p += 2;
+        }
+        return;
+    }
     for (i = 0; i < len; i++) {
         p[0] = lo;
         p[1] = hi;
         p += 2;
     }
+}
+
+void gh_add_begin(int vw, int vh) {
+    gh_fx_begin(vw, vh);
+}
+
+void gh_add_end(void) {
+    gh_fx_end();
 }
 
 void gh_stamp_runs(uint8_t *window, int vw, int vh,
