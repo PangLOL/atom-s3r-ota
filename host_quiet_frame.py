@@ -1201,6 +1201,20 @@ def main():
     waiting.scroll = 0
     waiting._collect_rings()
     assert waiting._ring_taken(0) is False
+    import gc as _gc
+    _gc_calls = {"n": 0}
+    _saved_collect = _gc.collect
+
+    def _count_collect(*_a, **_k):
+        _gc_calls["n"] += 1
+        return 0
+
+    _gc.collect = _count_collect
+    try:
+        assert fw._gc_make_room() is True
+        assert _gc_calls["n"] >= 1
+    finally:
+        _gc.collect = _saved_collect
     assert fw.FLASH_PREAMBLE == b"ATOMFLASH\n"
     assert fw.FLASH_ACK == "flash-quiet"
     assert fw._SERIAL_QUIET is False

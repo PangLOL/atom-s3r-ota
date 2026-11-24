@@ -3325,6 +3325,64 @@ def gc_slice_room(spent_us, quantum_us=None):
     return (quantum_us - spent_us) >= (GC_SLICE_US + GC_SLICE_MARGIN_US)
 
 
+def _gc_make_room():
+    """Free a 16-byte block when the sliced collector has fallen behind.
+
+    gc.disable() makes a failed alloc return at once, with no collect.
+    The loop used to catch that MemoryError, feed the watchdog, and try
+    the same alloc again, so the last frame stayed on the panel and the
+    serial line repeated once a second. A few slices run first. The
+    16-byte probe then finishes the cycle if no block was freed, because
+    automatic collection is on for that one call. It is turned back off
+    so a present does not take a surprise full sweep.
+    """
+    try:
+        import gc
+    except Exception:
+        return False
+    en = getattr(gc, "enable", None)
+    dis = getattr(gc, "disable", None)
+    isen = getattr(gc, "isenabled", None)
+    was_on = True
+    if isen is not None:
+        try:
+            was_on = bool(isen())
+        except Exception:
+            was_on = True
+    if en is not None:
+        try:
+            en()
+        except Exception:
+            pass
+    i = 0
+    while i < 8:
+        _feed_wdt()
+        try:
+            gc.collect()
+        except Exception:
+            break
+        i += 1
+    ok = False
+    try:
+        block = bytearray(16)
+        ok = True
+        del block
+    except Exception:
+        ok = False
+    if was_on:
+        if en is not None:
+            try:
+                en()
+            except Exception:
+                pass
+    elif dis is not None:
+        try:
+            dis()
+        except Exception:
+            pass
+    return ok
+
+
 def _gc_after_present(spent_us):
     """One sliced collect after the present.
 
@@ -8376,6 +8434,7 @@ def main():
         bus = None
 
     loop_err_ms = 0
+    gc_room_ms = 0
     while True:
         try:
             iter_us = _mono_us()
@@ -8485,6 +8544,11 @@ def main():
             # The panel has this frame. One slice, including when this frame
             # already ran long, so a drive cannot fill the heap and stall.
             _gc_after_present(_us_diff(_mono_us(), frame_started))
+            # Once a minute, finish a cycle if the slices have not kept a
+            # 16-byte hole. An overnight desk run otherwise fills the heap.
+            if gc_room_ms == 0 or time.ticks_diff(now, gc_room_ms) >= 60000:
+                gc_room_ms = now
+                _gc_make_room()
             _brk_enter("pace")
             try:
                 next_draw = pace_after(frame_started, _mono_us())
@@ -8499,6 +8563,8 @@ def main():
             _brk_commit(_us_diff(_mono_us(), iter_us))
         except Exception as e:
             _feed_wdt()
+            if isinstance(e, MemoryError):
+                _gc_make_room()
             try:
                 err_now = time.ticks_ms()
                 if loop_err_ms == 0 or time.ticks_diff(err_now, loop_err_ms) >= 1000:
