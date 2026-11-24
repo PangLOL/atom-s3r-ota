@@ -160,8 +160,8 @@ def main():
     assert fw.REFRESH_MS == 50
     assert not hasattr(fw, "DBL_TAP_MS")
     assert fw.SONIC_W == 39 and fw.SONIC_H == 36
-    assert fw.SONIC_X == 16 and fw.SONIC_Y == 55
-    assert fw.SONIC_FEET_Y == 90
+    assert fw.SONIC_X == 16 and fw.SONIC_Y == 68
+    assert fw.SONIC_FEET_Y == 103
     assert fw.SONIC_FEET_DEST_X == 35 and fw.SONIC_FEET_DEST_Y == 91
     assert fw.HUD_RING_POS == (4, 3)
     assert fw.HUD_BAR_POS == (14, 6)

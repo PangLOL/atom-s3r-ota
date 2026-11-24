@@ -1216,7 +1216,7 @@ def main():
     tile = sprite.ocean_rgb565
     # Packed checker is a 16px cell, two rows tall, repeated under the grass.
     period = 16
-    src = 101 * tw * 2
+    src = (fw.GRASS_Y + 8) * tw * 2
     tmpl = bytes(tile[src:src + period * 2])
     x = 0
     dirt_bad = 0

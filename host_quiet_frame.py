@@ -616,10 +616,10 @@ def main():
     fast.tick(fw.SPEED_FAST - 1.0, 10, 0.0)
     assert fast.spark_i < 0
     assert not hasattr(fw, "AURA_ALPHA")
-    assert fw.BAR_TIP_X == 68 and fw.BAR_TIP_Y == 72
-    assert fw.AURA_TIP_X == 66 and fw.AURA_TIP_Y == 72
+    assert fw.BAR_TIP_X == 68 and fw.BAR_TIP_Y == 85
+    assert fw.AURA_TIP_X == 66 and fw.AURA_TIP_Y == 85
     assert fw.SW_TIP_X == 76
-    assert fw.SPARK_FRONT_X == 22 and fw.SPARK_MID_Y == 88
+    assert fw.SPARK_FRONT_X == 22 and fw.SPARK_MID_Y == 101
     assert fw.FX_FRAME_MS == 1000 // 15
     assert fw.HOCKEY_ON_DECEL == 5.0 and fw.HOCKEY_OFF_DECEL == 6.0
     assert fw.BOOT_DY == fw.SONIC_FEET_Y - fw.SONIC_MID_Y
@@ -815,7 +815,7 @@ def main():
         assert _name in opack.by_name, _name
     for _gone in ("ground", "palm_0", "palm_1", "island_0", "bush_0", "flowers_0", "tiny_flowers_0", "gh_bg_0"):
         assert _gone not in opack.by_name, _gone
-    assert opack.by_name["ocean"].w == 256 and opack.by_name["ocean"].h == 103
+    assert opack.by_name["ocean"].w == 256 and opack.by_name["ocean"].h == 128
     assert opack.by_name["fx_spark_4"].w > 8
     assert len(raw) == fw.PIXIDX_SIZE
     obuf, otw, oth = fw.prerender_ocean_rgb565(opack, opack.by_name["ocean"])

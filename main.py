@@ -187,7 +187,7 @@ HOCKEY_ON_DECEL = 5.0
 HOCKEY_OFF_DECEL = 6.0
 HOCKEY_ARM_MS = 180
 HOCKEY_FRAMES = 3
-SONIC_MID_Y = 72
+SONIC_MID_Y = 85
 AURA_TIP_X = 66
 SW_TIP_X = 76
 FACE_ENABLED = False      # sheet has no face / mouth layer; stay off
@@ -485,8 +485,8 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "5e1eca6f6b9e91a2e0778c595ca0af30bf9c28e56b07787b47d9e43dac7c1a1e"
-PIXIDX_SIZE = 368867
+PIXIDX_SHA256 = "a1711bdbdcf4e7f5033c2c797e61e57002761a80e047d3dc85fe67918babe8ee"
+PIXIDX_SIZE = 375331
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
@@ -496,15 +496,15 @@ SPEED_FAST = 80.0
 _RUN_TAGS = ("run_slow", "run_medium", "run_fast")
 IDLE_TRIGGER_AFTER_MS = 3500
 
-# Locked after-preview layout (128x128). Sonic sprite is 39x36 at top-left
-# (16, 55). Frames use a feet-centre origin, so the blit dest is the exclusive
-# bottom of that box: (35, 91). Feet plant on y 90. Playfield is y 0-102.
+# 13 rows of sky were restored above the old crop, so the picture sits
+# 13 px lower. Sonic is 39x36. Feet plant on y 103. The gauge still
+# paints over y 103-127 until it is toggled off.
 SONIC_X = 16
-SONIC_Y = 55
+SONIC_Y = 68
 SONIC_W = 39
 SONIC_H = 36
-SONIC_FEET_Y = 90
-SONIC_HEAD_Y = 63
+SONIC_FEET_Y = 103
+SONIC_HEAD_Y = 76
 SONIC_FRONT_X = 54
 # One Chao at a time, cruise only (moving, and under 80 km/h). The pack
 # has four frames per type. 0 and 1 are the side-view chase pair used to
@@ -547,7 +547,7 @@ AURA_TIP_Y = SONIC_MID_Y  # 72
 BAR_TIP_X = 68            # 8 px left of the shockwave tip
 BAR_TIP_Y = SONIC_MID_Y   # 72
 SPARK_FRONT_X = 22
-SPARK_MID_Y = 88
+SPARK_MID_Y = 101
 SPARK_FRAMES = 5
 HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
@@ -558,8 +558,9 @@ PARALLAX_CLOUDS = 0.25
 PARALLAX_MOUNTAINS = 0.4  # packed art has no mountain band
 PARALLAX_WATER = 0.6
 PARALLAX_GROUND = 1.0
-HORIZON_Y = 32   # sky/clouds above; water and the horizon line from here
-GRASS_Y = 88     # near ground (grass, dirt, planted palms) from here
+# 13 px of sky above the old crop, then 12 px of checker under the grass.
+HORIZON_Y = 45   # sky/clouds above; water and the horizon line from here
+GRASS_Y = 101    # near ground (grass, dirt, planted palms) from here
 RING_PERIOD = 1536  # long gaps between groups of 3-8
 RING_FPS_MS = 1000 // 30  # 33
 
@@ -569,9 +570,9 @@ FIELD_RING_X = (66, 82, 97, 866, 882, 898, 914, 930)
 # Stable place keys. Formatting "r%d" on every present was garbage.
 _RING_PLACE_KEYS = tuple("r%d" % i for i in range(len(FIELD_RING_X)))
 _SPARK_PLACE_KEYS = tuple("k%d" % i for i in range(12))
-FIELD_RING_Y = 78
+FIELD_RING_Y = 91
 
-# Scenery is baked into the 256x103 backdrop. These names are the
+# Scenery is baked into the 256x128 backdrop. These names are the
 # fallback if a pack has no ocean frame. The isolated palm, and the
 # third tiny-flower frame. The old ground, palms, island, bush, and
 # flower strips are not in the pack.
@@ -4658,12 +4659,12 @@ except Exception:
 
 
 def _pixidx_geometry_ok(pack):
-    """Sea loop is the source width, 256x103, plus 39x36 Sonic."""
+    """Sea loop is 256x128, plus 39x36 Sonic."""
     ocean = pack.by_name.get("ocean")
     sonic = pack.by_name.get("run_fast_0")
     if sonic is None:
         sonic = pack.by_name.get("idle_0")
-    if ocean is None or ocean.w != 256 or ocean.h != 103:
+    if ocean is None or ocean.w != 256 or ocean.h != 128:
         return False
     if sonic is None or sonic.w != 39 or sonic.h != 36:
         return False
@@ -5500,7 +5501,7 @@ class Sprite:
         self._prepare_sprites(force=True)
 
     def _prepare_ocean(self, force=False):
-        """Pre-render the 256x103 ocean tile into RGB565 once per pack load."""
+        """Pre-render the 256x128 ocean tile into RGB565 once per pack load."""
         if (
             not force
             and self.ocean_rgb565 is not None
@@ -8449,7 +8450,7 @@ class Dashboard:
             _brk_exit()
         _flow_add("adv", _us_diff(_mono_us(), t_adv))
 
-        # pushImage already covers y 0-102. Gauges repaint y 103-127.
+        # The sea tile is the full 128. Gauges repaint y 103-127 on top of it.
         # Skipping fillScreen and the canvas push avoids a second full-panel
         # flush and a clear that would wipe the playfield.
         direct = self._direct_playfield()
