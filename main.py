@@ -8733,6 +8733,9 @@ def init_can():
 # timeout is 5 seconds. On a live car bus that allocation repeats every
 # frame until a collect stalls the panel; the task watchdog then resets
 # the board. Off the car the queue is empty, so this path never runs.
+# m5can fills this list and returns it. A timeout returns None and does
+# not write the list. The memoryview length is then the DLC, so the next
+# clear must not walk eight slots.
 _CAN_DATA = bytearray(8)
 _CAN_FRAME = [0, False, False, 0, memoryview(_CAN_DATA)]
 
@@ -8787,13 +8790,53 @@ def _can_note(now):
     _CAN_TEL["err"] = 0
 
 
+def _can_waiting(bus):
+    """True when the RX queue reports a frame. fifo 0, else any()."""
+    try:
+        return bus.any(0)
+    except TypeError:
+        try:
+            return bus.any()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _can_read(bus, frame):
+    """One queued frame. timeout is 0. A bare recv() is never used.
+
+    The reused list is the primary path. m5can returns that list after
+    filling it, and returns None on timeout without writing it. A fill
+    that still returns None is a frame: the id slot is None before the
+    call. Any error, not only TypeError, tries recv(0, timeout=0). That
+    call allocates a tuple only when it actually returns a frame.
+    """
+    frame[0] = None
+    try:
+        got = bus.recv(0, frame, timeout=0)
+    except Exception:
+        _CAN_TEL["err"] += 1
+        got = None
+    else:
+        if got:
+            return got
+        if frame[0] is not None:
+            return frame
+    try:
+        return bus.recv(0, timeout=0)
+    except Exception:
+        _CAN_TEL["err"] += 1
+        return None
+
+
 def pull_frames(bus, values, now=None):
     """Drain queued CAN frames without waiting and without allocating.
 
     At most 64 frames or CAN_DRAIN_US, whichever comes first. timeout is
-    always 0. A bare recv() is never used. If any() stays true and recv
-    returns nothing, the next drains wait CAN_STICK_MS so a stuck flag
-    cannot call the driver on every frame.
+    always 0. A bare recv() is never used. If any() stays true after both
+    reads return nothing, the next drains wait CAN_STICK_MS so a stuck
+    flag cannot call the driver on every frame.
     """
     global _can_stick_until
     if now is None:
@@ -8807,43 +8850,27 @@ def pull_frames(bus, values, now=None):
         return 0
     n = 0
     frame = _CAN_FRAME
-    data = frame[4]
     t0 = _mono_us()
     while n < 64:
         if _us_diff(_mono_us(), t0) >= CAN_DRAIN_US:
             break
-        try:
-            waiting = bus.any(0)
-        except TypeError:
-            try:
-                waiting = bus.any()
-            except Exception:
-                _CAN_TEL["err"] += 1
-                break
-        except Exception:
+        waiting = _can_waiting(bus)
+        if waiting is None:
             _CAN_TEL["err"] += 1
             break
         if not waiting:
             _can_stick_until = None
             break
+        data = frame[4]
+        nbyte = len(data)
         i = 0
-        while i < 8:
+        while i < nbyte:
             data[i] = 0
             i += 1
-        got = None
-        try:
-            got = bus.recv(0, frame, timeout=0)
-        except TypeError:
-            try:
-                got = bus.recv(0, timeout=0)
-            except Exception:
-                _CAN_TEL["err"] += 1
-                break
-        except Exception:
-            _CAN_TEL["err"] += 1
-            break
+        got = _can_read(bus, frame)
         if not got:
-            _can_stick_until = _ticks_add(now, CAN_STICK_MS)
+            if _can_waiting(bus):
+                _can_stick_until = _ticks_add(now, CAN_STICK_MS)
             break
         try:
             can_id = got[0]

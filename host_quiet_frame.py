@@ -1169,12 +1169,15 @@ def main():
     assert fw.OTA_ENABLED is False
 
     class _CanBus(object):
-        def __init__(self, frames, sticky=False, state=6):
+        def __init__(self, frames, sticky=False, state=6, none_fill=False, list_exc=None):
             self.frames = frames
             self.i = 0
             self.sticky = sticky
             self._state = state
+            self.none_fill = none_fill
+            self.list_exc = list_exc
             self.timeouts = []
+            self.shapes = []
             self.restarts = 0
 
         def any(self, fifo=0):
@@ -1188,9 +1191,13 @@ def main():
             self._state = 6
 
         def recv(self, fifo, lst=None, timeout=5000):
+            # A bare recv() has no timeout argument. Every call here passed one.
             self.timeouts.append(timeout)
+            self.shapes.append("list" if lst is not None else "tuple")
             if timeout != 0:
                 raise AssertionError(timeout)
+            if lst is not None and self.list_exc is not None:
+                raise self.list_exc
             if self.i >= len(self.frames):
                 return None
             src = self.frames[self.i]
@@ -1200,11 +1207,40 @@ def main():
             lst[0] = src[0]
             raw = src[4]
             view = lst[4]
+            if hasattr(view, "n"):
+                view.n = len(raw)
             j = 0
             while j < len(raw) and j < len(view):
                 view[j] = raw[j]
                 j += 1
+            if self.none_fill:
+                return None
             return lst
+
+    class _DLC(object):
+        """Byte view whose visible length follows the last DLC, like m5can."""
+
+        def __init__(self):
+            self.b = bytearray(8)
+            self.n = 8
+
+        def __len__(self):
+            return self.n
+
+        def __getitem__(self, i):
+            if i < 0 or i >= self.n:
+                raise IndexError(i)
+            return self.b[i]
+
+        def __setitem__(self, i, v):
+            if i < 0 or i >= self.n:
+                raise IndexError(i)
+            self.b[i] = v
+
+    read_src = inspect.getsource(fw._can_read)
+    assert "bus.recv()" not in read_src
+    assert "timeout=0" in read_src
+    assert "bus.recv()" not in inspect.getsource(fw.pull_frames)
 
     # 0x03E8 = 1000 -> 10.00 km/h. Brake bit is data[4] of 0x17C.
     speed = (0x158, False, False, 0, bytes((0x03, 0xE8, 0, 0, 0, 0, 0, 0)))
@@ -1218,17 +1254,52 @@ def main():
     assert values["rpm"] == 3000.0
     assert values["brk"] == 1.0
     assert bus.timeouts == [0, 0]
+    assert bus.shapes == ["list", "list"]
     assert bus.restarts == 0
     fw._can_stick_until = None
     fw._can_restart_ms = None
     flooded = _CanBus([speed] * 80, sticky=True)
     assert fw.pull_frames(flooded, values, 2000) == 64
     assert flooded.timeouts == [0] * 64
+    assert flooded.shapes == ["list"] * 64
     fw._can_stick_until = None
     dead = _CanBus([], sticky=True)
     assert fw.pull_frames(dead, values, 3000) == 0
+    assert dead.shapes == ["list", "tuple"]
+    assert dead.timeouts == [0, 0]
     assert fw.pull_frames(dead, values, 3000) == 0
-    assert len(dead.timeouts) == 1
+    assert dead.shapes == ["list", "tuple"]
+    fw._can_stick_until = None
+    # In-place fill that returns None is a frame. It must not black out.
+    filled = _CanBus([speed, rpm], none_fill=True)
+    assert fw.pull_frames(filled, values, 5000) == 2
+    assert values["spd"] == 10.0 and values["rpm"] == 3000.0 and values["brk"] == 1.0
+    assert filled.shapes == ["list", "list"]
+    filled.frames.append(speed)
+    assert fw.pull_frames(filled, values, 5100) == 1
+    assert filled.shapes == ["list", "list", "list"]
+    fw._can_stick_until = None
+    fw._CAN_TEL["err"] = 0
+    raised = _CanBus([speed, rpm], list_exc=ValueError("list"))
+    assert fw.pull_frames(raised, values, 6000) == 2
+    assert raised.shapes == ["list", "tuple", "list", "tuple"]
+    assert raised.timeouts == [0, 0, 0, 0]
+    assert values["spd"] == 10.0
+    assert fw._CAN_TEL["err"] == 2
+    fw._can_stick_until = None
+    saved_view = fw._CAN_FRAME[4]
+    fw._CAN_FRAME[4] = _DLC()
+    try:
+        # 100 C raw -> 60 C. A 1-byte frame used to shrink the view and the
+        # next clear walked off the end, so the drain never returned.
+        coolant = (0x324, False, False, 0, bytes((100,)))
+        short = _CanBus([coolant, speed])
+        assert fw.pull_frames(short, values, 7000) == 2
+        assert values["clt"] == 60.0
+        assert values["spd"] == 10.0
+        assert fw._CAN_FRAME[4].n == len(speed[4])
+    finally:
+        fw._CAN_FRAME[4] = saved_view
     fw._can_stick_until = None
     fw._can_restart_ms = None
     off = _CanBus([], state=4)
