@@ -38,6 +38,8 @@ and the boot initiate stay procedural. The boot row is the top half
 only, so that half is flipped across the shoes. The sea stays on its
 first frame.
 The brake plays the three skid frames. They face right, with the smoke from the old hockey row.
+Stopped (speed under 1 km/h, the same gate as idle) with rpm above 1200
+plays the packed spindash cycle. At 1200 rpm or below, idle is unchanged.
 Chao cycles are normal_chao, amy_chao, knuckles_chao, sonic_chao, and
 tails_chao. Frames 0 and 1 join, switch sides, and leave. Frames 2 and 3
 hover at Sonic's head. One Chao, at 2 fps, for up to five minutes.
@@ -3778,7 +3780,7 @@ def _underlay_budget(pack):
         return best
 
     sonic = 0
-    for key in ("idle", "idle_trigger", "run_slow", "run_medium", "run_fast", "skid"):
+    for key in ("idle", "idle_trigger", "run_slow", "run_medium", "run_fast", "skid", "spindash"):
         sonic = max(sonic, max_bytes(pack.cycles.get(key)))
     chao = 0
     for key in CHAO_TYPES:
@@ -4073,6 +4075,9 @@ def _bake_frame_list(pack):
     skid = pack.cycles.get("skid")
     if skid:
         frames.extend(skid)
+    spindash = pack.cycles.get("spindash")
+    if spindash:
+        frames.extend(spindash)
     for key in CHAO_TYPES:
         cyc = pack.cycles.get(key)
         if cyc:
@@ -5827,7 +5832,7 @@ class Sprite:
         self._step_hockey(speed, dt_ms, brk)
         self._step_chao(speed, dt_ms)
         self.boost.tick(speed, dt_ms, rpm)
-        self._step_anim(speed, dt_ms)
+        self._step_anim(speed, dt_ms, rpm)
         self._collect_rings()
         self._step_sparkles(dt_ms)
 
@@ -6088,15 +6093,23 @@ class Sprite:
             return None
         return pack.cycles.get(tag)
 
-    def _step_anim(self, speed, dt_ms):
+    def _step_anim(self, speed, dt_ms, rpm=None):
         pack = self.pack
         if pack is None:
             return
+        if rpm is None:
+            rpm = 0.0
         hockey_frames = None
         if self.hockey:
             hockey_frames = self._cycle_frames("skid")
         if hockey_frames:
             tag = "skid"
+        elif speed < 1.0 and rpm > 1200.0:
+            # Same stopped gate as idle. A rev above 1200 rpm plays the
+            # packed spindash cycle. 1200 rpm stays on idle.
+            self.idle_wait = 0
+            self.triggering = False
+            tag = "spindash"
         elif speed < 1.0:
             if self.triggering:
                 tag = "idle_trigger"

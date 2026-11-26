@@ -270,6 +270,24 @@ def main():
     assert sprite.idle_wait == waited
     sprite._step_anim(0.0, 50)
     assert sprite.triggering is True and sprite.anim_tag == "idle_trigger"
+    # Stopped is speed < 1, the idle gate. rpm must be above 1200.
+    sprite.pack.cycles["spindash"] = [_Fr(), _Fr(), _Fr(), _Fr()]
+    sprite.pack.cycles["run_slow"] = [_Fr(), _Fr()]
+    sprite.pack.cycles["run_medium"] = [_Fr(), _Fr()]
+    sprite._step_anim(0.0, 16, 1200.0)
+    assert sprite.anim_tag == "idle_trigger" and sprite.triggering is True
+    sprite._step_anim(0.0, 16, 1200.1)
+    assert sprite.anim_tag == "spindash" and sprite.anim_i == 0
+    assert sprite.idle_wait == 0 and sprite.triggering is False
+    sprite._step_anim(0.3, fw.FX_FRAME_MS, 1800.0)
+    assert sprite.anim_tag == "spindash" and sprite.anim_i == 1
+    sprite._step_anim(1.0, 16, 4000.0)
+    assert sprite.anim_tag == "run_slow" and sprite._run_pending is None
+    # A run-band change still waits for the cycle wrap, even at high rpm.
+    sprite._step_anim(50.0, 16, 6000.0)
+    assert sprite.anim_tag == "run_slow" and sprite._run_pending == "run_medium"
+    sprite._step_anim(0.0, 16, 800.0)
+    assert sprite.anim_tag == "idle" and sprite.triggering is False and sprite.idle_wait == 16
     assert fw.anim_dt(40) == 40
     assert fw.anim_dt(50) == 50
     assert fw.anim_dt(134) == fw.REFRESH_MS
@@ -667,6 +685,9 @@ def main():
     stop.triggering = False
     stop._step_anim(70.0, 16)
     assert stop.anim_tag == "skid" and stop.anim_i == 1
+    stop.pack.cycles["spindash"] = [_Fr(), _Fr()]
+    stop._step_anim(0.0, 16, 2000.0)
+    assert stop.anim_tag == "skid" and stop.anim_i == 1
     fx.tick(20.0, 800, fw.VTEC_OFF_RPM)
     assert fx.phase == "run" and fx.below_ms == 0
     fx.tick(20.0, fw.BOOST_END_MS - 1, fw.VTEC_OFF_RPM - 1)
@@ -813,6 +834,7 @@ def main():
         "spindash_0", "spindash_7", "skid_0",
     ):
         assert _name in opack.by_name, _name
+    assert len(opack.cycles.get("spindash") or []) == 8
     for _gone in ("ground", "palm_0", "palm_1", "island_0", "bush_0", "flowers_0", "tiny_flowers_0", "gh_bg_0", "hockey_0", "look_0"):
         assert _gone not in opack.by_name, _gone
     far = opack.by_name["far_bg"]
