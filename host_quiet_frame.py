@@ -4,6 +4,7 @@ No panel. The playfield pixel compares do not stamp this dot.
 """
 
 import importlib.util
+import io
 import os
 import sys
 import time
@@ -152,6 +153,78 @@ def main():
     assert start is False and idle == 1000
     start, armed, idle = fw.auto_sweep_due(21000, 0, False, False, False, 1000)
     assert start is True and armed is False
+    start, armed, idle = fw.auto_sweep_due(10000, 0, False, False, True, None, False)
+    assert start is False and armed is False and idle is None
+    start, armed, idle = fw.auto_sweep_due(10000, 0, False, False, False, None)
+    assert start is False and idle == 10000
+    if not hasattr(fw.M5, "update"):
+        fw.M5.update = lambda: None
+
+    class _Face(object):
+        def __init__(self):
+            self.n = 0
+            self.dbl = False
+
+        def wasClicked(self):
+            n = self.n
+            self.n = 0
+            return n
+
+        def wasDoubleClicked(self):
+            dbl = self.dbl
+            self.dbl = False
+            return dbl
+
+    singles = []
+    doubles = []
+    face = _Face()
+    watch = fw.ButtonWatch(face, singles.append, doubles.append)
+    face.n = 1
+    assert watch.poll(1000) is True
+    assert singles == [] and doubles == []
+    assert watch.poll(1000 + fw.AUTO_SWEEP_DOUBLE_MS) is False
+    assert singles == [] and doubles == []
+    single_at = 1000 + fw.AUTO_SWEEP_DOUBLE_MS + fw.FRAME_MIN_MS
+    assert watch.poll(single_at) is False
+    assert singles == [single_at] and doubles == []
+    face.n = 1
+    assert watch.poll(2000) is True
+    face.n = 1
+    assert watch.poll(2000 + 200) is True
+    assert singles == [single_at] and doubles == [2200]
+    assert watch.poll(2200 + fw.AUTO_SWEEP_DOUBLE_MS + 1) is False
+    assert len(singles) == 1
+    face.n = 2
+    assert watch.poll(4000) is True
+    assert doubles == [2200, 4000] and len(singles) == 1
+    held = []
+    watch2 = fw.ButtonWatch(face, held.append, doubles.append)
+    face.n = 1
+    watch2.poll(5000)
+    face.n = 1
+    watch2.poll(5000 + fw.AUTO_SWEEP_DOUBLE_MS + 50)
+    assert held == [5000 + fw.AUTO_SWEEP_DOUBLE_MS + 50]
+    watch2.poll(5000 + fw.AUTO_SWEEP_DOUBLE_MS + 50 + fw.AUTO_SWEEP_DOUBLE_MS + 1)
+    assert held == [
+        5000 + fw.AUTO_SWEEP_DOUBLE_MS + 50,
+        5000 + 2 * fw.AUTO_SWEEP_DOUBLE_MS + 51,
+    ]
+    saved = sys.stdout
+    try:
+        buf = io.StringIO()
+        sys.stdout = buf
+        assert fw._auto_sweep_enabled is False
+        fw.toggle_auto_sweep()
+        assert fw._auto_sweep_enabled is True
+        assert buf.getvalue() == "auto-sweep on\n"
+        buf.seek(0)
+        buf.truncate()
+        fw.toggle_auto_sweep()
+        assert fw._auto_sweep_enabled is False
+        assert buf.getvalue() == "auto-sweep off\n"
+    finally:
+        fw._auto_sweep_enabled = False
+        sys.stdout = saved
 
     class _Fr(object):
         duration_ms = 33
@@ -167,14 +240,54 @@ def main():
     sprite.ring_i = 0
     sprite.idle_wait = 0
     sprite.triggering = False
+    assert fw.RING_FPS_MS == 1000 // 30
+    assert fw.FX_FRAME_MS == 1000 // 15
+    sprite.ring_accum = 0
     sprite._step_anim(0.0, 45)
-    assert sprite.anim_i == 1 and sprite.ring_i == 1
-    sprite._step_anim(0.0, 90)
-    assert sprite.anim_i == 2 and sprite.ring_i == 2
+    assert sprite.anim_i == 0 and sprite.anim_accum == 45
+    assert sprite.ring_i == 0 and sprite.ring_accum == 45
+    sprite._step_anim(0.0, 30)
+    assert sprite.anim_i == 1 and sprite.anim_accum == 9
+    assert sprite.ring_i == 1 and sprite.ring_accum == 9
     sprite._step_anim(120.0, 80)
-    assert sprite.anim_tag == "run_fast" and sprite.anim_i == 0
+    assert sprite.anim_tag == "run_fast" and sprite.anim_i == 0 and sprite.anim_accum == 0
+    # The speed-band change resets the character clock, not the ring spin.
+    assert sprite.ring_i == 2 and sprite.ring_accum == 23
     sprite._step_anim(120.0, 80)
-    assert sprite.anim_i == 1 and sprite.ring_i == 4
+    assert sprite.anim_i == 1 and sprite.ring_i == 3 and sprite.ring_accum == 37
+    # Idle trigger still keys off the same wait. The frame rate does not.
+    sprite.pack.cycles["idle_trigger"] = [_Fr(), _Fr(), _Fr()]
+    sprite.anim_tag = "idle"
+    sprite.anim_i = 0
+    sprite.anim_accum = 0
+    sprite.idle_wait = 0
+    sprite.triggering = False
+    waited = 0
+    while waited < fw.IDLE_TRIGGER_AFTER_MS - 50:
+        sprite._step_anim(0.0, 50)
+        waited += 50
+    assert sprite.triggering is False and sprite.anim_tag == "idle"
+    assert sprite.idle_wait == waited
+    sprite._step_anim(0.0, 50)
+    assert sprite.triggering is True and sprite.anim_tag == "idle_trigger"
+    # Stopped is speed < 1, the idle gate. rpm must be above 1200.
+    sprite.pack.cycles["spindash"] = [_Fr(), _Fr(), _Fr(), _Fr()]
+    sprite.pack.cycles["run_slow"] = [_Fr(), _Fr()]
+    sprite.pack.cycles["run_medium"] = [_Fr(), _Fr()]
+    sprite._step_anim(0.0, 16, 1200.0)
+    assert sprite.anim_tag == "idle_trigger" and sprite.triggering is True
+    sprite._step_anim(0.0, 16, 1200.1)
+    assert sprite.anim_tag == "spindash" and sprite.anim_i == 0
+    assert sprite.idle_wait == 0 and sprite.triggering is False
+    sprite._step_anim(0.3, fw.FX_FRAME_MS, 1800.0)
+    assert sprite.anim_tag == "spindash" and sprite.anim_i == 1
+    sprite._step_anim(1.0, 16, 4000.0)
+    assert sprite.anim_tag == "run_slow" and sprite._run_pending is None
+    # A run-band change still waits for the cycle wrap, even at high rpm.
+    sprite._step_anim(50.0, 16, 6000.0)
+    assert sprite.anim_tag == "run_slow" and sprite._run_pending == "run_medium"
+    sprite._step_anim(0.0, 16, 800.0)
+    assert sprite.anim_tag == "idle" and sprite.triggering is False and sprite.idle_wait == 16
     assert fw.anim_dt(40) == 40
     assert fw.anim_dt(50) == 50
     assert fw.anim_dt(134) == fw.REFRESH_MS
@@ -390,9 +503,9 @@ def main():
         fw._mono_us = saved_mono
         clock["dur"] = 0
 
-        # Room for one slice: exactly one call. The next frame is another
-        # single call, not a burst left over from the first. A late frame
-        # and a leftover under the margin skip. Heap counters stay put.
+        # One slice per present, including a late frame. Skipping those
+        # let a drive fill the heap until one alloc stalled into a reset.
+        # A negative spent still skips. Heap counters stay put.
         calls["n"] = 0
         fw._gc_after_present(16000)
         assert calls["n"] == 1 and walks["n"] == 0
@@ -401,9 +514,9 @@ def main():
         fw._gc_after_present(quantum)
         fw._gc_after_present(quantum - need + 1)
         fw._gc_after_present(-5)
-        assert calls["n"] == 2
+        assert calls["n"] == 4
         fw._gc_after_present(quantum - need)
-        assert calls["n"] == 3
+        assert calls["n"] == 5
         n0 = calls["n"]
         n = 0
         while n < 10:
@@ -496,6 +609,85 @@ def main():
     assert fx.phase == "idle", "100 km/h under 5400 rpm does not start the aura"
     fx.tick(20.0, 50, fw.VTEC_ON_RPM)
     assert fx.phase == "run" and fx.aura_i == 0 and fx.initiated
+    assert fx.spark_i < 0
+    seen = [fx.aura_i]
+    guard = 0
+    while len(seen) < 8 and guard < 12:
+        fx.tick(20.0, fw.FX_FRAME_MS, fw.VTEC_ON_RPM)
+        seen.append(fx.aura_i)
+        guard += 1
+    assert seen[:8] == [0, 1, 2, 3, 0, 1, 2, 3], seen
+    assert fx.sw_i < 0 and fx.start_sw_done
+    fast = fw.BoostFX()
+    fast.tick(fw.SPEED_FAST, 20, 0.0)
+    assert fast.phase == "idle" and fast.spark_i == 0
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 1
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 2
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 3
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 4
+    fast.tick(fw.SPEED_FAST, fw.FX_FRAME_MS, 0.0)
+    assert fast.spark_i == 0
+    fast.tick(fw.SPEED_FAST - 1.0, 10, 0.0)
+    assert fast.spark_i < 0
+    assert not hasattr(fw, "AURA_ALPHA")
+    assert fw.BAR_TIP_X == 68 and fw.BAR_TIP_Y == 72
+    assert fw.AURA_TIP_X == 66 and fw.AURA_TIP_Y == 72
+    assert fw.SW_TIP_X == 76
+    assert fw.SPARK_FRONT_X == 22 and fw.SPARK_MID_Y == 88
+    assert fw.FX_FRAME_MS == 1000 // 15
+    assert fw.HOCKEY_ON_DECEL == 5.0 and fw.HOCKEY_OFF_DECEL == 6.0
+    assert fw.BOOT_DY == fw.SONIC_FEET_Y - fw.SONIC_MID_Y
+    assert fw.FLOWER_FRAME == 2
+    assert fw.CHECKER_ROWS == 2
+    assert len(fw.PALMS) == 1 and fw.PALMS[0][0] == 10
+    assert fw.BG_FRAME == 0 and fw.SEA_SHIFT == 0
+    assert "palm_1" not in [name for name, _x in fw.SCENERY_PROPS]
+    assert "prop_fl_2" in [name for name, _x in fw.SCENERY_PROPS]
+    assert "prop_palm" in [name for name, _x in fw.SCENERY_PROPS]
+    assert fw.HOCKEY_MIN_KMH == 25.0
+    assert 150 <= fw.HOCKEY_ARM_MS <= 200
+    assert fw.HOCKEY_FRAMES == 3
+    stop = fw.Sprite(None)
+    stop._spd_prev = 80.0
+    stop._step_hockey(78.0, 100, 1.0)
+    assert stop.hockey is False and stop._hockey_arm == 100
+    stop._step_hockey(76.0, 100, 1.0)
+    assert stop.hockey is True and stop.hockey_i == 0
+    stop._step_hockey(74.0, fw.FX_FRAME_MS, 1.0)
+    assert stop.hockey is True and stop.hockey_i == 1
+    stop._step_hockey(72.0, fw.FX_FRAME_MS, 1.0)
+    stop._step_hockey(70.0, fw.FX_FRAME_MS, 1.0)
+    assert stop.hockey_i == 2
+    stop._step_hockey(68.0, fw.FX_FRAME_MS, 1.0)
+    assert stop.hockey_i == 2
+    stop._step_hockey(67.5, 200, 1.0)
+    assert stop.hockey is False
+    slow = fw.Sprite(None)
+    slow._spd_prev = 30.0
+    slow._step_hockey(20.0, 200, 1.0)
+    assert slow.hockey is False and slow._hockey_arm == 0
+    stop.pack = type("Pack", (), {})()
+    stop.pack.cycles = {
+        "skid": [_Fr(), _Fr(), _Fr()],
+        "run_fast": [_Fr(), _Fr()],
+    }
+    stop.hockey = True
+    stop.hockey_i = 1
+    stop.anim_tag = "run_fast"
+    stop.anim_i = 0
+    stop.anim_accum = 0
+    stop.ring_i = 0
+    stop.idle_wait = 0
+    stop.triggering = False
+    stop._step_anim(70.0, 16)
+    assert stop.anim_tag == "skid" and stop.anim_i == 1
+    stop.pack.cycles["spindash"] = [_Fr(), _Fr()]
+    stop._step_anim(0.0, 16, 2000.0)
+    assert stop.anim_tag == "skid" and stop.anim_i == 1
     fx.tick(20.0, 800, fw.VTEC_OFF_RPM)
     assert fx.phase == "run" and fx.below_ms == 0
     fx.tick(20.0, fw.BOOST_END_MS - 1, fw.VTEC_OFF_RPM - 1)
@@ -527,6 +719,243 @@ def main():
     assert settle["rpm"] < fw.VTEC_OFF_RPM
     assert settle["clt"] == 96.0
     assert sum(stage[0] for stage in fw.Sweep.STAGES) == 9900
+    assert fw.CHAO_LEFT_X >= fw.SONIC_X
+    assert fw.CHAO_BOB_JOIN < fw.CHAO_BOB_HOVER
+    assert fw.CHAO_JOIN_MS >= 2000
+    assert fw.CHAO_DWELL_MS == 5 * 60 * 1000
+    assert fw.CHAO_DRASTIC_KMH == 30.0 and fw.CHAO_DRASTIC_MS == 500
+    assert fw._chao_ease(0.0) == 0.0 and fw._chao_ease(1.0) == 1.0
+    assert abs(fw._chao_ease(0.5) - 0.5) < 1e-6
+    assert fw._chao_ease(0.25) < 0.25
+    parked = fw.Sprite(None)
+    parked.advance(0.0, 500, 800.0, 0.0)
+    assert parked.chao_phase == "off"
+    fast = fw.Sprite(None)
+    fast.advance(80.0, 200, 5000.0, 0.0)
+    assert fast.chao_phase == "off"
+    span = fw.CHAO_LEFT_X - fw.CHAO_OFF_LEFT
+    early = fw.Sprite(None)
+    early.advance(40.0, fw.CHAO_JOIN_MS // 4, 2000.0, 0.0)
+    assert early.chao_phase == "join" and early.chao_face == 1
+    eased_x = fw.CHAO_OFF_LEFT + fw._chao_ease(0.25) * span
+    assert abs(early.chao_x - eased_x) < 1.5
+    assert abs(early.chao_y - fw.CHAO_HEAD_Y) <= fw.CHAO_BOB_JOIN + 0.01
+    pet = fw.Sprite(None)
+    pet.advance(50.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    assert pet.chao_phase == "follow" and pet.chao_type == 0
+    assert pet.chao_side == 0 and int(pet.chao_x) == fw.CHAO_LEFT_X
+    assert pet.chao_face == 1
+    pet.chao_i = 0
+    pet.chao_accum = 0
+    pet.advance(50.0, fw.CHAO_FRAME_MS - 1, 2000.0, 0.0)
+    assert pet.chao_i == 0 and abs(pet.chao_y - fw.CHAO_HEAD_Y) <= fw.CHAO_BOB_HOVER + 0.01
+    pet.advance(50.0, 1, 2000.0, 0.0)
+    assert pet.chao_i == 1 and pet.chao_phase == "follow"
+    soft = fw.Sprite(None)
+    soft.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    soft.advance(50.0, 16, 2000.0, 0.0)
+    assert soft.chao_phase == "follow"
+    jump = fw.Sprite(None)
+    jump.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    jump.advance(70.0, 16, 3000.0, 0.0)
+    assert jump.chao_phase == "leave" and jump.chao_face == 1
+    over = fw.Sprite(None)
+    over.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    over.advance(85.0, 16, 5000.0, 0.0)
+    assert over.chao_phase == "leave" and over.chao_face == 1 and over.chao_exit < 0
+    over.advance(85.0, fw.CHAO_LEAVE_MS, 5000.0, 0.0)
+    assert over.chao_phase == "off"
+    assert over.chao_x <= 0
+    dwell = fw.Sprite(None)
+    dwell.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    dwell.advance(40.0, fw.CHAO_DWELL_MS, 2000.0, 0.0)
+    assert dwell.chao_phase == "leave" and dwell.chao_face == 1
+    side = fw.Sprite(None)
+    side.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    side.advance(40.0, fw.CHAO_SIDE_HOLD_MS, 2000.0, 0.0)
+    assert side.chao_phase == "follow" and side.chao_side_phase == "move"
+    side.advance(40.0, fw.CHAO_SIDE_MS, 2000.0, 0.0)
+    assert side.chao_side == 1 and int(side.chao_x) == fw.CHAO_RIGHT_X
+    assert side.chao_face == 1
+    side.advance(40.0, fw.CHAO_SIDE_HOLD_MS, 2000.0, 0.0)
+    assert side.chao_side_phase == "move"
+    side.advance(40.0, 16, 2000.0, 0.0)
+    assert side.chao_face == 0 and side.chao_x < fw.CHAO_RIGHT_X
+    again = fw.Sprite(None)
+    again.advance(40.0, fw.CHAO_JOIN_MS, 2000.0, 0.0)
+    again.advance(85.0, 16, 5000.0, 0.0)
+    again.advance(85.0, fw.CHAO_LEAVE_MS, 5000.0, 0.0)
+    assert again.chao_phase == "off"
+    again.advance(40.0, 16, 2000.0, 0.0)
+    assert again.chao_phase == "join" and again.chao_type == 1
+
+    class _ChaoFr(object):
+        def __init__(self, name):
+            self.name = name
+            self.w = 17
+            self.h = 21
+            self.origin_x = 8
+            self.origin_y = 11
+
+    class _ChaoPack(object):
+        def __init__(self):
+            self.cycles = {
+                "normal_chao": [_ChaoFr("normal_chao_%d" % i) for i in range(4)],
+            }
+            self.by_name = {}
+
+    drawn = fw.Sprite(_ChaoPack())
+    drawn.chao_phase = "join"
+    drawn.chao_side_phase = "move"
+    drawn.chao_type = 0
+    drawn.chao_i = 1
+    drawn.chao_x = fw.CHAO_LEFT_X
+    drawn.chao_y = fw.CHAO_HEAD_Y
+    drawn.chao_face = 1
+    fr0 = drawn.pack.cycles["normal_chao"][0]
+    fr0.nruns = 1
+    fr0.runs = bytes([0, 0, 0, 4, 1])
+    joined = drawn._chao_stamp()
+    assert joined[0].name == "normal_chao_1"
+    runs, nruns = fw._mirror_runs(fr0)
+    assert nruns == 1 and runs[0] == fr0.w - 4
+    drawn.chao_phase = "follow"
+    drawn.chao_side_phase = "hold"
+    drawn.chao_i = 0
+    drawn.chao_face = 0
+    hovering = drawn._chao_stamp()
+    assert hovering[0].name == "normal_chao_2"
+    assert hovering[2] == fw.CHAO_HEAD_Y - 11
+    raw = open(os.path.join(ROOT, "pixidx.bin"), "rb").read()
+    opack = fw.PixIdx(raw)
+    for _name in (
+        "fx_spark_0", "fx_bar_0", "fx_aura_0", "fx_boot_0",
+        "gnd_grass", "gnd_check", "gnd_floor", "prop_palm", "prop_fl_2", "fx_spark_4",
+        "spindash_0", "spindash_7", "skid_0",
+    ):
+        assert _name in opack.by_name, _name
+    assert len(opack.cycles.get("spindash") or []) == 8
+    for _gone in ("ground", "palm_0", "palm_1", "island_0", "bush_0", "flowers_0", "tiny_flowers_0", "gh_bg_0", "hockey_0", "look_0"):
+        assert _gone not in opack.by_name, _gone
+    far = opack.by_name["far_bg"]
+    mid = opack.by_name["mid_bg"]
+    assert far.w == 256 and far.h == fw.HORIZON_Y
+    assert mid.w == 256 and far.h + mid.h == 128
+    assert opack.by_name["fx_spark_4"].w > 8
+    assert len(raw) == fw.PIXIDX_SIZE
+    obuf, otw, oth = fw.prerender_sea_rgb565(opack)
+    fw.repair_ocean_tile(obuf, otw, oth)
+    sky = fw._rgb888_to_565(fw.SKY_BLUE_888)
+    cap = fw._rgb888_to_565(fw.SKY_CAP_BLUE_888)
+    y = 0
+    while y < fw.SKY_CAP_ROWS:
+        i = (y * otw) * 2
+        assert obuf[i] == (sky & 0xFF) and obuf[i + 1] == ((sky >> 8) & 0xFF)
+        y += 1
+    sea = fw._rgb888_to_565(fw.SEA_BLUE_888)
+    stamps = fw.build_parallax_layers(obuf, otw, oth)
+    y = fw.HORIZON_Y
+    while y < fw.HORIZON_Y + 4:
+        x = 0
+        while x < otw:
+            i = (y * otw + x) * 2
+            c = obuf[i] | (obuf[i + 1] << 8)
+            assert c == sea
+            x += 1
+        y += 1
+    # No foliage left in the water, and the grass join is not a tear.
+    foliage = 0
+    y = fw.HORIZON_Y
+    while y < fw.GRASS_Y:
+        x = 0
+        while x < otw:
+            c = fw._rgb565_to_888(fw._565_at(obuf, otw, x, y))
+            if not fw._is_backdrop_888(c):
+                foliage += 1
+            x += 1
+        y += 1
+    assert foliage == 0
+    # The dark strip is one 8px block. The checker starts on the next row
+    # and shares those edges, so it repeats every 16px and is not one shade.
+    ground = bytearray(obuf)
+    fw._install_sheet_backdrop(ground, otw, oth, opack)
+    sy = fw.GRASS_Y + fw.BLADE_ROWS + 7
+    cell = 8
+    tmpl = bytes(ground[(sy * otw) * 2:(sy * otw + cell) * 2])
+    x = 0
+    while x < otw:
+        got = bytes(ground[(sy * otw + x) * 2:(sy * otw + x + cell) * 2])
+        assert got == tmpl
+        x += cell
+    cy = sy + 1
+    left = bytes(ground[(cy * otw) * 2:(cy * otw + cell) * 2])
+    right = bytes(ground[(cy * otw + cell) * 2:(cy * otw + cell * 2) * 2])
+    assert left != right
+    # The sea picture's own waves step by about this much between columns.
+    assert fw._band_diff(obuf, otw, 127, 128, fw.HORIZON_Y + 4, fw.GRASS_Y) <= 32
+    # The packed ocean is the sea picture, so there is no hill loop to lift.
+    wide = 0
+    for st in stamps:
+        stamp_w, stamp_h = st[3], st[4]
+        # Trees were narrow and tall. A wrapped hill may leave a short sliver.
+        assert not (stamp_w <= 28 and stamp_h >= 40)
+        if stamp_w >= 40 and stamp_h >= 20:
+            wide += 1
+            mask = st[6]
+            # The palm used to occupy the right edge. Those columns are clear.
+            x = stamp_w - 1
+            empty = 0
+            while x >= 0:
+                y = 0
+                hit = False
+                while y < stamp_h:
+                    di = y * stamp_w + x
+                    if mask[di >> 3] & (1 << (di & 7)):
+                        hit = True
+                        break
+                    y += 1
+                if hit:
+                    break
+                empty += 1
+                x -= 1
+            assert empty >= 3, (stamp_w, empty)
+            mid = stamp_w // 2
+            body = 0
+            y = 0
+            while y < stamp_h:
+                di = y * stamp_w + mid
+                if mask[di >> 3] & (1 << (di & 7)):
+                    body += 1
+                y += 1
+            assert body >= 8
+    if stamps:
+        assert wide >= 1
+    sea_top = fw.HORIZON_Y + 4
+    sea_scores = fw._sea_boundary(obuf, otw, sea_top, fw.GRASS_Y)
+    # The source loop puts an island on the seam, so that column is busier
+    # than open water. A torn sea still scores much higher.
+    assert sea_scores[otw - 1] < 500, sea_scores[otw - 1]
+    assert max(sea_scores) < 800, max(sea_scores)
+
+    class _Rects(object):
+        def __init__(self):
+            self.calls = []
+
+        def fillRect(self, x, y, w, h, color):
+            self.calls.append((x, y, w, h))
+
+    rects = _Rects()
+    fw.fill_rect_clip(rects, -2, 10, 6, 6, 1)
+    assert rects.calls == [(0, 10, 4, 6)]
+    # A loop whose center has crossed the right edge still has its left half
+    # on screen. The old wrap treated that center as a left edge and dropped it.
+    sp = fw.Sprite(None)
+    half = fw.LOOP_RO + 6
+    centers = list(sp._wrapped_center(fw.LOOP_X, half, fw.LOOP_X - fw.W))
+    assert fw.W in centers, centers
+    assert any((c - half) < fw.W and (c + half) > fw.W for c in centers)
+    gone = list(sp._wrapped_center(fw.LOOP_X, half, fw.LOOP_X - (fw.W + half)))
+    assert gone == [], gone
 
     sw.start(0)
     fx = fw.BoostFX()
@@ -594,6 +1023,7 @@ def main():
     assert splash_mark.W == 128 and splash_mark.H == 128
     assert len(splash_mark.BITS) == 2048
     assert splash_mark.white_count() == 2512
+    assert splash_mark.DRAW_Y == -5
     png = open(os.path.join(ROOT, "splash_128.png"), "rb").read()
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     import struct
@@ -758,6 +1188,248 @@ def main():
     assert sp.sparkles == []
     assert fw._BRK_PRINT_MS == 2000
 
+    assert fw.OTA_ENABLED is False
+
+    class _CanBus(object):
+        def __init__(self, frames, sticky=False, state=6, none_fill=False, list_exc=None):
+            self.frames = frames
+            self.i = 0
+            self.sticky = sticky
+            self._state = state
+            self.none_fill = none_fill
+            self.list_exc = list_exc
+            self.timeouts = []
+            self.shapes = []
+            self.restarts = 0
+
+        def any(self, fifo=0):
+            return self.sticky or self.i < len(self.frames)
+
+        def state(self):
+            return self._state
+
+        def restart(self):
+            self.restarts += 1
+            self._state = 6
+
+        def recv(self, fifo, lst=None, timeout=5000):
+            # A bare recv() has no timeout argument. Every call here passed one.
+            self.timeouts.append(timeout)
+            self.shapes.append("list" if lst is not None else "tuple")
+            if timeout != 0:
+                raise AssertionError(timeout)
+            if lst is not None and self.list_exc is not None:
+                raise self.list_exc
+            if self.i >= len(self.frames):
+                return None
+            src = self.frames[self.i]
+            self.i += 1
+            if lst is None:
+                return src
+            lst[0] = src[0]
+            raw = src[4]
+            view = lst[4]
+            if hasattr(view, "n"):
+                view.n = len(raw)
+            j = 0
+            while j < len(raw) and j < len(view):
+                view[j] = raw[j]
+                j += 1
+            if self.none_fill:
+                return None
+            return lst
+
+    class _DLC(object):
+        """Byte view whose visible length follows the last DLC, like m5can."""
+
+        def __init__(self):
+            self.b = bytearray(8)
+            self.n = 8
+
+        def __len__(self):
+            return self.n
+
+        def __getitem__(self, i):
+            if i < 0 or i >= self.n:
+                raise IndexError(i)
+            return self.b[i]
+
+        def __setitem__(self, i, v):
+            if i < 0 or i >= self.n:
+                raise IndexError(i)
+            self.b[i] = v
+
+    read_src = inspect.getsource(fw._can_read)
+    assert "bus.recv()" not in read_src
+    assert "timeout=0" in read_src
+    assert "bus.recv()" not in inspect.getsource(fw.pull_frames)
+
+    # 0x03E8 = 1000 -> 10.00 km/h. Brake bit is data[4] of 0x17C.
+    speed = (0x158, False, False, 0, bytes((0x03, 0xE8, 0, 0, 0, 0, 0, 0)))
+    rpm = (0x17C, False, False, 0, bytes((0, 0, 0x0B, 0xB8, 0x01, 0, 0, 0)))
+    values = {}
+    fw._can_stick_until = None
+    fw._can_restart_ms = None
+    bus = _CanBus([speed, rpm])
+    assert fw.pull_frames(bus, values, 1000) == 2
+    assert values["spd"] == 10.0
+    assert values["rpm"] == 3000.0
+    assert values["brk"] == 1.0
+    assert bus.timeouts == [0, 0]
+    assert bus.shapes == ["list", "list"]
+    assert bus.restarts == 0
+    fw._can_stick_until = None
+    fw._can_restart_ms = None
+    flooded = _CanBus([speed] * 80, sticky=True)
+    assert fw.pull_frames(flooded, values, 2000) == 64
+    assert flooded.timeouts == [0] * 64
+    assert flooded.shapes == ["list"] * 64
+    fw._can_stick_until = None
+    dead = _CanBus([], sticky=True)
+    assert fw.pull_frames(dead, values, 3000) == 0
+    assert dead.shapes == ["list", "tuple"]
+    assert dead.timeouts == [0, 0]
+    assert fw.pull_frames(dead, values, 3000) == 0
+    assert dead.shapes == ["list", "tuple"]
+    fw._can_stick_until = None
+    # In-place fill that returns None is a frame. It must not black out.
+    filled = _CanBus([speed, rpm], none_fill=True)
+    assert fw.pull_frames(filled, values, 5000) == 2
+    assert values["spd"] == 10.0 and values["rpm"] == 3000.0 and values["brk"] == 1.0
+    assert filled.shapes == ["list", "list"]
+    filled.frames.append(speed)
+    assert fw.pull_frames(filled, values, 5100) == 1
+    assert filled.shapes == ["list", "list", "list"]
+    fw._can_stick_until = None
+    fw._CAN_TEL["err"] = 0
+    raised = _CanBus([speed, rpm], list_exc=ValueError("list"))
+    assert fw.pull_frames(raised, values, 6000) == 2
+    assert raised.shapes == ["list", "tuple", "list", "tuple"]
+    assert raised.timeouts == [0, 0, 0, 0]
+    assert values["spd"] == 10.0
+    assert fw._CAN_TEL["err"] == 2
+    fw._can_stick_until = None
+    saved_view = fw._CAN_FRAME[4]
+    fw._CAN_FRAME[4] = _DLC()
+    try:
+        # 100 C raw -> 60 C. A 1-byte frame used to shrink the view and the
+        # next clear walked off the end, so the drain never returned.
+        coolant = (0x324, False, False, 0, bytes((100,)))
+        short = _CanBus([coolant, speed])
+        assert fw.pull_frames(short, values, 7000) == 2
+        assert values["clt"] == 60.0
+        assert values["spd"] == 10.0
+        assert fw._CAN_FRAME[4].n == len(speed[4])
+    finally:
+        fw._CAN_FRAME[4] = saved_view
+    fw._can_stick_until = None
+    fw._can_restart_ms = None
+    off = _CanBus([], state=4)
+    assert fw.pull_frames(off, values, 4000) == 0
+    assert off.restarts == 1
+    assert fw.pull_frames(off, values, 4200) == 0
+    assert off.restarts == 1
+    class _RingPack(object):
+        by_name = {}
+        cycles = {}
+
+    touched = fw.Sprite(_RingPack())
+    touched.scroll = fw.FIELD_RING_X[0] - fw.SONIC_FRONT_X
+    touched._collect_rings()
+    assert touched.rings == 1
+    assert touched._ring_taken(0)
+    touched._collect_rings()
+    assert touched.rings == 1
+    touched.scroll += fw.RING_PERIOD // 2
+    touched._collect_rings()
+    assert touched.rings == 1
+    assert touched._ring_taken(0)
+    assert (fw.FIELD_RING_X[0] - int(touched.scroll - fw.RING_PERIOD // 2)) not in touched._field_ring_xs(int(touched.scroll))
+    waiting = fw.Sprite(_RingPack())
+    waiting.scroll = 0
+    waiting._collect_rings()
+    assert waiting._ring_taken(0) is False
+    import shutil
+    import tempfile
+    ring_dir = tempfile.mkdtemp()
+    saved_base = fw.RING_COUNT_BASE
+    fw.RING_COUNT_BASE = os.path.join(ring_dir, "ring_count")
+    try:
+        assert fw.ring_count_load() == (0, 0, -1)
+        fw.ring_count_store(256, 1, 0)
+        assert fw.ring_count_load() == (256, 1, 0)
+        # A hard power-off after the temp write, before the rename, keeps 256.
+        open(fw.RING_COUNT_BASE + ".1.tmp", "wb").write(b"2 300\n")
+        assert fw.ring_count_load() == (256, 1, 0)
+        # A torn slot is ignored. The finished slot remains.
+        open(fw.RING_COUNT_BASE + ".1", "wb").write(b"2 30")
+        assert fw.ring_count_load() == (256, 1, 0)
+        fw.ring_count_store(300, 2, 1)
+        assert fw.ring_count_load() == (300, 2, 1)
+        kept = fw.Sprite(_RingPack())
+        assert kept.rings == 300
+        assert kept._ring_seen == 0 and kept._ring_got == 0
+        kept.scroll = fw.FIELD_RING_X[0] - fw.SONIC_FRONT_X
+        kept._collect_rings()
+        assert kept.rings == 301 and kept._ring_dirty is True
+        assert kept._ring_seen != 0
+        # Collect marks the count dirty and does not touch flash.
+        assert fw.ring_count_load() == (300, 2, 1)
+        assert kept.save_rings(1000) is True
+        assert open(fw.RING_COUNT_BASE + ".0", "rb").read() == b"3 301\n"
+        assert b"seen" not in open(fw.RING_COUNT_BASE + ".0", "rb").read()
+        assert kept._ring_dirty is False
+        kept._ring_dirty = True
+        assert kept.save_rings(1000 + 100) is False
+        assert kept.save_rings(1000 + fw.RING_SAVE_MS) is True
+        assert fw.ring_count_load()[0] == 301
+        again = fw.Sprite(_RingPack())
+        assert again.rings == 301 and again._ring_seen == 0 and again._ring_got == 0
+        calls = {"n": 0}
+
+        def _boom(*_a, **_k):
+            calls["n"] += 1
+            raise OSError("full")
+
+        saved_store = fw.ring_count_store
+        fw.ring_count_store = _boom
+        try:
+            again._ring_dirty = True
+            again._ring_save_ms = None
+            assert again.save_rings(50000) is False
+            assert again._ring_dirty is True
+            assert again.save_rings(50000 + 10) is False
+            assert calls["n"] == 1
+            assert again.save_rings(50000 + fw.RING_SAVE_MS) is False
+            assert calls["n"] == 2
+        finally:
+            fw.ring_count_store = saved_store
+    finally:
+        fw.RING_COUNT_BASE = saved_base
+        shutil.rmtree(ring_dir)
+    import gc as _gc
+    _gc_calls = {"n": 0}
+    _saved_collect = _gc.collect
+
+    def _count_collect(*_a, **_k):
+        _gc_calls["n"] += 1
+        return 0
+
+    _gc.collect = _count_collect
+    try:
+        assert fw._gc_make_room() is True
+        assert _gc_calls["n"] >= 1
+    finally:
+        _gc.collect = _saved_collect
+    assert fw.FLASH_PREAMBLE == b"ATOMFLASH\n"
+    assert fw.FLASH_ACK == "flash-quiet"
+    assert fw._SERIAL_QUIET is False
+    saved_out = sys.stdout
+    fw._accept_flash_preamble(b"xxATOMFLASH\n")
+    assert fw._SERIAL_QUIET is True
+    assert fw._stdout_can_write() is False
+    sys.stdout = saved_out
+    fw._SERIAL_QUIET = False
     print("quiet frame ok", "rpm fill", fill0, "dot", hex(want), "stall px", stepped, "vtec", int(peak_rpm))
 
 

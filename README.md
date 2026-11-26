@@ -103,8 +103,10 @@ it, a `brk` line lists average/max milliseconds for each other call
 in the loop (`sleep`, `m5`, `sonic`, `push`, and the rest) plus `left`
 for time that no call named. A late
 frame slips that deadline instead of queueing
-another present. Rings and Sonic advance one frame per present;
-leftover time is not spent on a second step. Scroll still uses the
+another present. Sonic and the world-ring spin step at the 15 fps
+FX clock, so a faster refresh does not play them twice as fast.
+Leftover time is not spent on a second
+step. Scroll still uses the
 measured gap, capped at 50 ms. Off-vehicle, with no live CAN, the bench
 sweep starts 10 s after the first present and again after 20 s of rest
 (`auto-sweep` on the serial line). A face-button press still starts it.

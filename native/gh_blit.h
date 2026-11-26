@@ -20,6 +20,13 @@ void gh_copy_rows(const uint8_t *tile, int tw,
                   int y0, int y1, int off,
                   uint8_t *out, int vw, int out_y);
 
+/* Sky, sea, ground. sea_dy > 0 draws the sea band that many pixels higher.
+   0 matches three plain gh_copy_rows calls. */
+void gh_compose_bands(const uint8_t *tile, int tw, int th,
+                      int off_c, int off_w, int off_g,
+                      int horizon, int grass, int sea_dy,
+                      uint8_t *out, int vw);
+
 void gh_blit_stamp(uint8_t *window, int vw, int vh, int tw,
                    const uint8_t *sbuf, const uint8_t *mask,
                    int sw, int sh, int ox, int oy, int off);
@@ -34,6 +41,11 @@ void gh_stamp_runs(uint8_t *window, int vw, int vh,
                    const uint8_t *runs, int nruns,
                    const uint8_t *pairs, int ncolors,
                    int dest_x, int dest_y);
+
+/* Saturating add for the packed boost sprites. One sprite claims each
+   pixel once. Call end before the next sprite so they stack. */
+void gh_add_begin(int vw, int vh);
+void gh_add_end(void);
 
 /* Opaque spans in a scenery stamp: 4 bytes each, x u16 LE, y u8, len u8.
    Colors are copied from sbuf. Same wrap candidates as gh_blit_stamp. */
@@ -57,10 +69,13 @@ void gh_fill_triangle(uint8_t *buf, int vw, int vh,
                       int x0, int y0, int x1, int y1, int x2, int y2,
                       uint16_t c565);
 
-/* aura_i / sw_i / bar_i < 0 skips that layer. Order is aura, shockwave, barrier. */
+/* aura_i / sw_i / bar_i / spark_i < 0 skips that layer.
+   Order is aura, shockwave, barrier, sparks. Each layer is saturating
+   RGB565 add over the pixels already in buf (Sonic included). */
 void gh_fx(uint8_t *buf, int vw, int vh,
-           int aura_i, int sw_i, int bar_i,
-           int aura_x, int aura_y, int sw_x);
+           int aura_i, int sw_i, int bar_i, int spark_i,
+           int aura_x, int aura_y, int sw_x, int bar_x,
+           int spark_x, int spark_y);
 
 void gh_draw_digit(uint8_t *buf, int vw, int vh,
                    int x, int y, int n,

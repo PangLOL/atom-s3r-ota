@@ -32,7 +32,6 @@ static mp_obj_t gh_compose(size_t n_args, const mp_obj_t *args) {
     mp_obj_t *offs = NULL;
     int tw, th, vw, off_c, off_w, off_g, horizon, grass;
     size_t i;
-    (void)n_args;
     need_buf(args[0], &tile, 0);
     tw = arg_int(args[1]);
     th = arg_int(args[2]);
@@ -62,9 +61,14 @@ static mp_obj_t gh_compose(size_t n_args, const mp_obj_t *args) {
     }
     need_len(&tile, (size_t)tw * (size_t)th * 2);
     need_len(&win, (size_t)vw * (size_t)th * 2);
-    gh_copy_rows(tile.buf, tw, 0, horizon, off_c, win.buf, vw, 0);
-    gh_copy_rows(tile.buf, tw, horizon, grass, off_w, win.buf, vw, horizon);
-    gh_copy_rows(tile.buf, tw, grass, th, off_g, win.buf, vw, grass);
+    {
+        int sea_dy = 0;
+        if (n_args >= 12) {
+            sea_dy = arg_int(args[11]);
+        }
+        gh_compose_bands(tile.buf, tw, th, off_c, off_w, off_g,
+                         horizon, grass, sea_dy, win.buf, vw);
+    }
     for (i = 0; i < nstamp; i++) {
         size_t len = 0;
         mp_obj_t *item = NULL;
@@ -85,7 +89,7 @@ static mp_obj_t gh_compose(size_t n_args, const mp_obj_t *args) {
     }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_compose_obj, 11, 11, gh_compose);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_compose_obj, 11, 12, gh_compose);
 
 static mp_obj_t gh_copy(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t tile, win;
@@ -148,17 +152,38 @@ static mp_obj_t gh_fx_fn(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t win;
     int vw = arg_int(args[1]);
     int vh = arg_int(args[2]);
+    int spark_i;
+    int aura_x, aura_y, sw_x, bar_x, spark_x, spark_y;
     (void)n_args;
     need_buf(args[0], &win, 1);
+    aura_x = arg_int(args[6]);
+    aura_y = arg_int(args[7]);
+    sw_x = arg_int(args[8]);
+    spark_i = -1;
+    bar_x = sw_x;
+    spark_x = 22;
+    spark_y = 88;
+    if (n_args >= 10) {
+        spark_i = arg_int(args[9]);
+    }
+    if (n_args >= 11) {
+        bar_x = arg_int(args[10]);
+    }
+    if (n_args >= 12) {
+        spark_x = arg_int(args[11]);
+    }
+    if (n_args >= 13) {
+        spark_y = arg_int(args[12]);
+    }
     if (vw > 0 && vh > 0) {
         need_len(&win, (size_t)vw * (size_t)vh * 2);
         gh_fx(win.buf, vw, vh,
-              arg_int(args[3]), arg_int(args[4]), arg_int(args[5]),
-              arg_int(args[6]), arg_int(args[7]), arg_int(args[8]));
+              arg_int(args[3]), arg_int(args[4]), arg_int(args[5]), spark_i,
+              aura_x, aura_y, sw_x, bar_x, spark_x, spark_y);
     }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_fx_obj, 9, 9, gh_fx_fn);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_fx_obj, 9, 13, gh_fx_fn);
 
 static mp_obj_t gh_digits(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t win;

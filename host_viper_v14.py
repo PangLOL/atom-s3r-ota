@@ -54,8 +54,7 @@ def main():
     raw = f.read()
     f.close()
     pack = fw.PixIdx(raw)
-    ocean = pack.by_name["ocean"]
-    tile, tw, th = fw.prerender_ocean_rgb565(pack, ocean)
+    tile, tw, th = fw.prerender_sea_rgb565(pack)
     stamps = fw.build_parallax_layers(tile, tw, th)
     print("stamps", len(stamps))
     bad = 0

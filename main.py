@@ -2,10 +2,11 @@
 
 V15: the V14 packed picture, composited so a scroll does not restamp
 sprites that did not change. Same pre-scaled PIX6 art (Sonic 39x36,
-playfield 128x103, rings 14x14). pixidx.bin is unchanged. At pack load the
-384x103 ocean tile is pre-rendered into an RGB565 buffer and split into
-parallax layers: sky/clouds at 0.25, water and islands at 0.6, ground and
-near palms at 1.0. The packed art has no mountain band, so 0.4 is unused.
+playfield 128x103, rings 14x14). The four reference sheets are packed
+into pixidx.bin. At pack load the
+256-wide sea is pre-rendered into an RGB565 buffer and split into
+parallax layers: far_bg (sky and the distant islands) at 0.25, mid_bg
+(the water) at 0.6, ground and near palms at 1.0.
 Scenery stamps (loop island, palms, bushes) blit through the same kind of
 viper loop Sonic and the HUD already use. A viper self-test failure stays
 on the V12 Python blit, so the pixels do not change. That self-test runs
@@ -32,9 +33,21 @@ The OTA client stays, on its existing schedule; its HTTP fetch cannot
 block forever. A machine.WDT is armed after the first heavy alloc, fed
 from the loop, and not used as a routine reboot. This file is version 15.
 It is not the published Pages payload.
-Chao, official mouths, and boost FX rips are not packed. Aura / shockwave /
-barrier still use V2 primitives, layered on top of Sonic at tip (66, 72),
-alpha 178. FACE_ENABLED stays off.
+The boost sheets are not packed. Sparks, the sound barrier, the aura,
+and the boot initiate stay procedural. The boot row is the top half
+only, so that half is flipped across the shoes. The sea stays on its
+first frame.
+The brake plays the three skid frames. They face right, with the smoke from the old hockey row.
+Stopped (speed under 1 km/h, the same gate as idle) with rpm above 1200
+plays the packed spindash cycle. At 1200 rpm or below, idle is unchanged.
+The HUD ring count is kept in ring_count.0 and ring_count.1. A hard
+power-off keeps the last slot that finished. The scroll masks are not saved.
+Chao cycles are normal_chao, amy_chao, knuckles_chao, sonic_chao, and
+tails_chao. Frames 0 and 1 join, switch sides, and leave. Frames 2 and 3
+hover at Sonic's head. One Chao, at 2 fps, for up to five minutes.
+Aura, shockwave, sound barrier, and full-speed sparks stay in the draw
+path. BOOST_VFX is False, so none of them are drawn. Flip it to True
+to show them again. FACE_ENABLED stays off.
 Companion asset pixidx.bin is fetched from the OTA host if missing, stale, or
 the wrong size / geometry (a leftover V6 pack must not be used).
 
@@ -72,6 +85,8 @@ sweat droplets are not drawn.
 """
 
 import math
+import os
+import sys
 import time
 
 import M5
@@ -142,6 +157,9 @@ INF_SPEED = 80.0
 SWEAT_CLT = 90.0
 APP_VERSION = 16
 APP_VERSION_NAME = "2026.11.21-v16"
+# Network updates stay off until this build is declared OTA-ready.
+# Flip this to True only then. USB flashing on COM6 does not use it.
+OTA_ENABLED = False
 # Long enough that a main.py / pixidx write is not reset, short enough that
 # a stuck idle loop comes back without a power cycle. Not a routine reboot.
 WDT_TIMEOUT_MS = 30000
@@ -164,10 +182,23 @@ BOOST_END_MS = 2000
 VTEC_ON_RPM = 5400.0
 VTEC_OFF_RPM = 5100.0
 FX_FRAME_MS = 1000 // 15  # 15 fps, same as S3Vec run_fast
+# Hockey stop. Brake bit plus a hard decel, then a 3-frame pose.
+# Enter only while brk is held, decel stays at or above 5 km/h per
+# second, and speed is still above 25 km/h, for HOCKEY_ARM_MS. Leave
+# when the brake releases or decel falls under 6. The three skid
+# frames face right.
+HOCKEY_MIN_KMH = 25.0
+HOCKEY_ON_DECEL = 5.0
+HOCKEY_OFF_DECEL = 6.0
+HOCKEY_ARM_MS = 180
+HOCKEY_FRAMES = 3
 SONIC_MID_Y = 72
 AURA_TIP_X = 66
 SW_TIP_X = 76
 FACE_ENABLED = False      # sheet has no face / mouth layer; stay off
+# Additive aura, shockwave, sound barrier, and sparks. Off for now:
+# the saturating blend is too much on the Atom. Flip to True to draw.
+BOOST_VFX = False
 
 W, H = 128, 128
 GAUGE_H = H // 5
@@ -265,6 +296,11 @@ WATER_Y = 54
 WATER_H = 12
 GRASS_H = 7
 TILE = 6
+# Two checker rows under the grass. A taller dirt band repeats that pair.
+CHECKER_ROWS = 2
+# The sea sheet has more frames. This board keeps the first one.
+BG_FRAME = 0
+SEA_SHIFT = 0
 
 # x, y, rx, ry
 CLOUDS = (
@@ -293,17 +329,16 @@ HILLS = (
     (82, 22, 10),
     (128, 14, 7),
 )
-# x, height
+# x, height. The first tree only. The loose coconut is not drawn.
 PALMS = (
     (10, 26),
-    (46, 18),
-    (98, 22),
-    (168, 28),
 )
 LOOP_X = 148
 LOOP_RO = 20
 LOOP_RI = 12
-# x, color
+# x, color. Tiny flowers have three poses. The stage holds the third.
+FLOWER_FRAME = 2
+_FLOWER_WH = ((1, 1), (2, 1), (2, 2))
 FLOWERS = (
     (18, 0xE04040),
     (24, 0xF0D030),
@@ -458,19 +493,19 @@ def find_btn():
 # MicroPython import budget (V2 main.py is already 44 KB).
 
 PIXIDX_NAME = "pixidx.bin"
-PIXIDX_SHA256 = "f33a0418a01743d405be8cee372a3ad0b8c3d72efbc8e2f0f95720468cb2c1c0"
-PIXIDX_SIZE = 216653
+PIXIDX_SHA256 = "a90307a2dc2a0264b9a43f737f6b9ea1d4d2d60c407e889abffe95c694474e15"
+PIXIDX_SIZE = 381230
 PIXIDX_URL = "https://panglol.github.io/atom-s3r-ota/pixidx.bin"
 PIXIDX_FETCH_EVERY_MS = 90000
 PIX6_MAGIC = b"PIX6"
 
 SPEED_SLOW = 40.0
 SPEED_FAST = 80.0
+_RUN_TAGS = ("run_slow", "run_medium", "run_fast")
 IDLE_TRIGGER_AFTER_MS = 3500
 
-# Locked after-preview layout (128x128). Sonic sprite is 39x36 at top-left
-# (16, 55). Frames use a feet-centre origin, so the blit dest is the exclusive
-# bottom of that box: (35, 91). Feet plant on y 90. Playfield is y 0-102.
+# Sonic is 39x36. Feet plant on the grass top. The gauge still paints
+# over y 103-127 until it is toggled off.
 SONIC_X = 16
 SONIC_Y = 55
 SONIC_W = 39
@@ -478,22 +513,71 @@ SONIC_H = 36
 SONIC_FEET_Y = 90
 SONIC_HEAD_Y = 63
 SONIC_FRONT_X = 54
+# One Chao at a time, cruise only (moving, and under 80 km/h). The pack
+# has four frames per type. 0 and 1 are the side-view chase pair used to
+# join from behind and leave forward. 2 and 3 are the front hover pair.
+# The sheet has no frames 4-7.
+CHAO_TYPES = (
+    "normal_chao",
+    "amy_chao",
+    "knuckles_chao",
+    "sonic_chao",
+    "tails_chao",
+)
+CHAO_MOVE = (0, 1)
+CHAO_HOVER = (2, 3)
+CHAO_FRAME_MS = 500  # 2 fps
+# Approach is long enough to see the chase pair. Leave is shorter.
+CHAO_JOIN_MS = 2600
+CHAO_LEAVE_MS = 1600
+CHAO_SIDE_HOLD_MS = 4500
+CHAO_SIDE_MS = 1400
+CHAO_DWELL_MS = 5 * 60 * 1000
+# 30 km/h inside 500 ms is a kickdown or a hard brake, not cruise noise.
+CHAO_DRASTIC_KMH = 30.0
+CHAO_DRASTIC_MS = 500
+CHAO_BOB_JOIN = 3
+CHAO_BOB_HOVER = 8
+CHAO_BOB_PERIOD_MS = 2400
+# Packed art faces right. Mirror when traveling left.
+# Body centre. Close enough that the right-facing hover sits against Sonic.
+CHAO_LEFT_X = SONIC_X + 2
+CHAO_RIGHT_X = SONIC_X + SONIC_W + 8
+CHAO_HEAD_Y = SONIC_HEAD_Y
+CHAO_OFF_LEFT = -20
+CHAO_OFF_RIGHT = W + 20
 SONIC_FEET_DEST_X = SONIC_X + SONIC_W // 2  # 35
 SONIC_FEET_DEST_Y = SONIC_Y + SONIC_H       # 91
+# Shoe line minus the aura tip. The boot initiate is centered here.
+BOOT_DY = SONIC_FEET_Y - SONIC_MID_Y        # 18
 AURA_TIP_Y = SONIC_MID_Y  # 72
-AURA_ALPHA = 178
+BAR_TIP_X = 68            # 8 px left of the shockwave tip
+BAR_TIP_Y = SONIC_MID_Y   # 72
+SPARK_FRONT_X = 22
+SPARK_MID_Y = 88
+SPARK_FRAMES = 5
 HUD_RING_POS = (4, 3)
 HUD_BAR_POS = (14, 6)
+# One sprite replaces the separate ring and bar. Digits still anchor on the bar.
+HUD_GAUGE_POS = (4, 2)
 GROUND_SURFACE_IN_TILE = 0  # unused; feet dest is locked, backdrop includes ground
-PROP_PERIOD = 384   # 384x103 backdrop width
+PROP_PERIOD = 256   # sea source width; the tile loops when the islands meet
 # V2 fallback ratios, applied to bands split from the prerendered ocean.
 PARALLAX_CLOUDS = 0.25
-PARALLAX_MOUNTAINS = 0.4  # packed art has no mountain band
+PARALLAX_MOUNTAINS = 0.4  # far_bg keeps the islands with the sky
 PARALLAX_WATER = 0.6
 PARALLAX_GROUND = 1.0
-HORIZON_Y = 32   # sky/clouds above; water and the horizon line from here
-GRASS_Y = 88     # near ground (grass, dirt, planted palms) from here
+# far_bg is everything above the line where the distant islands meet the sea.
+HORIZON_Y = 53
+# Grass blades, then the dark strip and the checker as one sprite.
+GRASS_Y = 88
+BLADE_ROWS = 16
 RING_PERIOD = 1536  # long gaps between groups of 3-8
+# HUD total only. Two slots: a hard power-off during one write leaves the
+# other. A flash sync at 1 Hz hitches, so a changed count is written after
+# the present, and at most once per RING_SAVE_MS. The scroll masks stay RAM.
+RING_COUNT_BASE = "ring_count"
+RING_SAVE_MS = 10000
 RING_FPS_MS = 1000 // 30  # 33
 
 # World-x of mid-ground ring centres. First group matches the after still
@@ -504,14 +588,14 @@ _RING_PLACE_KEYS = tuple("r%d" % i for i in range(len(FIELD_RING_X)))
 _SPARK_PLACE_KEYS = tuple("k%d" % i for i in range(12))
 FIELD_RING_Y = 78
 
-# Scenery is baked into the 384x103 backdrop. These are kept as a fallback
-# only if a pack has no ocean frame (should not happen in V7).
+# Scenery is baked into the 256x128 backdrop. These names are the
+# fallback if a pack has no ocean frame. The isolated palm, and the
+# third tiny-flower frame. The old ground, palms, island, bush, and
+# flower strips are not in the pack.
 SCENERY_PROPS = (
-    ("palm_0", 5),
-    ("island_0", 65),
-    ("palm_1", 114),
-    ("bush_0", 0),
-    ("flowers_0", 102),
+    ("prop_palm", 5),
+    ("prop_sun", 65),
+    ("prop_fl_2", 102),
 )
 
 
@@ -694,7 +778,7 @@ class PixIdx:
         return self.palettes[pal_id]
 
 
-def blit_frame(lcd, pack, frame, dest_x, dest_y, pal, clip_t=0, clip_b=103, use_origin=True):
+def blit_frame(lcd, pack, frame, dest_x, dest_y, pal, clip_t=0, clip_b=103, use_origin=True, flip=False):
     """Interpreter: walk packed indices, skip 0, fillRect horizontal spans. V2 Lcd path."""
     if frame is None:
         return
@@ -717,21 +801,23 @@ def blit_frame(lcd, pack, frame, dest_x, dest_y, pal, clip_t=0, clip_b=103, use_
         row = base + y * row_bytes
         x = 0
         while x < w:
+            sx = (w - 1 - x) if flip else x
             if bpp4:
-                b = data[row + (x >> 1)]
-                idx = (b >> 4) if (x & 1) == 0 else (b & 0x0F)
+                b = data[row + (sx >> 1)]
+                idx = (b >> 4) if (sx & 1) == 0 else (b & 0x0F)
             else:
-                idx = data[row + x]
+                idx = data[row + sx]
             if idx == 0:
                 x += 1
                 continue
             x1 = x + 1
             while x1 < w:
+                sx1 = (w - 1 - x1) if flip else x1
                 if bpp4:
-                    b2 = data[row + (x1 >> 1)]
-                    i2 = (b2 >> 4) if (x1 & 1) == 0 else (b2 & 0x0F)
+                    b2 = data[row + (sx1 >> 1)]
+                    i2 = (b2 >> 4) if (sx1 & 1) == 0 else (b2 & 0x0F)
                 else:
-                    i2 = data[row + x1]
+                    i2 = data[row + sx1]
                 if i2 != idx:
                     break
                 x1 += 1
@@ -768,15 +854,14 @@ def _rgb888_to_565(c):
     return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
 
 
-def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
-    """Bake the ocean tile into a little-endian RGB565 buffer once at pack load.
-
-    Index 0 (transparent in the sprite blitter) is filled with the sky
-    background so a window copy is fully opaque.
-    """
+def _blit_indexed_565(buf, tw, th, pack, frame, dest_y, bg_color=COL_BG):
+    """Copy one indexed frame into a little-endian RGB565 buffer."""
+    if buf is None or pack is None or frame is None or tw <= 0 or th <= 0:
+        return
     w = frame.w
     h = frame.h
-    buf = bytearray(w * h * 2)
+    if w <= 0 or h <= 0:
+        return
     pal_id = frame.pal_id
     if pal_id < 0 or pal_id >= len(pack.palettes_565):
         pal_id = 0
@@ -790,10 +875,15 @@ def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
     base = pack.pix_off + frame.data_offset
     bpp4 = pack.bpp == 4
     row_bytes = ((w + 1) // 2) if bpp4 else w
-    di = 0
-    for y in range(h):
+    y = 0
+    while y < h:
+        dy = dest_y + y
+        if dy < 0 or dy >= th:
+            y += 1
+            continue
         row = base + y * row_bytes
-        for x in range(w):
+        x = 0
+        while x < w and x < tw:
             if bpp4:
                 b = data[row + (x >> 1)]
                 idx = (b >> 4) if (x & 1) == 0 else (b & 0x0F)
@@ -802,14 +892,202 @@ def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
             if idx >= len(pairs):
                 idx = 0
             pair = pairs[idx]
+            di = (dy * tw + x) * 2
             buf[di] = pair[0]
             buf[di + 1] = pair[1]
-            di += 2
+            x += 1
+        y += 1
+
+
+def prerender_ocean_rgb565(pack, frame, bg_color=COL_BG):
+    """Bake one tile into a little-endian RGB565 buffer once at pack load.
+
+    Index 0 (transparent in the sprite blitter) is filled with the sky
+    background so a window copy is fully opaque.
+    """
+    if pack is None or frame is None:
+        return bytearray(0), 0, 0
+    w = frame.w
+    h = frame.h
+    if w <= 0 or h <= 0:
+        return bytearray(0), 0, 0
+    buf = bytearray(w * h * 2)
+    _blit_indexed_565(buf, w, h, pack, frame, 0, bg_color)
     return buf, w, h
 
 
+def prerender_sea_rgb565(pack, bg_color=COL_BG):
+    """Stack far_bg and mid_bg into one 256-wide sea tile."""
+    if pack is None:
+        return bytearray(0), 0, 0
+    far = pack.by_name.get("far_bg")
+    mid = pack.by_name.get("mid_bg")
+    if far is None or mid is None or far.w <= 0 or far.h <= 0 or mid.w <= 0 or mid.h <= 0:
+        ocean = pack.by_name.get("ocean")
+        if ocean is None:
+            return bytearray(0), 0, 0
+        return prerender_ocean_rgb565(pack, ocean, bg_color)
+    tw = far.w
+    th = far.h + mid.h
+    buf = bytearray(tw * th * 2)
+    _blit_indexed_565(buf, tw, th, pack, far, 0, bg_color)
+    _blit_indexed_565(buf, tw, th, pack, mid, far.h, bg_color)
+    return buf, tw, th
+
+
+def _continue_dirt_checker(tile, tw, th):
+    """Two checker rows, then that pair repeats for the rest of the dirt.
+
+    Rows 100 and 101 are the two rows. The clean left edge is a 12px
+    cell, and 384 is a multiple of 12, so that cell fills each of those
+    rows. Every later dirt row copies one of the two. The sea and the
+    loops are not rewritten. pixidx.bin is not touched.
+    """
+    if tile is None or tw < 12 or th < 103 or (tw % 12) != 0:
+        return
+    period = 12
+    rows = CHECKER_ROWS
+    if rows < 1:
+        rows = 1
+    base = 100
+    y = base
+    n = 0
+    while n < rows and y < th:
+        src = y * tw * 2
+        tmpl = bytes(tile[src:src + period * 2])
+        x = 0
+        while x < tw:
+            tile[src + x * 2:src + (x + period) * 2] = tmpl
+            x += period
+        y += 1
+        n += 1
+    while y < th:
+        src_y = base + ((y - base) % rows)
+        src = src_y * tw * 2
+        dst = y * tw * 2
+        tile[dst:dst + tw * 2] = tile[src:src + tw * 2]
+        y += 1
+
+
+def _frame_at_565(pack, fr, x, y):
+    """One opaque RGB565 pixel, or None where the frame is transparent."""
+    if fr is None or x < 0 or y < 0 or x >= fr.w or y >= fr.h:
+        return None
+    idx = pack.data[pack.pix_off + fr.data_offset + y * fr.w + x]
+    if idx == 0:
+        return None
+    pal = pack.palettes_565[fr.pal_id]
+    if idx >= len(pal):
+        return None
+    return pal[idx]
+
+
+def _install_sheet_backdrop(tile, tw, th, pack):
+    """Paint far_bg, mid_bg, the grass blades, then the ground sprite.
+
+    gnd_floor is the dark strip under the grass and the checker under
+    that strip, on one 8px block grid.
+    """
+    if tile is None or pack is None or tw < 1 or th < 1:
+        return
+    far = pack.by_name.get("far_bg")
+    mid = pack.by_name.get("mid_bg")
+    if far is not None and far.w > 0 and far.h > 0:
+        _blit_indexed_565(tile, tw, th, pack, far, 0)
+    if mid is not None and mid.w > 0 and mid.h > 0:
+        dest = far.h if far is not None else HORIZON_Y
+        _blit_indexed_565(tile, tw, th, pack, mid, dest)
+    grass = pack.by_name.get("gnd_grass")
+    floor = pack.by_name.get("gnd_floor")
+    if grass is not None and grass.w > 0 and grass.h > 0 and GRASS_Y < th:
+        blades = BLADE_ROWS
+        if blades > grass.h:
+            blades = grass.h
+        period = floor.w if floor is not None and floor.w > 0 else grass.w
+        y = 0
+        while y < blades and GRASS_Y + y < th:
+            x = 0
+            while x < tw:
+                sx = x % period
+                if sx >= grass.w:
+                    sx -= 8
+                col = _frame_at_565(pack, grass, sx, y)
+                if col is not None:
+                    _set_565(tile, tw, x, GRASS_Y + y, col)
+                x += 1
+            y += 1
+    if floor is None or floor.w < 1 or floor.h < 1:
+        return
+    y = 0
+    while y < floor.h and GRASS_Y + BLADE_ROWS + y < th:
+        x = 0
+        while x < tw:
+            col = _frame_at_565(pack, floor, x % floor.w, y)
+            if col is not None:
+                _set_565(tile, tw, x, GRASS_Y + BLADE_ROWS + y, col)
+            x += 1
+        y += 1
+
+
+# World x of the packed ground props. Feet sit on the Sonic plant line.
+_SHEET_PROPS = (
+    ("prop_palm", 36),
+    ("prop_sun", 120),
+    ("prop_fl_0", 168),
+    ("prop_fl_1", 200),
+    ("prop_fl_2", 232),
+    ("prop_fl_3", 270),
+)
+
+
+def _sheet_prop_stamps(pack, th):
+    """Ground-speed stamps for the first palm, the sunflower, and the flowers."""
+    if pack is None:
+        return []
+    feet = SONIC_FEET_Y
+    if feet >= th:
+        feet = th - 1
+    if feet < 1:
+        return []
+    out = []
+    for name, world_x in _SHEET_PROPS:
+        fr = pack.by_name.get(name)
+        if fr is None or fr.w < 1 or fr.h < 1:
+            continue
+        src_y0 = 0
+        sh = fr.h
+        oy = feet - sh
+        if oy < 0:
+            src_y0 = -oy
+            sh = fr.h - src_y0
+            oy = 0
+        if oy + sh > th:
+            sh = th - oy
+        if sh < 1:
+            continue
+        sw = fr.w
+        sbuf = bytearray(sw * sh * 2)
+        mask = bytearray((sw * sh + 7) // 8)
+        dy = 0
+        while dy < sh:
+            dx = 0
+            while dx < sw:
+                col = _frame_at_565(pack, fr, dx, src_y0 + dy)
+                if col is not None:
+                    di = dy * sw + dx
+                    sbuf[di * 2] = col & 0xFF
+                    sbuf[di * 2 + 1] = (col >> 8) & 0xFF
+                    mask[di >> 3] |= 1 << (di & 7)
+                dx += 1
+            dy += 1
+        spans = _opaque_spans(mask, sw, sh)
+        ox = int(world_x) - sw // 2
+        out.append((PARALLAX_GROUND, ox, oy, sw, sh, sbuf, mask, spans))
+    return out
+
+
 def copy_ocean_window(tile, tw, th, scroll, out, vw=W):
-    """Wrap-copy a vw-wide window of the 384-wide RGB565 tile into out."""
+    """Wrap-copy a vw-wide window of the sea tile into out."""
     off = int(scroll) % tw
     if off < 0:
         off += tw
@@ -1687,9 +1965,91 @@ def _make_stamp(tile, tw, pts, factor):
             sbuf[di * 2] = val & 0xFF
             sbuf[di * 2 + 1] = (val >> 8) & 0xFF
             mask[di >> 3] |= 1 << (di & 7)
+        _drop_stamp_palms(mask, sw, sh)
         spans = _opaque_spans(mask, sw, sh)
         stamps.append((factor, x0, y0, sw, sh, sbuf, mask, spans))
     return stamps
+
+
+def _drop_stamp_palms(mask, sw, sh):
+    """Clear a palm that was lifted with the loop hill.
+
+    The island is the widest run of columns that reach the bottom of the
+    stamp. A narrow run beside it is a trunk, and the columns outside
+    that island on the trunk's side are fronds. Those columns stay in
+    the bitmap so the hill does not move, but they no longer draw.
+    """
+    if sw < 16 or sh < 16:
+        return
+    ground = sh - 3
+    grounded = []
+    x = 0
+    while x < sw:
+        bot = False
+        y = ground
+        while y < sh:
+            di = y * sw + x
+            if mask[di >> 3] & (1 << (di & 7)):
+                bot = True
+                break
+            y += 1
+        grounded.append(1 if bot else 0)
+        x += 1
+    runs = []
+    x = 0
+    while x < sw:
+        if not grounded[x]:
+            x += 1
+            continue
+        a = x
+        while x < sw and grounded[x]:
+            x += 1
+        runs.append((a, x - 1))
+    if not runs:
+        return
+    island = runs[0]
+    best = island[1] - island[0]
+    i = 1
+    while i < len(runs):
+        run = runs[i]
+        w = run[1] - run[0]
+        if w > best:
+            island = run
+            best = w
+        i += 1
+    drop = []
+    x = 0
+    while x < sw:
+        drop.append(0)
+        x += 1
+    for a, b in runs:
+        if a == island[0] and b == island[1]:
+            continue
+        if (b - a) > 8:
+            continue
+        if b < island[0]:
+            x = a
+            end = island[0]
+        else:
+            x = island[1] + 1
+            end = b + 1
+        while x < end:
+            drop[x] = 1
+            x += 1
+    x = sw - 1
+    while x > island[1]:
+        drop[x] = 1
+        x -= 1
+    x = 0
+    while x < sw:
+        if drop[x]:
+            y = 0
+            while y < sh:
+                di = y * sw + x
+                bit = 1 << (di & 7)
+                mask[di >> 3] = mask[di >> 3] & (255 ^ bit)
+                y += 1
+        x += 1
 
 
 def _opaque_spans(mask, sw, sh):
@@ -1736,6 +2096,15 @@ _blit_stamp_viper = None
 _blit_stamp_clip_viper = None
 # 0 unknown, 1 poll has reported writable, 2 this port has no poll.
 _STDOUT_POLL = 0
+# Flash quiet. tools/flash_com6.py writes FLASH_PREAMBLE between frames.
+# The loop answers FLASH_ACK once, then drops every later print so raw
+# REPL paste is not mixed with timing, brk, pause, or auto-sweep lines.
+FLASH_PREAMBLE = b"ATOMFLASH\n"
+FLASH_ACK = "flash-quiet"
+_SERIAL_QUIET = False
+_FLASH_BUF = b""
+_FLASH_POLLER = None
+_FLASH_POLL_DEAD = False
 
 
 def _stdout_can_write():
@@ -1756,6 +2125,8 @@ def _stdout_can_write():
 
 def _stdout_can_write_body():
     global _STDOUT_POLL
+    if _SERIAL_QUIET:
+        return False
     if _STDOUT_POLL == 2:
         return True
     try:
@@ -1785,6 +2156,91 @@ def _stdout_can_write_body():
     if _STDOUT_POLL == 1:
         return False
     return True
+
+
+def _enter_flash_quiet():
+    """One acknowledgement, then silence stdout for the rest of the session."""
+    global _SERIAL_QUIET
+    if _SERIAL_QUIET:
+        return
+    print(FLASH_ACK)
+    _SERIAL_QUIET = True
+    try:
+        import sys
+
+        class _QuietOut(object):
+            def write(self, data):
+                if data:
+                    return len(data)
+                return 0
+
+            def flush(self):
+                return None
+
+        sys.stdout = _QuietOut()
+    except Exception:
+        pass
+
+
+def _accept_flash_preamble(data):
+    """Fold serial input into the preamble buffer. ATOMFLASH enters quiet."""
+    global _FLASH_BUF
+    if _SERIAL_QUIET or not data:
+        return
+    if isinstance(data, str):
+        try:
+            data = data.encode("utf-8")
+        except Exception:
+            return
+    _FLASH_BUF = (_FLASH_BUF + data)[-48:]
+    if b"ATOMFLASH" in _FLASH_BUF:
+        _enter_flash_quiet()
+
+
+def _poll_flash_quiet():
+    """Non-blocking stdin check. A missing poller leaves the prints alone."""
+    global _FLASH_POLLER, _FLASH_POLL_DEAD
+    if _SERIAL_QUIET or _FLASH_POLL_DEAD:
+        return
+    try:
+        import sys
+        try:
+            import uselect as selectmod
+        except ImportError:
+            import select as selectmod
+    except Exception:
+        _FLASH_POLL_DEAD = True
+        return
+    if _FLASH_POLLER is None:
+        try:
+            poller = selectmod.poll()
+            poller.register(sys.stdin, selectmod.POLLIN)
+            _FLASH_POLLER = poller
+        except Exception:
+            _FLASH_POLL_DEAD = True
+            return
+    try:
+        if not _FLASH_POLLER.poll(0):
+            return
+    except Exception:
+        return
+    got = b""
+    while len(got) < 48:
+        try:
+            if not _FLASH_POLLER.poll(0):
+                break
+            chunk = sys.stdin.read(1)
+        except Exception:
+            break
+        if not chunk:
+            break
+        if isinstance(chunk, str):
+            try:
+                chunk = chunk.encode("utf-8")
+            except Exception:
+                break
+        got += chunk
+    _accept_flash_preamble(got)
 
 
 def _feed_wdt():
@@ -2026,8 +2482,401 @@ def _blit_stamp(window, vw, tw, stamp, scroll):
     _blit_stamp_py(window, vw, tw, stamp, scroll)
 
 
+def _mirror_baked(rgb, mask, w, h):
+    """Mirror a baked RGB565 sprite and its 1-bit mask inside the same box."""
+    n = w * h
+    out = bytearray(n * 2)
+    bits = bytearray((n + 7) // 8)
+    y = 0
+    while y < h:
+        x = 0
+        while x < w:
+            src = y * w + (w - 1 - x)
+            dst = y * w + x
+            out[dst * 2] = rgb[src * 2]
+            out[dst * 2 + 1] = rgb[src * 2 + 1]
+            if mask[src >> 3] & (1 << (src & 7)):
+                bits[dst >> 3] |= 1 << (dst & 7)
+            x += 1
+        y += 1
+    return out, bits
+
+
+def _chao_ease(t):
+    """Smoothstep. Slow at both ends, no step in velocity."""
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _mirror_runs(fr):
+    """Horizontal mirror of a PIX6 run table. Same box, facing the other way."""
+    cached = getattr(fr, "_flip_runs", None)
+    if cached is not None:
+        return cached
+    w = fr.w
+    runs = fr.runs
+    n = fr.nruns
+    out = bytearray(n * 5)
+    i = 0
+    while i < n:
+        o = i * 5
+        x = runs[o] | (runs[o + 1] << 8)
+        y = runs[o + 2]
+        ln = runs[o + 3]
+        idx = runs[o + 4]
+        nx = w - (x + ln)
+        if nx < 0:
+            nx = 0
+        out[o] = nx & 0xFF
+        out[o + 1] = (nx >> 8) & 0xFF
+        out[o + 2] = y & 0xFF
+        out[o + 3] = ln & 0xFF
+        out[o + 4] = idx & 0xFF
+        i += 1
+    fr._flip_runs = (out, n)
+    return fr._flip_runs
+
+
+SKY_CAP_ROWS = 12
+# Packed sky below the cap. Rows 0-11 are a darker blue strip.
+SKY_BLUE_888 = (0 << 16) | (174 << 8) | 255
+# Darker blue that also sits on the sea side of the horizon.
+SKY_CAP_BLUE_888 = (0 << 16) | (134 << 8) | 255
+
+
+# Open water used for the horizon band. Not a copy of the neighbour,
+# which smeared leaf pixels along the sea-sky join.
+SEA_BLUE_888 = (49 << 16) | (195 << 8) | 255
+
+
+def repair_ocean_tile(tile, tw, th):
+    """Paint the sky cap. Does not sample neighbouring pixels.
+
+    Rows 0-11 of the pack are a darker blue than the sky below them.
+    pixidx.bin is not rewritten.
+    """
+    if tile is None or tw <= 1 or th <= 0:
+        return
+    sky = _rgb888_to_565(SKY_BLUE_888)
+    y = 0
+    cap_n = SKY_CAP_ROWS
+    if cap_n > th:
+        cap_n = th
+    while y < cap_n:
+        x = 0
+        while x < tw:
+            _set_565(tile, tw, x, y, sky)
+            x += 1
+        y += 1
+
+
+def _band_diff(tile, tw, a, b, y0, y1):
+    d = 0
+    y = y0
+    while y < y1:
+        if _565_at(tile, tw, a, y) != _565_at(tile, tw, b, y):
+            d += 1
+        y += 1
+    return d
+
+
+def _close_band_tears(tile, tw, y0, y1, limit):
+    """Copy a column over the next one when the join is a tear, not a wave."""
+    if y1 <= y0 or tw < 2:
+        return
+    passes = 0
+    while passes < 6:
+        passes += 1
+        changed = False
+        x = 0
+        while x < tw:
+            nxt = x + 1
+            if nxt >= tw:
+                nxt = 0
+            if _band_diff(tile, tw, x, nxt, y0, y1) > limit:
+                y = y0
+                while y < y1:
+                    _set_565(tile, tw, nxt, y, _565_at(tile, tw, x, y))
+                    y += 1
+                changed = True
+            x += 1
+        if not changed:
+            return
+
+
+def finish_ocean_background(tile, tw, th):
+    """After the hill stamps are lifted out, clean the tile they leave behind.
+
+    Leftover palm pixels above the grass become sky or sea. The horizon
+    rows are a solid sea colour, not a smear of the pixel to their left.
+    Hard joins in the water and the grass are closed so a scroll does not
+    show a doubled column or a hole.
+    """
+    if tile is None or tw <= 1 or th <= 0:
+        return
+    sky = _rgb888_to_565(SKY_BLUE_888)
+    sea = _rgb888_to_565(SEA_BLUE_888)
+    grass_y = GRASS_Y if GRASS_Y < th else th
+    y = SKY_CAP_ROWS
+    if y < 0:
+        y = 0
+    while y < grass_y:
+        x = 0
+        while x < tw:
+            c = _rgb565_to_888(_565_at(tile, tw, x, y))
+            if not _is_backdrop_888(c):
+                _set_565(tile, tw, x, y, sky if y < HORIZON_Y else sea)
+            x += 1
+        y += 1
+    y = HORIZON_Y
+    y1 = HORIZON_Y + 4
+    if y1 > grass_y:
+        y1 = grass_y
+    while y < y1:
+        x = 0
+        while x < tw:
+            _set_565(tile, tw, x, y, sea)
+            x += 1
+        y += 1
+    sea_top = HORIZON_Y + 4
+    if sea_top < grass_y:
+        _replace_distant_echoes(tile, tw, sea_top, grass_y)
+        _close_sea_seams(tile, tw, sea_top, grass_y)
+    # Dirt rows 100-102 stay on the 12px checker. Only the grass above them
+    # is closed, so a tuft join cannot open a hole.
+    grass_bot = grass_y + 12
+    if grass_bot > 100:
+        grass_bot = 100
+    if grass_y < grass_bot:
+        _close_band_tears(tile, tw, grass_y, grass_bot, 8)
+
+
+def _replace_distant_echoes(tile, tw, y0, y1):
+    """Drop a sea column that copies one more than a few pixels away.
+
+    The copy is replaced by the column beside it, so the wrap is not a
+    doubled stripe. Nearby wave pixels are left alone.
+    """
+    if y1 <= y0 or tw < 2:
+        return
+    sigs = []
+    x = 0
+    while x < tw:
+        raw = bytearray()
+        y = y0
+        while y < y1:
+            v = _565_at(tile, tw, x, y)
+            raw.append(v & 0xFF)
+            raw.append((v >> 8) & 0xFF)
+            y += 1
+        sigs.append(bytes(raw))
+        x += 1
+    seen = {}
+    echo = []
+    x = 0
+    while x < tw:
+        prev = seen.get(sigs[x])
+        if prev is None:
+            seen[sigs[x]] = x
+        elif x - prev > 16:
+            echo.append(x)
+        x += 1
+    for x in echo:
+        src = x - 1
+        guard = 0
+        while src in echo and src > 0 and guard < tw:
+            src -= 1
+            guard += 1
+        if src < 0:
+            continue
+        y = y0
+        while y < y1:
+            _set_565(tile, tw, x, y, _565_at(tile, tw, src, y))
+            y += 1
+
+
+def _sea_dist(a, b):
+    ar = (a >> 11) & 31
+    ag = (a >> 5) & 63
+    ab = a & 31
+    br = (b >> 11) & 31
+    bg = (b >> 5) & 63
+    bb = b & 31
+    dr = ar - br
+    dg = ag - bg
+    db = ab - bb
+    if dr < 0:
+        dr = -dr
+    if dg < 0:
+        dg = -dg
+    if db < 0:
+        db = -db
+    return dr + dg + db
+
+
+def _sea_lerp(a, b, t):
+    ar = (a >> 11) & 31
+    ag = (a >> 5) & 63
+    ab = a & 31
+    br = (b >> 11) & 31
+    bg = (b >> 5) & 63
+    bb = b & 31
+    r = int(ar + (br - ar) * t + 0.5)
+    g = int(ag + (bg - ag) * t + 0.5)
+    bl = int(ab + (bb - ab) * t + 0.5)
+    if r < 0:
+        r = 0
+    elif r > 31:
+        r = 31
+    if g < 0:
+        g = 0
+    elif g > 63:
+        g = 63
+    if bl < 0:
+        bl = 0
+    elif bl > 31:
+        bl = 31
+    return (r << 11) | (g << 5) | bl
+
+
+def _sea_boundary(tile, tw, y0, y1):
+    scores = []
+    x = 0
+    while x < tw:
+        d = 0
+        y = y0
+        while y < y1:
+            d += _sea_dist(
+                _565_at(tile, tw, x, y),
+                _565_at(tile, tw, (x + 1) % tw, y),
+            )
+            y += 1
+        scores.append(d)
+        x += 1
+    return scores
+
+
+def _close_sea_seams(tile, tw, y0, y1):
+    """Join the sea across an echoed column and across a hard vertical cut.
+
+    A long run of identical columns is an echo left by the copy pass. It
+    is repainted as a ramp from the water beside it, so the copy and the
+    cut at its edge are gone. Any cut that is still much harder than the
+    waves, including the tile wrap, is spread across a few columns. The
+    grass is not touched. The join lives in the tile, so a faster scroll
+    does not open it again.
+    """
+    if y1 <= y0 or tw < 8:
+        return
+    scores = _sea_boundary(tile, tw, y0, y1)
+    flat = []
+    x = 0
+    while x < tw:
+        if scores[x] >= 40:
+            x += 1
+            continue
+        a = x
+        while x < tw and scores[x] < 40:
+            x += 1
+        if x - a >= 6:
+            flat.append((a, x - 1))
+    for a, b in flat:
+        left = (a - 1) % tw
+        right = (b + 2) % tw
+        n = (b + 1) - a + 1
+        i = 0
+        col = a
+        while i < n:
+            t = (i + 1) / float(n)
+            y = y0
+            while y < y1:
+                c = _sea_lerp(
+                    _565_at(tile, tw, left, y),
+                    _565_at(tile, tw, right, y),
+                    t,
+                )
+                _set_565(tile, tw, col, y, c)
+                y += 1
+            col = (col + 1) % tw
+            i += 1
+    scores = _sea_boundary(tile, tw, y0, y1)
+    order = sorted(scores)
+    med = order[len(order) // 2]
+    limit = med * 2
+    if limit < 560:
+        limit = 560
+    seams = []
+    x = 0
+    while x < tw:
+        if scores[x] >= limit:
+            seams.append(x)
+        x += 1
+    if not seams:
+        return
+    height = y1 - y0
+    band = bytearray(tw * height * 2)
+    y = y0
+    while y < y1:
+        x = 0
+        while x < tw:
+            v = _565_at(tile, tw, x, y)
+            i = ((y - y0) * tw + x) * 2
+            band[i] = v & 255
+            band[i + 1] = (v >> 8) & 255
+            x += 1
+        y += 1
+    half = 6
+    for bseam in seams:
+        left = (bseam - half) % tw
+        right = (bseam + 1 + half) % tw
+        span = (right - left) % tw
+        if span < 2:
+            continue
+        i = 1
+        while i < span:
+            col = (left + i) % tw
+            t = i / float(span)
+            k = 0
+            y = y0
+            while y < y1:
+                si = (k * tw + left) * 2
+                di = (k * tw + right) * 2
+                la = band[si] | (band[si + 1] << 8)
+                ra = band[di] | (band[di + 1] << 8)
+                _set_565(tile, tw, col, y, _sea_lerp(la, ra, t))
+                k += 1
+                y += 1
+            i += 1
+
+
+def _keep_hill_loop(pts, tw):
+    """True for a solid green hill. A palm bridge is wide but mostly empty."""
+    if len(pts) < 200:
+        return False
+    _x0, _x1, y0, y1, width, _wrapped = _pts_bbox(pts, tw)
+    height = y1 - y0 + 1
+    if width < 40 or height < 16:
+        return False
+    area = width * height
+    if area <= 0 or (len(pts) / float(area)) < 0.45:
+        return False
+    counts = _row_widths(pts, tw)
+    mid = 0
+    for y, c in counts.items():
+        if 30 <= y <= 68:
+            mid += c
+    return mid >= 200
+
+
 def build_parallax_layers(tile, tw, th):
-    """In-place inpaint of tile plus a list of stamps. Runs once at pack load."""
+    """In-place inpaint of tile plus a list of stamps. Runs once at pack load.
+
+    Only the green hill loop is stamped back. Other scenery is painted
+    out of the tile and not drawn.
+    """
     grass_y = GRASS_Y if th >= GRASS_Y else th
     mask = _object_mask(tile, tw, th, grass_y)
     comps = _components(mask, tw, grass_y)
@@ -2039,17 +2888,27 @@ def build_parallax_layers(tile, tw, th):
     for pts in parts:
         if len(pts) < 8:
             continue
+        all_pts.extend(pts)
+        if not _keep_hill_loop(pts, tw):
+            continue
         factor = _classify(pts, tw, grass_y)
         stamps.extend(_make_stamp(tile, tw, pts, factor))
-        all_pts.extend(pts)
     _inpaint(tile, tw, th, all_pts, grass_y)
+    finish_ocean_background(tile, tw, th)
     return stamps
 
 
-def compose_parallax_window(tile, tw, th, scroll, stamps, window, vw):
+def compose_parallax_window(tile, tw, th, scroll, stamps, window, vw, sea_dy=0):
     _service()
+    if sea_dy < 0:
+        sea_dy = 0
+    if sea_dy > HORIZON_Y:
+        sea_dy = HORIZON_Y
     _copy_rows(tile, tw, 0, HORIZON_Y, scroll * PARALLAX_CLOUDS, window, vw, 0)
-    _copy_rows(tile, tw, HORIZON_Y, GRASS_Y, scroll * PARALLAX_WATER, window, vw, HORIZON_Y)
+    _copy_rows(
+        tile, tw, HORIZON_Y, GRASS_Y, scroll * PARALLAX_WATER,
+        window, vw, HORIZON_Y - sea_dy,
+    )
     _copy_rows(tile, tw, GRASS_Y, th, scroll * PARALLAX_GROUND, window, vw, GRASS_Y)
     for st in stamps:
         _blit_stamp(window, vw, tw, st, scroll)
@@ -2665,27 +3524,90 @@ def gc_slice_room(spent_us, quantum_us=None):
     return (quantum_us - spent_us) >= (GC_SLICE_US + GC_SLICE_MARGIN_US)
 
 
-def _gc_after_present(spent_us):
-    """One sliced collect after the present, when this frame has room.
+def _gc_make_room():
+    """Free a 16-byte block when the sliced collector has fallen behind.
 
-    The panel already has this frame. When the leftover of the 33 ms
-    budget covers one slice plus a small margin, this calls collect
-    once with no arguments and returns. On the flashed Atom S3R VM that
-    call is one slice of about 3 ms. Later bytecode and the event poll
-    continue that cycle, at least 12 ms apart. A late frame skips.
-    This does not loop, and it does not wait out a deferral and then
-    start a cycle. It does not read the heap: a free or alloc sample
-    walks every block, and the sweep may not have finished.
+    gc.disable() makes a failed alloc return at once, with no collect.
+    The loop used to catch that MemoryError, feed the watchdog, and try
+    the same alloc again, so the last frame stayed on the panel and the
+    serial line repeated once a second. A few slices run first. The
+    16-byte probe then finishes the cycle if no block was freed, because
+    automatic collection is on for that one call. It is turned back off
+    so a present does not take a surprise full sweep.
     """
-    if not gc_slice_room(spent_us):
+    try:
+        import gc
+    except Exception:
+        return False
+    en = getattr(gc, "enable", None)
+    dis = getattr(gc, "disable", None)
+    isen = getattr(gc, "isenabled", None)
+    was_on = True
+    if isen is not None:
+        try:
+            was_on = bool(isen())
+        except Exception:
+            was_on = True
+    if en is not None:
+        try:
+            en()
+        except Exception:
+            pass
+    i = 0
+    while i < 8:
+        _feed_wdt()
+        try:
+            gc.collect()
+        except Exception:
+            break
+        i += 1
+    ok = False
+    try:
+        block = bytearray(16)
+        ok = True
+        del block
+    except Exception:
+        ok = False
+    if was_on:
+        if en is not None:
+            try:
+                en()
+            except Exception:
+                pass
+    elif dis is not None:
+        try:
+            dis()
+        except Exception:
+            pass
+    return ok
+
+
+def _gc_after_present(spent_us):
+    """One sliced collect after the present.
+
+    The panel already has this frame. On the flashed Atom S3R VM,
+    collect() with no argument is one slice of about 3 ms. Later
+    bytecode and the event poll continue that cycle, at least 12 ms
+    apart. A frame that already used the 33 ms budget used to skip the
+    slice. On a drive every frame can be late, so nothing collects
+    until an allocation finishes the rest of the cycle in one stall.
+    That stall freezes the picture and the task watchdog resets the
+    board: the last frame holds, the panel goes dark, the boot splash
+    returns, and the ring count starts over. One slice still runs.
+    A negative spent means the clock wrapped, and that call is skipped.
+    This does not loop, and it does not read the heap.
+    """
+    if spent_us < 0:
         return
     _brk_enter("gc")
     try:
+        _feed_wdt()
         try:
             import gc
             gc.collect()
         except Exception:
             pass
+        _feed_wdt()
     finally:
         _brk_exit()
 
@@ -2772,15 +3694,36 @@ def live_can(bus, last_rx_ms, now):
 # sweep returns to rest. Never while a sweep is running or CAN is live.
 AUTO_SWEEP_BOOT_MS = 10000
 AUTO_SWEEP_IDLE_MS = 20000
+# Two face-button clicks inside this window toggle auto-sweep. 320 ms is
+# long enough for a thumb on the Atom button (a deliberate double lands
+# around 150–300 ms) and short enough that a single press still starts
+# the bench sweep before its first stage is noticeable.
+AUTO_SWEEP_DOUBLE_MS = 320
+# Off until a double press turns it on. A desk or a car must not start
+# the bench sweep by itself.
+_auto_sweep_enabled = False
 
 
-def auto_sweep_due(now, present_t0, active, can_live, boot_armed, idle_since):
+def toggle_auto_sweep(now=None):
+    """Flip auto-sweep and print one line. A running sweep is left alone."""
+    global _auto_sweep_enabled
+    _auto_sweep_enabled = not _auto_sweep_enabled
+    if _auto_sweep_enabled:
+        print("auto-sweep on")
+    else:
+        print("auto-sweep off")
+
+
+def auto_sweep_due(now, present_t0, active, can_live, boot_armed, idle_since, enabled=True):
     """Return (start, boot_armed, idle_since).
 
     present_t0 is the first present, not boot. active suppresses a start.
     can_live suppresses every auto start. boot_armed is the first wait.
-    After any sweep, idle_since counts 20 s of rest.
+    After any sweep, idle_since counts 20 s of rest. enabled False drops
+    a pending boot or idle start so turning it back on waits a fresh rest.
     """
+    if not enabled:
+        return False, False, None
     if active:
         return False, False, None
     if present_t0 is None or can_live:
@@ -2845,18 +3788,25 @@ def _underlay_budget(pack):
         return best
 
     sonic = 0
-    for key in ("idle", "idle_trigger", "run_slow", "run_medium", "run_fast"):
+    for key in ("idle", "idle_trigger", "run_slow", "run_medium", "run_fast", "skid", "spindash"):
         sonic = max(sonic, max_bytes(pack.cycles.get(key)))
+    chao = 0
+    for key in CHAO_TYPES:
+        chao = max(chao, max_bytes(pack.cycles.get(key)))
     rings = max_bytes(pack.cycles.get("rings"))
     spark = max_bytes(pack.cycles.get("rings_sparkle"))
     extra = 0
-    bar = pack.by_name.get("hud_bar")
-    hud = pack.by_name.get("hud_ring")
-    if bar is not None:
-        extra += bar.w * bar.h * 2
-    if hud is not None:
-        extra += hud.w * hud.h * 2
-    return sonic + extra + _UNDER_RINGS * rings + _UNDER_SPARKS * spark + 64
+    gauge = pack.by_name.get("hud_gauge")
+    if gauge is not None:
+        extra += gauge.w * gauge.h * 2
+    else:
+        bar = pack.by_name.get("hud_bar")
+        hud = pack.by_name.get("hud_ring")
+        if bar is not None:
+            extra += bar.w * bar.h * 2
+        if hud is not None:
+            extra += hud.w * hud.h * 2
+    return sonic + chao + extra + _UNDER_RINGS * rings + _UNDER_SPARKS * spark + 64
 
 
 def _copy_partial_row(tile, tw, src_y, off, window, x0, x1, vw=W):
@@ -3103,7 +4053,7 @@ _BAKE_REQUIRED = (
     "run_fast",
     "rings",
 )
-_BAKE_NAMED = ("hud_ring", "hud_bar")
+_BAKE_NAMED = ("hud_gauge",)
 _STAMP_KIND = None
 _stamp_viper = None
 
@@ -3118,12 +4068,28 @@ def _bake_frame_list(pack):
         frames.extend(cyc)
     for name in _BAKE_NAMED:
         fr = pack.by_name.get(name)
-        if fr is None:
-            return None
-        frames.append(fr)
+        if fr is not None:
+            frames.append(fr)
+    if pack.by_name.get("hud_gauge") is None:
+        for name in ("hud_ring", "hud_bar"):
+            fr = pack.by_name.get(name)
+            if fr is None:
+                return None
+            frames.append(fr)
     spark = pack.cycles.get("rings_sparkle")
     if spark:
         frames.extend(spark)
+    # Same C stamp path as the run cycle. Missing art just skips the bake.
+    skid = pack.cycles.get("skid")
+    if skid:
+        frames.extend(skid)
+    spindash = pack.cycles.get("spindash")
+    if spindash:
+        frames.extend(spindash)
+    for key in CHAO_TYPES:
+        cyc = pack.cycles.get(key)
+        if cyc:
+            frames.extend(cyc)
     return frames
 
 
@@ -3757,12 +4723,15 @@ except Exception:
 
 
 def _pixidx_geometry_ok(pack):
-    """V7/V8 art: 384x103 backdrop and 39x36 Sonic. A leftover V6 pack fails this."""
-    ocean = pack.by_name.get("ocean")
+    """far_bg and mid_bg are one 256-wide loop, plus 39x36 Sonic."""
+    far = pack.by_name.get("far_bg")
+    mid = pack.by_name.get("mid_bg")
     sonic = pack.by_name.get("run_fast_0")
     if sonic is None:
         sonic = pack.by_name.get("idle_0")
-    if ocean is None or ocean.w != 384 or ocean.h != 103:
+    if far is None or mid is None or far.w != 256 or mid.w != 256:
+        return False
+    if far.h != HORIZON_Y or far.h + mid.h != H:
         return False
     if sonic is None or sonic.w != 39 or sonic.h != 36:
         return False
@@ -3827,6 +4796,8 @@ def try_fetch_pixidx():
     A leftover local pack is never treated as success; only the current
     sha256 / size / geometry is saved and used.
     """
+    if not OTA_ENABLED:
+        return None
     try:
         import ota_client
         if hasattr(ota_client, "wifi_connected") and not ota_client.wifi_connected():
@@ -3989,6 +4960,7 @@ class Sweep:
             "rpm": clamp(rpm, RPM_MIN, RPM_MAX),
             "tps": clamp(tps, TPS_MIN, TPS_MAX),
             "clt": clamp(clt, CLT_MIN, CLT_MAX),
+            "brk": 0.0,
         }
 
 
@@ -4026,6 +4998,34 @@ COL_HUD_DIGIT = 0xF8F8F8
 COL_HUD_OUTLINE = 0x101018
 
 
+def fill_rect_clip(lcd, x, y, w, h, color, vw=W, vh=None):
+    """fillRect that drops the off-screen part instead of sliding it on screen."""
+    if vh is None:
+        vh = GAUGE_Y
+    x = int(x)
+    y = int(y)
+    w = int(w)
+    h = int(h)
+    if w < 0:
+        x += w
+        w = -w
+    if h < 0:
+        y += h
+        h = -h
+    if x < 0:
+        w += x
+        x = 0
+    if y < 0:
+        h += y
+        y = 0
+    if x + w > vw:
+        w = vw - x
+    if y + h > vh:
+        h = vh - y
+    if w > 0 and h > 0:
+        lcd.fillRect(x, y, w, h, color)
+
+
 def draw_digit(lcd, x, y, n, color=None, s=1, outline=None):
     n = int(n) % 10
     bits = DIGITS[n]
@@ -4048,6 +5048,70 @@ def draw_digit(lcd, x, y, n, color=None, s=1, outline=None):
         for col in range(5):
             if rowb & (0b10000 >> col):
                 lcd.fillRect(x + col * s, y + row * s, s, s, color)
+
+
+def _put565(buf, vw, vh, x, y, c):
+    if x < 0 or y < 0 or x >= vw or y >= vh:
+        return
+    i = (y * vw + x) * 2
+    buf[i] = c & 0xFF
+    buf[i + 1] = (c >> 8) & 0xFF
+
+
+def _stamp_digit565(buf, vw, vh, x, y, n, scale):
+    """One HUD digit into an RGB565 buffer. Same 5x7 bitmap as draw_digit."""
+    bits = DIGITS[int(n) % 10]
+    if scale < 1:
+        scale = 1
+    color = _rgb888_to_565(COL_HUD_DIGIT)
+    outline = _rgb888_to_565(COL_HUD_OUTLINE)
+    row = 0
+    while row < 7:
+        rowb = bits[row]
+        col = 0
+        while col < 5:
+            if rowb & (0b10000 >> col):
+                oy = -1
+                while oy <= 1:
+                    ox = -1
+                    while ox <= 1:
+                        if ox != 0 or oy != 0:
+                            py = 0
+                            while py < scale:
+                                px = 0
+                                while px < scale:
+                                    _put565(
+                                        buf, vw, vh,
+                                        x + (col + ox) * scale + px,
+                                        y + (row + oy) * scale + py,
+                                        outline,
+                                    )
+                                    px += 1
+                                py += 1
+                        ox += 1
+                    oy += 1
+            col += 1
+        row += 1
+    row = 0
+    while row < 7:
+        rowb = bits[row]
+        col = 0
+        while col < 5:
+            if rowb & (0b10000 >> col):
+                py = 0
+                while py < scale:
+                    px = 0
+                    while px < scale:
+                        _put565(
+                            buf, vw, vh,
+                            x + col * scale + px,
+                            y + row * scale + py,
+                            color,
+                        )
+                        px += 1
+                    py += 1
+            col += 1
+        row += 1
 
 
 def draw_ring_glyph(lcd, cx, cy, rx, ry):
@@ -4073,7 +5137,7 @@ def _chevron_column(lcd, x, cy, half_h, width, color, steps=4):
 
 
 def draw_aura(lcd, tip_x, tip_y, frame):
-    """Original 4-frame teardrop aura. Tip sits at Sonic mid-height."""
+    """Boost aura, the third row of the effect sheet. Four teardrop frames."""
     # 0 initiate (greener), 1 transition, 2-3 cycle (blue).
     pals = (
         (0xC8F090, 0x6ED050, 0xFFFFFF, 0xE8FFE0),
@@ -4101,49 +5165,101 @@ def draw_aura(lcd, tip_x, tip_y, frame):
         fill_triangle(lcd, back + 2, cy + dy, back - length, cy + dy, back + 2, cy + dy + 3, col)
 
 
+# Boot initiate, top half only. y is above the shoe center. The bottom
+# half is this same mark flipped. Not copied from the sheet.
+_BOOT_MARKS = (
+    (
+        (0, -2, -5, -1, -1, -6, COL_AURA_W),
+        (-4, -4, -8, -2, -5, -8, COL_AURA_I),
+    ),
+    (
+        (0, -3, -6, -1, -1, -8, COL_AURA_W),
+        (-4, -5, -9, -2, -5, -9, COL_AURA_I),
+        (3, -4, 0, -2, 4, -7, COL_AURA_M),
+    ),
+    (
+        (0, -4, -7, -1, -1, -10, COL_AURA_W),
+        (-5, -6, -10, -2, -6, -11, COL_AURA_I),
+        (3, -5, 0, -2, 5, -9, COL_AURA_M),
+    ),
+    (
+        (0, -5, -8, -1, -1, -12, COL_AURA_W),
+        (-5, -7, -11, -2, -6, -12, COL_AURA_I),
+        (4, -6, 1, -2, 6, -10, COL_AURA_M),
+    ),
+    (
+        (-2, -4, -6, -1, -3, -8, COL_AURA_W),
+        (3, -6, 1, -2, 5, -8, COL_AURA_I),
+        (-8, -3, -11, -1, -9, -6, COL_AURA_M),
+    ),
+)
+
+
+def _boot_half(lcd, ox, oy, tri, mirror):
+    s = -1 if mirror else 1
+    x0, y0, x1, y1, x2, y2, col = tri
+    fill_triangle(
+        lcd,
+        ox + x0, oy + s * y0,
+        ox + x1, oy + s * y1,
+        ox + x2, oy + s * y2,
+        col,
+    )
+
+
 def draw_shockwave(lcd, tip_x, tip_y, frame):
-    """Original 5-frame shockwave. Frame 5 (index 4) is the dissipating burst."""
+    """Boot initiate. The sheet row is the top half, flipped across the shoes."""
     if frame < 0 or frame > 4:
         return
-    heights = (8, 14, 22, 30, 34)
-    widths = (6, 8, 10, 12, 14)
-    h = heights[frame]
-    w = widths[frame]
-    if frame < 4:
-        _chevron_column(lcd, tip_x - 1, tip_y, h, w, COL_AURA_W, steps=4 + frame)
-        _chevron_column(lcd, tip_x - 6, tip_y, max(4, h - 3), w - 2, COL_AURA_I, steps=4)
-        _chevron_column(lcd, tip_x - 11, tip_y, max(4, h - 6), max(3, w - 3), COL_AURA_M, steps=3)
-        if frame >= 2:
-            _chevron_column(lcd, tip_x + 3, tip_y, max(4, h - 8), 4, COL_AURA_I, steps=3)
-    else:
-        # Dissipating burst: fragments around the mid-height tip.
-        frags = (
-            (-18, -16, 6, COL_AURA_I), (-10, -22, 5, COL_AURA_W), (4, -18, 5, COL_AURA_M),
-            (10, -8, 5, COL_AURA_W), (-20, 8, 5, COL_AURA_M), (-8, 18, 6, COL_AURA_W),
-            (8, 16, 4, COL_AURA_I), (12, 4, 5, COL_AURA_M), (-24, -4, 4, COL_AURA_I),
-            (6, 22, 3, COL_AURA_W), (-14, 20, 4, COL_AURA_M), (14, -20, 4, COL_AURA_I),
-        )
-        for dx, dy, s, col in frags:
-            fill_triangle(lcd, tip_x + dx, tip_y + dy, tip_x + dx - s, tip_y + dy - 2, tip_x + dx - 2, tip_y + dy + s, col)
+    cy = tip_y + BOOT_DY
+    marks = _BOOT_MARKS[frame]
+    for tri in marks:
+        _boot_half(lcd, tip_x, cy, tri, False)
+        _boot_half(lcd, tip_x, cy, tri, True)
 
 
 def draw_barrier(lcd, tip_x, tip_y, frame):
-    """Original sound-barrier after the end shockwave. 6 short frames."""
-    if frame < 0 or frame > 5:
+    """Sound barrier, the second row of the effect sheet. Four frames."""
+    if frame < 0 or frame > 3:
         return
-    # Grow a thin vertical ripple, then streak it forward and fade.
-    if frame <= 2:
-        h = 6 + frame * 6
-        x = tip_x + 2 + frame
+    # Same shapes as the old frames 0, 2, 3, and 5.
+    if frame <= 1:
+        h = 6 if frame == 0 else 18
+        x = tip_x + (2 if frame == 0 else 4)
         _chevron_column(lcd, x, tip_y, h, 4, COL_AURA_W, steps=3)
         _chevron_column(lcd, x - 4, tip_y, max(4, h - 3), 3, COL_AURA_I, steps=3)
     else:
-        k = frame - 2
+        k = 1 if frame == 2 else 3
         x = tip_x + 6 + k * 8
         h = 22 - k * 4
         _chevron_column(lcd, x, tip_y, max(4, h), 3, COL_AURA_I, steps=3)
         fill_triangle(lcd, x + 2, tip_y - h, x + 8 + k, tip_y - h + 2, x + 2, tip_y - h + 6, COL_AURA_W)
         fill_triangle(lcd, x + 2, tip_y + h, x + 8 + k, tip_y + h - 2, x + 2, tip_y + h - 6, COL_AURA_M)
+
+
+def draw_sparks(lcd, front_x, mid_y, frame):
+    """Full-speed sparks, the first row of the effect sheet.
+
+    Short streaks trail left from the front. Not a blue boost trail, and
+    not copied from the sheet. The panel fallback replaces pixels. The
+    native path saturating-adds them.
+    """
+    if frame < 0:
+        return
+    shards = (
+        ((-1, -1, 5, COL_AURA_W), (-4, 3, 4, COL_AURA_I), (-7, -4, 3, COL_AURA_W), (-3, 6, 3, COL_AURA_I)),
+        ((-2, 1, 6, COL_AURA_I), (-5, -3, 4, COL_AURA_W), (-8, 4, 3, COL_AURA_I), (-3, -6, 3, COL_AURA_W)),
+        ((-1, 2, 5, COL_AURA_W), (-6, -1, 5, COL_AURA_I), (-4, 5, 3, COL_AURA_W), (-9, -3, 3, COL_AURA_I)),
+        ((-2, -2, 4, COL_AURA_I), (-5, 2, 6, COL_AURA_W), (-8, -5, 3, COL_AURA_I), (-3, 5, 4, COL_AURA_W)),
+    )
+    for dx, dy, length, col in shards[frame % 4]:
+        fill_triangle(
+            lcd,
+            front_x + dx, mid_y + dy,
+            front_x + dx - length, mid_y + dy - 1,
+            front_x + dx - 2, mid_y + dy + 2,
+            col,
+        )
 
 
 class BoostFX:
@@ -4157,10 +5273,13 @@ class BoostFX:
         self.aura_i = -1
         self.sw_i = -1
         self.bar_i = -1
+        self.spark_i = -1
+        self.spark_on = False
         self.start_sw_done = False
         self.ticks = 0
 
     def reset(self):
+        """End the boost sequence. The spark index stays with _sync_spark."""
         self.initiated = False
         self.phase = "idle"
         self.accum = 0
@@ -4171,14 +5290,27 @@ class BoostFX:
         self.start_sw_done = False
         self.ticks = 0
 
+    def _sync_spark(self, speed):
+        if speed >= SPEED_FAST:
+            if self.spark_i < 0:
+                self.spark_i = 0
+            self.spark_on = True
+        else:
+            self.spark_i = -1
+            self.spark_on = False
+
     def tick(self, speed, dt_ms, rpm=None):
         # `speed` stays for callers. The aura follows rpm, not km/h.
+        # Sparks follow full-speed running, on the same 15 fps clock.
         if rpm is None:
             rpm = 0.0
+        if speed is None:
+            speed = 0.0
+        self._sync_spark(speed)
         if self._vtec_on(rpm):
             self.below_ms = 0
             if not self.initiated or self.phase in ("end_sw", "barrier", "idle"):
-                # (Re)initiate: aura 1 + shockwave once on top.
+                # (Re)initiate: aura frame 0, shockwave once on top.
                 self.initiated = True
                 self.phase = "run"
                 self.accum = 0
@@ -4201,7 +5333,7 @@ class BoostFX:
             elif self.phase == "idle":
                 self.below_ms = 0
 
-        if self.phase == "idle":
+        if self.phase == "idle" and self.spark_i < 0:
             return
 
         self.accum += dt_ms
@@ -4230,41 +5362,202 @@ class BoostFX:
 
     def _step_frame(self):
         self.ticks += 1
+        if self.spark_on and self.spark_i >= 0:
+            self.spark_i = (self.spark_i + 1) % SPARK_FRAMES
         if self.phase == "run":
-            # Aura: frame 1, then 2, then cycle 3 and 4.
-            if self.ticks == 1:
-                self.aura_i = 1
-            elif self.ticks >= 2:
-                # ticks 2+ : cycle frames 2 and 3 (aura 3 and 4)
-                self.aura_i = 2 + ((self.ticks - 2) & 1)
+            # All four aura frames, for the whole boost, at 15 fps.
+            self.aura_i = (self.aura_i + 1) & 3
             if not self.start_sw_done:
-                if self.sw_i < 4:
+                if self.sw_i < 5:
                     self.sw_i += 1
                 else:
                     self.sw_i = -1
                     self.start_sw_done = True
         elif self.phase == "end_sw":
-            if self.sw_i < 4:
+            if self.sw_i < 5:
                 self.sw_i += 1
             else:
                 self.phase = "barrier"
                 self.sw_i = -1
                 self.bar_i = 0
         elif self.phase == "barrier":
-            if self.bar_i < 5:
+            if self.bar_i < 3:
                 self.bar_i += 1
             else:
                 self.reset()
 
     def draw_behind(self, lcd, tip_x, tip_y):
-        if self.aura_i >= 0:
-            draw_aura(lcd, tip_x, tip_y, self.aura_i)
+        if not BOOST_VFX or self.aura_i < 0:
+            return
+        draw_aura(lcd, tip_x, tip_y, self.aura_i)
 
     def draw_front(self, lcd, tip_x, tip_y):
+        if not BOOST_VFX:
+            return
         if self.sw_i >= 0:
             draw_shockwave(lcd, tip_x, tip_y, self.sw_i)
         if self.bar_i >= 0:
-            draw_barrier(lcd, tip_x, tip_y, self.bar_i)
+            draw_barrier(lcd, BAR_TIP_X, BAR_TIP_Y, self.bar_i)
+        if self.spark_i >= 0:
+            draw_sparks(lcd, SPARK_FRONT_X, SPARK_MID_Y, self.spark_i)
+
+
+def _add565(dst, src):
+    """Saturating RGB565 add. Same channels as the native boost blend."""
+    r = ((dst >> 11) & 31) + ((src >> 11) & 31)
+    g = ((dst >> 5) & 63) + ((src >> 5) & 63)
+    b = (dst & 31) + (src & 31)
+    if r > 31:
+        r = 31
+    if g > 63:
+        g = 63
+    if b > 31:
+        b = 31
+    return (r << 11) | (g << 5) | b
+
+
+def _add_fx_runs(window, vw, vh, fr, pairs, x0, y0):
+    """Add one packed boost sprite. Overlapping runs inside it count once."""
+    runs = fr.runs
+    n = fr.nruns
+    if not runs or n < 1:
+        return
+    seen = {}
+    i = 0
+    while i < n:
+        o = i * 5
+        rx = runs[o] | (runs[o + 1] << 8)
+        ry = runs[o + 2]
+        ln = runs[o + 3]
+        idx = runs[o + 4]
+        i += 1
+        if ln < 1 or idx <= 0:
+            continue
+        col = pairs[idx * 2] | (pairs[idx * 2 + 1] << 8)
+        y = y0 + ry
+        if y < 0 or y >= vh:
+            continue
+        x = x0 + rx
+        k = 0
+        while k < ln:
+            xx = x + k
+            k += 1
+            if xx < 0 or xx >= vw:
+                continue
+            key = y * vw + xx
+            if key in seen:
+                continue
+            seen[key] = 1
+            di = key * 2
+            dst = window[di] | (window[di + 1] << 8)
+            out = _add565(dst, col)
+            window[di] = out & 0xFF
+            window[di + 1] = (out >> 8) & 0xFF
+
+
+def _ring_parse(text):
+    """(seq, count) from one finished slot, or None when the bytes are torn."""
+    if not isinstance(text, str):
+        return None
+    n = len(text)
+    if n < 4 or n > 24 or text[n - 1] != "\n":
+        return None
+    sp = text.find(" ")
+    if sp <= 0 or sp >= n - 2:
+        return None
+    if text.find(" ", sp + 1) >= 0:
+        return None
+    seq_s = text[:sp]
+    count_s = text[sp + 1:n - 1]
+    if (not seq_s.isdigit()) or (not count_s.isdigit()):
+        return None
+    seq = int(seq_s)
+    count = int(count_s)
+    if seq < 1 or count > 999:
+        return None
+    return seq, count
+
+
+def _ring_slot_read(base, slot):
+    path = "%s.%d" % (base, slot)
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return None
+    try:
+        data = f.read(32)
+    except Exception:
+        return None
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+    if not data or len(data) > 24:
+        return None
+    try:
+        text = data.decode("ascii")
+    except Exception:
+        return None
+    return _ring_parse(text)
+
+
+def ring_count_load(base=None):
+    """(count, seq, slot). (0, 0, -1) when neither slot is a finished write.
+
+    The scroll masks are not in the file. A torn slot is ignored, so the
+    other slot is the count that survived a hard power-off.
+    """
+    if base is None:
+        base = RING_COUNT_BASE
+    try:
+        best = None
+        for slot in (0, 1):
+            parsed = _ring_slot_read(base, slot)
+            if parsed is None:
+                continue
+            seq, count = parsed
+            if best is None or seq > best[0] or (seq == best[0] and slot > best[1]):
+                best = (seq, slot, count)
+        if best is None:
+            return 0, 0, -1
+        return best[2], best[0], best[1]
+    except Exception:
+        return 0, 0, -1
+
+
+def ring_count_store(count, seq, slot, base=None):
+    """Commit one slot. The other slot stays until this rename finishes."""
+    if base is None:
+        base = RING_COUNT_BASE
+    count = int(count) % 1000
+    if count < 0:
+        count = 0
+    seq = int(seq)
+    if seq < 1:
+        seq = 1
+    slot = 0 if int(slot) == 0 else 1
+    dest = "%s.%d" % (base, slot)
+    tmp = dest + ".tmp"
+    payload = ("%d %d\n" % (seq, count)).encode("ascii")
+    f = open(tmp, "wb")
+    try:
+        f.write(payload)
+        try:
+            f.flush()
+        except Exception:
+            pass
+    finally:
+        f.close()
+    try:
+        os.remove(dest)
+    except OSError:
+        pass
+    os.rename(tmp, dest)
+    try:
+        os.sync()
+    except Exception:
+        pass
 
 
 class Sprite:
@@ -4278,13 +5571,46 @@ class Sprite:
         self.body_col = COL_SONIC
         self.boost = BoostFX()
         self.pack = pack
-        self.rings = 0
+        count, seq, slot = ring_count_load()
+        self.rings = count
+        self._ring_seq = seq
+        self._ring_slot = slot
+        self._ring_dirty = False
+        self._ring_save_ms = None
         self._ring_seen = 0
+        self._ring_got = 0
         self.anim_tag = "idle"
+        self._run_pending = None
         self.anim_i = 0
         self.anim_accum = 0
         self.idle_wait = 0
         self.triggering = False
+        self.hockey = False
+        self.hockey_i = -1
+        self._hockey_arm = 0
+        self._hockey_accum = 0
+        self.chao_phase = "off"
+        self.chao_type = 0
+        self.chao_joined = False
+        self.chao_i = 0
+        self.chao_accum = 0
+        self.chao_x = 0
+        self.chao_x0 = 0
+        self.chao_y = CHAO_HEAD_Y
+        self.chao_travel = 0
+        self.chao_face = 1
+        self.chao_bob_p = 0
+        self.chao_dwell = 0
+        self.chao_side = 0
+        self.chao_side_phase = "hold"
+        self.chao_side_t = 0
+        self.chao_side_from = 0
+        self.chao_side_to = 1
+        self.chao_spd = None
+        self.chao_spd_age = 0
+        self.chao_exit = 1
+        self._spd_prev = None
+        self.decel = 0.0
         self.ring_i = 0
         self.ring_accum = 0
         self.sparkles = []  # [x, y, i, accum]
@@ -4320,6 +5646,7 @@ class Sprite:
         self._sig_ring_i = -1
         self._sig_anim_tag = None
         self._sig_anim_i = -1
+        self._sig_chao = None
         self._sig_scroll_i = -999999
         self._sig_amount = None
         self._sig_spark = []
@@ -4376,6 +5703,8 @@ class Sprite:
         self._nat_aura = -999
         self._nat_sw = -999
         self._nat_bar = -999
+        self._nat_spk = -999
+        self._nat_chao = None
         self._nat_spark = []
         self._off_buf = []
         self._sync_ground()
@@ -4405,7 +5734,7 @@ class Sprite:
         self._prepare_sprites(force=True)
 
     def _prepare_ocean(self, force=False):
-        """Pre-render the 384x103 ocean tile into RGB565 once per pack load."""
+        """Pre-render far_bg and mid_bg into one RGB565 tile per pack load."""
         if (
             not force
             and self.ocean_rgb565 is not None
@@ -4431,11 +5760,13 @@ class Sprite:
         pack = self.pack
         if pack is None:
             return
-        ocean = pack.by_name.get("ocean")
-        if ocean is None or ocean.w <= 0 or ocean.h <= 0:
+        far = pack.by_name.get("far_bg")
+        mid = pack.by_name.get("mid_bg")
+        if far is None or mid is None or far.w <= 0 or mid.w <= 0:
             return
         try:
-            buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+            buf, tw, th = prerender_sea_rgb565(pack)
+            repair_ocean_tile(buf, tw, th)
             window = bytearray(W * th * 2)
         except MemoryError:
             print("ocean rgb565 alloc failed")
@@ -4452,15 +5783,21 @@ class Sprite:
         except MemoryError:
             print("ocean parallax alloc failed, using 1.0 scroll")
             try:
-                buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+                buf, tw, th = prerender_sea_rgb565(pack)
+                repair_ocean_tile(buf, tw, th)
             except Exception:
                 pass
         except Exception as e:
             print("ocean parallax failed:", e)
             try:
-                buf, tw, th = prerender_ocean_rgb565(pack, ocean)
+                buf, tw, th = prerender_sea_rgb565(pack)
+                repair_ocean_tile(buf, tw, th)
             except Exception:
                 pass
+        _continue_dirt_checker(buf, tw, th)
+        _install_sheet_backdrop(buf, tw, th, pack)
+        # The sea picture has no hill stamps. Keep the packed ground props.
+        stamps = _sheet_prop_stamps(pack, th)
         self.ocean_rgb565 = buf
         self.ocean_tw = tw
         self.ocean_th = th
@@ -4597,33 +5934,301 @@ class Sprite:
         del self._under_spans[:]
         self._retain = True
 
-    def advance(self, speed, dt_ms, rpm=None):
+    def advance(self, speed, dt_ms, rpm=None, brk=None):
         if speed is None:
             speed = 0.0
         if rpm is None:
             rpm = 0.0
+        if brk is None:
+            brk = 0.0
         period = self._scroll_period
         self.scroll = (self.scroll + speed * dt_ms * 0.012) % period
         if speed < 1.0:
             self.phase = 0.0
         else:
             self.phase = (self.phase + dt_ms * (0.002 + 0.00035 * speed)) % 4.0
+        self._step_hockey(speed, dt_ms, brk)
+        self._step_chao(speed, dt_ms)
         self.boost.tick(speed, dt_ms, rpm)
-        self._step_anim(speed, dt_ms)
+        self._step_anim(speed, dt_ms, rpm)
         self._collect_rings()
         self._step_sparkles(dt_ms)
 
+    def _step_hockey(self, speed, dt_ms, brk):
+        """Arm a 3-frame stop when the brake and the decel both stay hard.
+
+        The pose faces the way the run faces. Nothing is drawn until a
+        `skid` cycle exists in the pack.
+        """
+        prev = self._spd_prev
+        self._spd_prev = speed
+        if prev is None or dt_ms <= 0:
+            decel = 0.0
+        else:
+            decel = (prev - speed) * (1000.0 / float(dt_ms))
+        self.decel = decel
+        braking = brk >= 0.5
+        if self.hockey:
+            if (not braking) or decel < HOCKEY_OFF_DECEL:
+                self.hockey = False
+                self.hockey_i = -1
+                self._hockey_arm = 0
+                self._hockey_accum = 0
+                return
+            self._hockey_accum += dt_ms
+            if self._hockey_accum >= FX_FRAME_MS:
+                self._hockey_accum -= FX_FRAME_MS
+                if self._hockey_accum > FX_FRAME_MS:
+                    self._hockey_accum = FX_FRAME_MS
+                if self.hockey_i < HOCKEY_FRAMES - 1:
+                    self.hockey_i += 1
+            return
+        if braking and decel >= HOCKEY_ON_DECEL and speed > HOCKEY_MIN_KMH:
+            self._hockey_arm += dt_ms
+            if self._hockey_arm >= HOCKEY_ARM_MS:
+                self.hockey = True
+                self.hockey_i = 0
+                self._hockey_accum = 0
+        else:
+            self._hockey_arm = 0
+
+    def _chao_begin_leave(self, speed):
+        """Above 80 km/h the Chao falls behind off the left, still facing right."""
+        if speed >= SPEED_FAST:
+            self.chao_exit = -1
+        else:
+            self.chao_exit = 1
+        self.chao_face = 1
+        self._chao_start("leave")
+
+    def _chao_start(self, phase):
+        self.chao_phase = phase
+        self.chao_x0 = int(self.chao_x)
+        self.chao_travel = 0
+        self.chao_i = 0
+        self.chao_accum = 0
+
+    def _chao_step_frame(self, dt_ms):
+        self.chao_accum += dt_ms
+        if self.chao_accum >= CHAO_FRAME_MS:
+            self.chao_accum -= CHAO_FRAME_MS
+            if self.chao_accum > CHAO_FRAME_MS:
+                self.chao_accum = CHAO_FRAME_MS
+            self.chao_i = (self.chao_i + 1) & 1
+
+    def _chao_bob(self, dt_ms):
+        """Wander around head height. Approach stays tighter than a hover."""
+        if self.chao_phase == "follow" and self.chao_side_phase == "hold":
+            amp = CHAO_BOB_HOVER
+        else:
+            amp = CHAO_BOB_JOIN
+        self.chao_bob_p += dt_ms
+        period = CHAO_BOB_PERIOD_MS
+        if period < 1:
+            period = 1
+        if self.chao_bob_p >= period * 4:
+            self.chao_bob_p -= period * 4
+        ang = (self.chao_bob_p % period) * 6.28318530718 / float(period)
+        ang2 = ((self.chao_bob_p // 2) % period) * 6.28318530718 / float(period)
+        dy = math.sin(ang) * amp + math.sin(ang2 + 1.3) * (amp * 0.35)
+        if dy > amp:
+            dy = amp
+        elif dy < -amp:
+            dy = -amp
+        self.chao_y = CHAO_HEAD_Y + dy
+        self.chao_bob_amp = amp
+
+    def _chao_drastic(self, speed, dt_ms):
+        """True when speed jumps by CHAO_DRASTIC_KMH inside CHAO_DRASTIC_MS."""
+        if self.chao_spd is None:
+            self.chao_spd = speed
+            self.chao_spd_age = 0
+            return False
+        self.chao_spd_age += dt_ms
+        delta = speed - self.chao_spd
+        if delta < 0:
+            delta = -delta
+        if delta >= CHAO_DRASTIC_KMH and self.chao_spd_age <= CHAO_DRASTIC_MS:
+            self.chao_spd = speed
+            self.chao_spd_age = 0
+            return True
+        if self.chao_spd_age >= CHAO_DRASTIC_MS:
+            self.chao_spd = speed
+            self.chao_spd_age = 0
+        return False
+
+    def _chao_key(self):
+        if self.chao_phase == "off":
+            return None
+        return (
+            self.chao_phase,
+            self.chao_type,
+            self.chao_i,
+            int(self.chao_x),
+            int(self.chao_y),
+            self.chao_face,
+            self.chao_side,
+        )
+
+    def _chao_flipped_runs(self, fr):
+        # chao_face 1 means facing right, which is how the art is stored.
+        if not self.chao_face:
+            return _mirror_runs(fr)
+        return fr.runs, fr.nruns
+
+    def _step_chao(self, speed, dt_ms):
+        """Join from the left, hover on both sides, then leave off the right.
+
+        Stays up to five minutes. Leaves early above 80 km/h or when speed
+        jumps by CHAO_DRASTIC_KMH within CHAO_DRASTIC_MS. Travel eases in
+        and out. The packed sprites face right, so a leftward move is mirrored.
+        """
+        cruise = speed >= 1.0 and speed < SPEED_FAST
+        if self.chao_phase == "off":
+            if not cruise:
+                self._chao_drastic(speed, dt_ms)
+                return
+            if self.chao_joined:
+                self.chao_type = (self.chao_type + 1) % len(CHAO_TYPES)
+            else:
+                self.chao_type = 0
+                self.chao_joined = True
+            self.chao_x = CHAO_OFF_LEFT
+            self.chao_dwell = 0
+            self.chao_side = 0
+            self.chao_side_phase = "hold"
+            self.chao_side_t = 0
+            self.chao_face = 1
+            self._chao_start("join")
+        phase = self.chao_phase
+        if phase == "off":
+            return
+        leave = speed >= SPEED_FAST or self._chao_drastic(speed, dt_ms)
+        if phase == "follow":
+            self.chao_dwell += dt_ms
+            if leave or self.chao_dwell >= CHAO_DWELL_MS:
+                self._chao_begin_leave(speed)
+                self._chao_bob(dt_ms)
+                return
+            else:
+                self._chao_follow(dt_ms)
+                self._chao_step_frame(dt_ms)
+                self._chao_bob(dt_ms)
+                return
+        if phase == "join" or phase == "leave":
+            if phase == "join" and leave:
+                self._chao_begin_leave(speed)
+                self._chao_bob(dt_ms)
+                return
+            limit = CHAO_JOIN_MS if phase == "join" else CHAO_LEAVE_MS
+            self.chao_travel += dt_ms
+            if self.chao_travel > limit:
+                self.chao_travel = limit
+            t = _chao_ease(self.chao_travel / float(limit if limit else 1))
+            if phase == "join":
+                dest = CHAO_LEFT_X
+                self.chao_face = 1
+            elif self.chao_exit < 0:
+                dest = CHAO_OFF_LEFT
+                self.chao_face = 1
+            else:
+                dest = CHAO_OFF_RIGHT
+                self.chao_face = 1
+            self.chao_x = self.chao_x0 + (dest - self.chao_x0) * t
+            if t >= 1.0:
+                if phase == "join":
+                    self.chao_phase = "follow"
+                    self.chao_x = CHAO_LEFT_X
+                    self.chao_side = 0
+                    self.chao_side_phase = "hold"
+                    self.chao_side_t = 0
+                    self.chao_dwell = 0
+                    self.chao_i = 0
+                    self.chao_accum = 0
+                    self.chao_face = 1
+                else:
+                    self.chao_phase = "off"
+                self._chao_bob(dt_ms)
+                return
+            self._chao_step_frame(dt_ms)
+            self._chao_bob(dt_ms)
+
+    def _chao_follow(self, dt_ms):
+        """Hold one side, then ease across to the other."""
+        self.chao_side_t += dt_ms
+        if self.chao_side_phase == "hold":
+            if self.chao_side == 0:
+                self.chao_x = CHAO_LEFT_X
+            else:
+                self.chao_x = CHAO_RIGHT_X
+            if self.chao_side_t >= CHAO_SIDE_HOLD_MS:
+                self.chao_side_from = self.chao_side
+                self.chao_side_to = 0 if self.chao_side else 1
+                self.chao_side_phase = "move"
+                self.chao_side_t = 0
+                self.chao_x0 = int(self.chao_x)
+            return
+        limit = CHAO_SIDE_MS
+        if limit < 1:
+            limit = 1
+        t = _chao_ease(self.chao_side_t / float(limit))
+        x_from = CHAO_LEFT_X if self.chao_side_from == 0 else CHAO_RIGHT_X
+        x_to = CHAO_LEFT_X if self.chao_side_to == 0 else CHAO_RIGHT_X
+        self.chao_x = x_from + (x_to - x_from) * t
+        self.chao_face = 1 if x_to >= x_from else 0
+        if self.chao_side_t >= limit:
+            self.chao_side = self.chao_side_to
+            self.chao_side_phase = "hold"
+            self.chao_side_t = 0
+            self.chao_x = x_to
+
+    def _chao_stamp(self):
+        """(frame, top-left x, top-left y), or None when the slot is empty."""
+        if self.chao_phase == "off":
+            return None
+        if self.chao_type < 0 or self.chao_type >= len(CHAO_TYPES):
+            return None
+        frames = self._cycle_frames(CHAO_TYPES[self.chao_type])
+        if not frames:
+            return None
+        if self.chao_phase == "follow" and self.chao_side_phase == "hold":
+            idx = CHAO_HOVER[self.chao_i & 1]
+        else:
+            idx = CHAO_MOVE[self.chao_i & 1]
+        if idx >= len(frames):
+            return None
+        fr = frames[idx]
+        y = self.chao_y
+        if y is None:
+            y = CHAO_HEAD_Y
+        return fr, int(self.chao_x) - fr.origin_x, int(y) - fr.origin_y
+
     def _cycle_frames(self, tag):
+        if not isinstance(tag, str):
+            return None
         pack = self.pack
         if pack is None:
             return None
         return pack.cycles.get(tag)
 
-    def _step_anim(self, speed, dt_ms):
+    def _step_anim(self, speed, dt_ms, rpm=None):
         pack = self.pack
         if pack is None:
             return
-        if speed < 1.0:
+        if rpm is None:
+            rpm = 0.0
+        hockey_frames = None
+        if self.hockey:
+            hockey_frames = self._cycle_frames("skid")
+        if hockey_frames:
+            tag = "skid"
+        elif speed < 1.0 and rpm > 1200.0:
+            # Same stopped gate as idle. A rev above 1200 rpm plays the
+            # packed spindash cycle. 1200 rpm stays on idle.
+            self.idle_wait = 0
+            self.triggering = False
+            tag = "spindash"
+        elif speed < 1.0:
             if self.triggering:
                 tag = "idle_trigger"
             else:
@@ -4643,25 +6248,74 @@ class Sprite:
                 tag = "run_medium"
             else:
                 tag = "run_fast"
-        frames = self._cycle_frames(tag)
+        if hockey_frames:
+            frames = hockey_frames
+        else:
+            frames = self._cycle_frames(tag)
         if not frames:
             return
+        # A run-to-run speed change waits until this cycle wraps. Switching
+        # the tag in the middle left the draw with the previous frames list.
+        if (
+            isinstance(tag, str)
+            and isinstance(self.anim_tag, str)
+            and tag in _RUN_TAGS
+            and self.anim_tag in _RUN_TAGS
+        ):
+            if tag != self.anim_tag:
+                self._run_pending = tag
+            tag = self.anim_tag
+            frames = self._cycle_frames(tag)
+            if not frames:
+                return
+        else:
+            self._run_pending = None
         if tag != self.anim_tag:
             # Show the first frame of the new cycle for this present.
             self.anim_tag = tag
-            self.anim_i = 0
-            self.anim_accum = 0
-        else:
-            # One Sonic frame per present. A late paint must not spend
-            # leftover dt on a second step.
-            self.anim_i += 1
-            if self.anim_i >= len(frames):
+            if tag == "skid":
+                self.anim_i = self.hockey_i if self.hockey_i >= 0 else 0
+            else:
                 self.anim_i = 0
-                if self.anim_tag == "idle_trigger":
-                    self.triggering = False
-                    self.anim_tag = "idle"
-                    self.idle_wait = 0
-        self.ring_i = (self.ring_i + 1) & 7
+            self.anim_accum = 0
+        elif tag == "skid":
+            self.anim_i = self.hockey_i if self.hockey_i >= 0 else 0
+            if self.anim_i >= len(frames):
+                self.anim_i = len(frames) - 1
+        else:
+            # Character frames at 15 fps. A late paint still takes one step.
+            self.anim_accum += dt_ms
+            if self.anim_accum >= FX_FRAME_MS:
+                self.anim_accum -= FX_FRAME_MS
+                if self.anim_accum > FX_FRAME_MS:
+                    self.anim_accum = FX_FRAME_MS
+                self.anim_i += 1
+                if self.anim_i >= len(frames):
+                    self.anim_i = 0
+                    if self.anim_tag == "idle_trigger":
+                        self.triggering = False
+                        self.anim_tag = "idle"
+                        self.idle_wait = 0
+                    pending = self._run_pending
+                    if (
+                        isinstance(pending, str)
+                        and pending in _RUN_TAGS
+                        and pending != self.anim_tag
+                    ):
+                        self.anim_tag = pending
+                        self._run_pending = None
+                        frames = self._cycle_frames(self.anim_tag)
+                        if not frames:
+                            return
+        # World-ring spin at 15 fps. Its clock is not the present quantum
+        # and not the character tag change, so a speed-band swap does not
+        # freeze the spin. A late paint still takes one step.
+        self.ring_accum += dt_ms
+        if self.ring_accum >= FX_FRAME_MS:
+            self.ring_accum -= FX_FRAME_MS
+            if self.ring_accum > FX_FRAME_MS:
+                self.ring_accum = FX_FRAME_MS
+            self.ring_i = (self.ring_i + 1) & 7
 
     def _purge_sparkles(self):
         """Drop a sparkle slot that is not [x, y, frame, acc].
@@ -4759,6 +6413,9 @@ class Sprite:
                 n += v & 1
                 v >>= 1
             self.rings = (self.rings + n) % 1000
+            # Count only. The seen/got masks stay in RAM so a reboot does
+            # not skip or repeat rings from a stale scroll position.
+            self._ring_dirty = True
             if self.pack is not None:
                 period = RING_PERIOD
                 xs = FIELD_RING_X
@@ -4770,6 +6427,40 @@ class Sprite:
                         self.sparkles.append([x, FIELD_RING_Y, 0, 0])
                     i += 1
         self._ring_seen = mask
+        self._ring_got |= gained
+
+    def save_rings(self, now):
+        """Write the HUD count after the present, at most once per RING_SAVE_MS.
+
+        A hard power-off keeps the last slot that finished. Rings collected
+        since that write are still only in RAM. The masks are not written.
+        """
+        if not self._ring_dirty:
+            return False
+        last = self._ring_save_ms
+        if last is not None and time.ticks_diff(now, last) < RING_SAVE_MS:
+            return False
+        if self._ring_slot == 0:
+            slot = 1
+        else:
+            slot = 0
+        seq = self._ring_seq + 1
+        if seq < 1:
+            seq = 1
+        count = int(self.rings) % 1000
+        _feed_wdt()
+        try:
+            ring_count_store(count, seq, slot)
+        except Exception:
+            # Stay dirty, but do not retry on the next frame.
+            self._ring_save_ms = now
+            return False
+        self.rings = count
+        self._ring_seq = seq
+        self._ring_slot = slot
+        self._ring_dirty = False
+        self._ring_save_ms = now
+        return True
 
     def _draw_hud_digits(self, lcd, bx, by):
         dx, dy = bx + 22, by + 4
@@ -4789,15 +6480,22 @@ class Sprite:
         pack = self.pack
         if pack is not None:
             bx, by = HUD_BAR_POS
-            # Ring and bar were already stamped into the pushed playfield.
+            # The gauge was already stamped into the pushed playfield.
             if not self._playfield_stamped:
-                pal = pack.pal(1)
-                bar = pack.by_name.get("hud_bar")
-                ring = pack.by_name.get("hud_ring")
-                if bar is not None:
-                    blit_frame(lcd, pack, bar, bx, by, pal, 0, GAUGE_Y, False)
-                if ring is not None:
-                    blit_frame(lcd, pack, ring, HUD_RING_POS[0], HUD_RING_POS[1], pal, 0, GAUGE_Y, False)
+                gauge = pack.by_name.get("hud_gauge")
+                if gauge is not None:
+                    blit_frame(
+                        lcd, pack, gauge, HUD_GAUGE_POS[0], HUD_GAUGE_POS[1],
+                        pack.pal(gauge.pal_id), 0, GAUGE_Y, False,
+                    )
+                else:
+                    pal = pack.pal(1)
+                    bar = pack.by_name.get("hud_bar")
+                    ring = pack.by_name.get("hud_ring")
+                    if bar is not None:
+                        blit_frame(lcd, pack, bar, bx, by, pal, 0, GAUGE_Y, False)
+                    if ring is not None:
+                        blit_frame(lcd, pack, ring, HUD_RING_POS[0], HUD_RING_POS[1], pal, 0, GAUGE_Y, False)
             self._draw_hud_digits(lcd, bx, by)
             return
         # V2 primitive fallback
@@ -4873,16 +6571,23 @@ class Sprite:
                 tip_y = SONIC_MID_Y
                 self._draw_sonic(lcd, speed, tps, clt)
                 # Aura is layered on top of Sonic at the locked tip.
-                self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
-                self.boost.draw_front(lcd, SW_TIP_X, tip_y)
+                if not self._blit_packed_fx(lcd):
+                    self.boost.draw_behind(lcd, AURA_TIP_X, tip_y)
+                    self.boost.draw_front(lcd, SW_TIP_X, tip_y)
             self._draw_ring_hud(lcd)
         finally:
             _brk_exit()
 
+    def _ring_taken(self, idx):
+        """True after the ring's centre has crossed Sonic. Draw skips it."""
+        return ((self._ring_got >> idx) & 1) != 0
+
     def _field_ring_xs(self, off):
         period = RING_PERIOD
         found = []
-        for wx in FIELD_RING_X:
+        for i, wx in enumerate(FIELD_RING_X):
+            if self._ring_taken(i):
+                continue
             x = (wx - off) % period
             if x > W + 40:
                 x -= period
@@ -4909,6 +6614,13 @@ class Sprite:
         if frames:
             fr = frames[self.anim_i % len(frames)]
             blit_frame(lcd, pack, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, pal_c, 0, GAUGE_Y, True)
+        chao = self._chao_stamp()
+        if chao is not None:
+            fr, x0, y0 = chao
+            blit_frame(
+                lcd, pack, fr, x0, y0, pack.pal(fr.pal_id), 0, GAUGE_Y, False,
+                not self.chao_face,
+            )
 
     def _can_retain(self):
         if not (
@@ -4989,6 +6701,7 @@ class Sprite:
             self.ocean_stamps,
             self.ocean_window,
             W,
+            SEA_SHIFT,
         )
         self._commit_offs()
         self._pf_valid = True
@@ -5036,6 +6749,32 @@ class Sprite:
                 self._band_mode[idx] = 1
             else:
                 self._band_mode[idx] = 2
+        self._repaint_horizon()
+
+    def _repaint_horizon(self):
+        """Redraw the sea-sky rows from the tile. A band shift must not keep them.
+
+        Sky and sea scroll at different speeds. The join rows are copied
+        again from the tile at the new offsets so a previous frame cannot
+        sit in that strip.
+        """
+        tile = self.ocean_rgb565
+        win = self.ocean_window
+        tw = self.ocean_tw
+        if tile is None or win is None or tw <= 0:
+            return
+        off_c = self._band_new[0]
+        off_w = self._band_new[1]
+        y = HORIZON_Y - 1
+        if y >= 0:
+            _copy_partial_row(tile, tw, y, off_c, win, 0, W)
+        y = HORIZON_Y
+        y1 = HORIZON_Y + 4
+        if y1 > self.ocean_th:
+            y1 = self.ocean_th
+        while y < y1:
+            _copy_partial_row(tile, tw, y, off_w, win, 0, W)
+            y += 1
 
     def _stamp_carried(self, oy, sh, d_stamp):
         """True when the shift already left this stamp on its new pixels.
@@ -5310,6 +7049,8 @@ class Sprite:
             return False
         if self._sig_anim_i != self.anim_i or self._sig_anim_tag != self.anim_tag:
             return False
+        if self._sig_chao != self._chao_key():
+            return False
         if self._sig_scroll_i != int(self.scroll):
             return False
         if self._sig_amount != amount:
@@ -5333,6 +7074,7 @@ class Sprite:
         self._sig_ring_i = self.ring_i
         self._sig_anim_tag = self.anim_tag
         self._sig_anim_i = self.anim_i
+        self._sig_chao = self._chao_key()
         self._sig_scroll_i = int(self.scroll)
         self._sig_amount = amount
         prev = self._sig_spark
@@ -5404,7 +7146,7 @@ class Sprite:
         self._sprites_on = True
         return True
 
-    def _stamp_frame(self, window, vw, vh, fr, dest_x, dest_y, use_origin, amount, save_under=False):
+    def _stamp_frame(self, window, vw, vh, fr, dest_x, dest_y, use_origin, amount, save_under=False, flip=False):
         at = self._bake_at.get(fr.name)
         if at is None:
             raise KeyError(fr.name)
@@ -5426,6 +7168,8 @@ class Sprite:
         y0 = int(y0)
         if save_under:
             self._save_underlay(x0, y0, fr.w, fr.h, vw, vh)
+        if flip:
+            rgb, mask = _mirror_baked(rgb, mask, fr.w, fr.h)
         stamp_baked(window, vw, vh, rgb, mask, fr.w, fr.h, x0, y0)
 
     def _plan_places(self, amount):
@@ -5460,7 +7204,7 @@ class Sprite:
                 x = (xs[idx] - off) % period
                 if x > W + 40:
                     x -= period
-                if -40 < x < W + 40:
+                if (not self._ring_taken(idx)) and -40 < x < W + 40:
                     x0 = int(x - fr.origin_x)
                     y0 = int(FIELD_RING_Y - fr.origin_y)
                     self._emit_place(out, keys[idx], x0, y0, fr.w, fr.h, fr, 0, "rings")
@@ -5488,16 +7232,27 @@ class Sprite:
             x0 = int(SONIC_FEET_DEST_X - fr.origin_x)
             y0 = int(SONIC_FEET_DEST_Y - fr.origin_y)
             self._emit_place(out, "sonic", x0, y0, fr.w, fr.h, fr, amount, "sonic")
-        bar = pack.by_name.get("hud_bar")
-        if bar is not None:
+        chao = self._chao_stamp()
+        if chao is not None:
+            fr, x0, y0 = chao
+            self._emit_place(out, "chao", x0, y0, fr.w, fr.h, fr, 0, "chao")
+        gauge = pack.by_name.get("hud_gauge")
+        if gauge is not None:
             self._emit_place(
-                out, "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
+                out, "hud_gauge", HUD_GAUGE_POS[0], HUD_GAUGE_POS[1],
+                gauge.w, gauge.h, gauge, 0, "hud",
             )
-        ring = pack.by_name.get("hud_ring")
-        if ring is not None:
-            self._emit_place(
-                out, "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
-            )
+        else:
+            bar = pack.by_name.get("hud_bar")
+            if bar is not None:
+                self._emit_place(
+                    out, "hud_bar", HUD_BAR_POS[0], HUD_BAR_POS[1], bar.w, bar.h, bar, 0, "hud"
+                )
+            ring = pack.by_name.get("hud_ring")
+            if ring is not None:
+                self._emit_place(
+                    out, "hud_ring", HUD_RING_POS[0], HUD_RING_POS[1], ring.w, ring.h, ring, 0, "hud"
+                )
         return out
 
     def _emit_place(self, out, key, x, y, w, h, fr, extra, kind):
@@ -5690,6 +7445,17 @@ class Sprite:
             if y1 <= y0:
                 continue
             self._shift_play_band(y0, y1, self._band_delta[idx])
+        if self.ocean_window is not None and self.play_window is not None:
+            y = HORIZON_Y - 1
+            if y < 0:
+                y = 0
+            y1 = HORIZON_Y + 4
+            if y1 > self.ocean_th:
+                y1 = self.ocean_th
+            while y < y1:
+                src = y * W * 2
+                self.play_window[src:src + W * 2] = self.ocean_window[src:src + W * 2]
+                y += 1
 
     def _note_stamp_part(self, kind, dt):
         if dt < 0:
@@ -5804,16 +7570,29 @@ class Sprite:
             self._stamp_frame(
                 window, vw, vh, fr, SONIC_FEET_DEST_X, SONIC_FEET_DEST_Y, True, amount, save_under
             )
-        bar = pack.by_name.get("hud_bar")
-        if bar is not None:
+        chao = self._chao_stamp()
+        if chao is not None:
+            fr, x0, y0 = chao
             self._stamp_frame(
-                window, vw, vh, bar, HUD_BAR_POS[0], HUD_BAR_POS[1], False, 0, save_under
+                window, vw, vh, fr, x0, y0, False, 0, save_under, not self.chao_face
             )
-        ring = pack.by_name.get("hud_ring")
-        if ring is not None:
+        gauge = pack.by_name.get("hud_gauge")
+        if gauge is not None:
             self._stamp_frame(
-                window, vw, vh, ring, HUD_RING_POS[0], HUD_RING_POS[1], False, 0, save_under
+                window, vw, vh, gauge, HUD_GAUGE_POS[0], HUD_GAUGE_POS[1],
+                False, 0, save_under,
             )
+        else:
+            bar = pack.by_name.get("hud_bar")
+            if bar is not None:
+                self._stamp_frame(
+                    window, vw, vh, bar, HUD_BAR_POS[0], HUD_BAR_POS[1], False, 0, save_under
+                )
+            ring = pack.by_name.get("hud_ring")
+            if ring is not None:
+                self._stamp_frame(
+                    window, vw, vh, ring, HUD_RING_POS[0], HUD_RING_POS[1], False, 0, save_under
+                )
 
     def _note_timing(self, compose_us, stamp_us, push_us, held):
         if compose_us < 0:
@@ -6008,6 +7787,8 @@ class Sprite:
             self._nat_aura != boost.aura_i
             or self._nat_sw != boost.sw_i
             or self._nat_bar != boost.bar_i
+            or self._nat_spk != boost.spark_i
+            or self._nat_chao != self._chao_key()
         ):
             return False
         sp = self.sparkles
@@ -6053,11 +7834,83 @@ class Sprite:
         self._nat_aura = boost.aura_i
         self._nat_sw = boost.sw_i
         self._nat_bar = boost.bar_i
+        self._nat_spk = boost.spark_i
+        self._nat_chao = self._chao_key()
         prev = self._nat_spark
         del prev[:]
         for item in self.sparkles:
             prev.append((item[0], item[1], item[2]))
         self._native_ready = True
+
+    def _packed_fx_on(self):
+        pack = self.pack
+        return pack is not None and pack.by_name.get("fx_aura_0") is not None
+
+    def _stamp_packed_fx(self, window, vw, vh):
+        """Stamp the packed boost frames. Returns True when they replace gh.fx."""
+        if not BOOST_VFX:
+            # True means the caller must not fall through to gh.fx either.
+            return True
+        gh = _GH
+        pack = self.pack
+        if gh is None or pack is None or not hasattr(gh, "stamp_runs"):
+            return False
+        if not self._packed_fx_on():
+            return False
+        boost = self.boost
+        specs = (
+            ("fx_aura", boost.aura_i, AURA_TIP_X, AURA_TIP_Y),
+            ("fx_boot", boost.sw_i, SW_TIP_X, AURA_TIP_Y + BOOT_DY),
+            ("fx_bar", boost.bar_i, BAR_TIP_X, BAR_TIP_Y),
+            ("fx_spark", boost.spark_i, SPARK_FRONT_X, SPARK_MID_Y),
+        )
+        for prefix, index, ax, ay in specs:
+            if index < 0:
+                continue
+            fr = pack.by_name.get("%s_%d" % (prefix, index))
+            if fr is None or not fr.nruns:
+                continue
+            pal_id = fr.pal_id
+            if pal_id < 0 or pal_id >= len(pack.pair_bytes):
+                pal_id = 0
+            pairs = pack.pair_bytes[pal_id]
+            x0 = ax - fr.origin_x
+            y0 = ay - fr.origin_y
+            # Each sprite adds once onto what is already there.
+            if hasattr(gh, "add_begin"):
+                gh.add_begin(vw, vh)
+                gh.stamp_runs(
+                    window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2,
+                    x0, y0,
+                )
+                gh.add_end()
+            else:
+                _add_fx_runs(window, vw, vh, fr, pairs, x0, y0)
+        return True
+
+    def _blit_packed_fx(self, lcd):
+        """LCD fallback for the packed boost frames."""
+        if not BOOST_VFX:
+            # True means the caller must not fall through to the LCD primitives.
+            return True
+        pack = self.pack
+        if pack is None or not self._packed_fx_on():
+            return False
+        boost = self.boost
+        specs = (
+            ("fx_aura", boost.aura_i, AURA_TIP_X, AURA_TIP_Y),
+            ("fx_boot", boost.sw_i, SW_TIP_X, AURA_TIP_Y + BOOT_DY),
+            ("fx_bar", boost.bar_i, BAR_TIP_X, BAR_TIP_Y),
+            ("fx_spark", boost.spark_i, SPARK_FRONT_X, SPARK_MID_Y),
+        )
+        for prefix, index, ax, ay in specs:
+            if index < 0:
+                continue
+            fr = pack.by_name.get("%s_%d" % (prefix, index))
+            if fr is None:
+                continue
+            blit_frame(lcd, pack, fr, ax, ay, pack.pal(fr.pal_id), 0, GAUGE_Y, True)
+        return True
 
     def _paint_native(self, amount, with_fx, offs_ready=False):
         """Fill play_window. Fills _paint_us: compose, stamp, hud, sonic, rings, fx, digits.
@@ -6085,6 +7938,7 @@ class Sprite:
                 gh.compose(
                     tile, tw, th, off_c, off_w, off_g, HORIZON_Y, GRASS_Y,
                     self.ocean_stamps, self._off_buf, window,
+                    0,
                 )
             else:
                 gh.copy(tile, tw, th, off_c, window, vw)
@@ -6114,11 +7968,17 @@ class Sprite:
                         if pal_id < 0 or pal_id >= len(self.pack.pair_bytes):
                             pal_id = 0
                         pairs = self.pack.pair_bytes[pal_id]
+                    runs = fr.runs
+                    nruns = fr.nruns
+                    if p[0] == "chao" and not self.chao_face:
+                        runs, nruns = self._chao_flipped_runs(fr)
                     gh.stamp_runs(
-                        window, vw, vh, fr.runs, fr.nruns, pairs, len(pairs) // 2, p[1], p[2]
+                        window, vw, vh, runs, nruns, pairs, len(pairs) // 2, p[1], p[2]
                     )
                 else:
                     rgb, mask = self._native_views(fr, p[6])
+                    if p[0] == "chao" and not self.chao_face:
+                        rgb, mask = _mirror_baked(rgb, mask, fr.w, fr.h)
                     gh.stamp(window, vw, vh, rgb, mask, fr.w, fr.h, p[1], p[2])
             finally:
                 _brk_exit()
@@ -6138,11 +7998,22 @@ class Sprite:
             t_fx = _mono_us()
             _brk_enter("fx")
             try:
-                gh.fx(
-                    window, vw, vh,
-                    boost.aura_i, boost.sw_i, boost.bar_i,
-                    AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
-                )
+                # BOOST_VFX False skips the additive aura, shockwave, barrier,
+                # and sparks. Digits below still draw. Flip the flag to draw.
+                if BOOST_VFX:
+                    if self._stamp_packed_fx(window, vw, vh):
+                        ai = si = bi = ki = -1
+                    else:
+                        ai = boost.aura_i
+                        si = boost.sw_i
+                        bi = boost.bar_i
+                        ki = boost.spark_i
+                    gh.fx(
+                        window, vw, vh,
+                        ai, si, bi,
+                        AURA_TIP_X, AURA_TIP_Y, SW_TIP_X,
+                        ki, BAR_TIP_X, SPARK_FRONT_X, SPARK_MID_Y,
+                    )
             finally:
                 _brk_exit()
             fx_us = _us_diff(_mono_us(), t_fx)
@@ -6292,7 +8163,8 @@ class Sprite:
                 self._native_ready = False
                 self._fx_in_buffer = False
                 self._play_valid = False
-        ocean = pack.by_name.get("ocean")
+        far = pack.by_name.get("far_bg")
+        mid = pack.by_name.get("mid_bg")
         off = int(self.scroll)
         self._playfield_stamped = False
         # Backdrop already includes sky, water, scenery and the grass/dirt band.
@@ -6371,6 +8243,7 @@ class Sprite:
                     self.ocean_stamps,
                     self.ocean_window,
                     W,
+                    SEA_SHIFT,
                 )
             else:
                 copy_ocean_window(
@@ -6387,10 +8260,12 @@ class Sprite:
             self._play_valid = False
             self._sprites_on = False
             push_buf = self.ocean_window
-        if window_ready and self._sprite_bake and not stamped:
+        if window_ready and not stamped and push_buf is not None and self._sprite_bake:
             try:
                 t0 = _mono_us()
-                self._stamp_playfield_sprites(amount, False)
+                # Characters go into the same buffer as the backdrop, after
+                # it, so the push already has Sonic and Chao on top.
+                self._stamp_playfield_sprites(amount, False, push_buf)
                 stamp_us = _us_diff(_mono_us(), t0)
                 stamped = True
             except Exception as e:
@@ -6399,6 +8274,10 @@ class Sprite:
                 window_ready = False
                 stamped = False
                 print("sprite stamp failed:", e)
+        # Do not present a scenery-only frame. If the sprites are not in
+        # the buffer, skip the push and draw background then characters.
+        if window_ready and not stamped:
+            window_ready = False
         if window_ready:
             t0 = _mono_us()
             hand = self._present_copy(push_buf)
@@ -6419,18 +8298,43 @@ class Sprite:
             self._note_timing(compose_us, stamp_us, push_us, held)
         if not self._playfield_stamped:
             if not window_ready:
-                if ocean is not None:
-                    blit_tiled_x(lcd, pack, ocean, 0, off, pal_b, 0, GAUGE_Y)
+                if far is not None:
+                    blit_tiled_x(lcd, pack, far, 0, off, pal_b, 0, GAUGE_Y)
+                if mid is not None:
+                    blit_tiled_x(
+                        lcd, pack, mid, far.h if far is not None else HORIZON_Y,
+                        off, pal_b, 0, GAUGE_Y,
+                    )
             self._blit_playfield_sprites(lcd, pal_s, pal_c, off)
-        # Aura / shockwave on top of Sonic, after the playfield push.
-        self.boost.draw_behind(lcd, AURA_TIP_X, AURA_TIP_Y)
-        self.boost.draw_front(lcd, SW_TIP_X, AURA_TIP_Y)
+        # Packed boost frames, or the procedural fallback, after the push.
+        if not self._blit_packed_fx(lcd):
+            self.boost.draw_behind(lcd, AURA_TIP_X, AURA_TIP_Y)
+            self.boost.draw_front(lcd, SW_TIP_X, AURA_TIP_Y)
 
     def _wrapped(self, x, w, off):
-        xx = (x - off) % PERIOD
-        for cand in (xx, xx - PERIOD):
+        """Screen left edges for a prop whose world left is x and width is w.
+
+        x is the left edge, not the center. A loop whose center has crossed
+        the right edge still overlaps the screen, so callers that anchor on
+        a center pass center - half_width. Copies one period left and right
+        are kept when they still touch the panel.
+        """
+        span = PERIOD
+        if span <= 0 or w <= 0:
+            return
+        xx = (int(x) - int(off)) % span
+        for cand in (xx - span, xx, xx + span):
             if cand < W and cand + w > 0:
                 yield cand
+
+    def _wrapped_center(self, cx, half_w, off):
+        """Centers of a prop that is 2*half_w wide and may straddle an edge."""
+        if half_w < 1:
+            half_w = 1
+        left = int(cx) - int(half_w)
+        width = int(half_w) * 2
+        for edge in self._wrapped(left, width, off):
+            yield edge + int(half_w)
 
     def _draw_background(self, lcd):
         gy = self.ground_y
@@ -6441,7 +8345,7 @@ class Sprite:
         off_i = int(self.scroll * 0.6)
 
         for cx, cy, rx, ry in CLOUDS:
-            for x in self._wrapped(cx, rx * 2, off_c):
+            for x in self._wrapped_center(cx, rx, off_c):
                 fill_ellipse(lcd, x, cy, rx, ry, COL_CLOUD)
 
         base = WATER_Y + 2
@@ -6459,62 +8363,87 @@ class Sprite:
 
         lcd.fillRect(0, WATER_Y, W, WATER_H, COL_WATER)
         lcd.fillRect(0, WATER_Y + 2, W, 1, COL_WATER_HI)
-        sh = int(self.scroll * 0.25) % 6
-        lcd.fillRect(0, WATER_Y + 5, W, 1, COL_WATER_HI if sh < 3 else COL_WATER)
-        lcd.fillRect(0, WATER_Y + 8, W, 1, COL_WATER if sh < 3 else COL_WATER_HI)
+        # First sea frame. Later frames of the sheet stay parked.
+        lcd.fillRect(0, WATER_Y + 5, W, 1, COL_WATER_HI)
+        lcd.fillRect(0, WATER_Y + 8, W, 1, COL_WATER)
 
         for ix, rx, ry in ISLANDS:
-            for x in self._wrapped(ix, rx * 2, off_i):
+            for x in self._wrapped_center(ix, rx, off_i):
                 fill_ellipse(lcd, x, WATER_Y + 2, rx, ry, COL_MTN_GRASS)
                 fill_ellipse(lcd, x, WATER_Y, rx - 2, 2, COL_GRASS)
 
-        for hx, rx, ry in HILLS:
-            for x in self._wrapped(hx, rx * 2, off):
-                fill_ellipse(lcd, x, gy - GRASS_H + 2, rx, ry, COL_GRASS_DK)
-                fill_ellipse(lcd, x, gy - GRASS_H, rx - 2, ry - 2, COL_GRASS)
+        cell = TILE
+        checker_rows = CHECKER_ROWS if CHECKER_ROWS > 0 else 1
+        grass_band = GRASS_H - 2
+        dirt_top = gy - checker_rows * cell
+        grass_top = dirt_top - grass_band
+        surface = grass_top
 
-        for x in self._wrapped(LOOP_X, LOOP_RO * 2, off):
+        for hx, rx, ry in HILLS:
+            for x in self._wrapped_center(hx, rx, off):
+                fill_ellipse(lcd, x, surface + 2, rx, ry, COL_GRASS_DK)
+                fill_ellipse(lcd, x, surface, rx - 2, ry - 2, COL_GRASS)
+
+        # The island under the loop sticks out past the ring.
+        loop_half = LOOP_RO + 6
+        for x in self._wrapped_center(LOOP_X, loop_half, off):
             self._draw_loop(lcd, x, gy - LOOP_RO - 2)
 
         for px, ph in PALMS:
-            for x in self._wrapped(px, 22, off):
-                self._draw_palm(lcd, x, gy - GRASS_H + 2, ph)
+            # Trunk x, fronds reach about 10 px to either side.
+            for x in self._wrapped(px - 10, 22, off):
+                self._draw_palm(lcd, x + 10, surface + 2, ph)
 
-        # After-style checker dirt with a bevel, plus a denser grass crown.
-        start = -(off % TILE)
+        # Grass surface, then two checker rows. A taller band repeats the
+        # pair. The animated grass-top frame strip is not drawn. TILE x
+        # TILE, clipped at the edges. World x picks the color, and 180 is
+        # a multiple of TILE, so the period wrap continues.
+        off_i = int(off)
+        start = -(off_i % cell)
+        if start > 0:
+            start -= cell
         x = start
-        dirt_y = gy - 2
-        grass_y = gy - GRASS_H
         while x < W:
-            cx = ((x + off) // TILE) & 1
-            on = cx == 0
-            # grass band
-            lcd.fillRect(x, grass_y, TILE, GRASS_H - 2, COL_GRASS if on else COL_GRASS_DK)
-            # bevelled dirt cell
-            base = COL_DIRT if on else COL_DIRT_DK
-            lcd.fillRect(x, dirt_y, TILE, 3, base)
-            lcd.fillRect(x, dirt_y, TILE, 1, COL_DIRT_HI if on else COL_DIRT)
-            lcd.fillRect(x, dirt_y + 2, TILE, 1, COL_DIRT_SH)
-            lcd.fillRect(x, dirt_y, 1, 3, COL_MORTAR)
-            x += TILE
-        # vertical grass blades so the crown reads after-like at 128
+            world = x + off_i
+            on = ((world // cell) & 1) == 0
+            fill_rect_clip(
+                lcd, x, grass_top, cell, grass_band,
+                COL_GRASS if on else COL_GRASS_DK,
+            )
+            row = 0
+            while row < checker_rows:
+                phase = (row & 1) == 0
+                cell_on = on if phase else (not on)
+                base = COL_DIRT if cell_on else COL_DIRT_DK
+                hi = COL_DIRT_HI if cell_on else COL_DIRT
+                y0 = dirt_top + row * cell
+                fill_rect_clip(lcd, x, y0, cell, cell, base)
+                fill_rect_clip(lcd, x, y0, cell, 1, hi)
+                fill_rect_clip(lcd, x, y0 + cell - 1, cell, 1, COL_DIRT_SH)
+                fill_rect_clip(lcd, x, y0, 1, cell, COL_MORTAR)
+                row += 1
+            x += cell
+        # Surface crown. Not the separate grass-top animation frames.
         bx = -(off % 3)
         while bx < W:
             h = 3 + ((bx + off) & 3)
             col = COL_GRASS_BL if ((bx + off) & 1) == 0 else COL_GRASS
-            lcd.fillRect(bx, grass_y - h + 2, 1, h, col)
+            fill_rect_clip(lcd, bx, grass_top - h + 2, 1, h, col)
             bx += 3
 
+        fw, fh = _FLOWER_WH[FLOWER_FRAME]
         for fx, col in FLOWERS:
-            for x in self._wrapped(fx, 3, off):
-                lcd.fillRect(x, gy - GRASS_H - 1, 2, 2, col)
+            for x in self._wrapped(fx, fw, off):
+                fill_rect_clip(lcd, x, surface - fh, fw, fh, col)
 
         for sx, sh in SUNFLOWERS:
-            for x in self._wrapped(sx, 8, off):
-                self._draw_sunflower(lcd, x, gy - GRASS_H, sh)
+            for x in self._wrapped_center(sx, 4, off):
+                self._draw_sunflower(lcd, x, surface, sh)
 
-        for rx, ry, rrx, rry in FIELD_RINGS:
-            for x in self._wrapped(rx, rrx * 2, off):
+        for i, (rx, ry, rrx, rry) in enumerate(FIELD_RINGS):
+            if self._ring_taken(i):
+                continue
+            for x in self._wrapped_center(rx, rrx, off):
                 self._draw_field_ring(lcd, x, ry, rrx, rry)
 
     def _draw_loop(self, lcd, cx, gy):
@@ -6545,7 +8474,6 @@ class Sprite:
         fill_triangle(lcd, tx, ty, tx + 10, ty + 2, tx + 4, ty - 6, COL_PALM)
         fill_triangle(lcd, tx, ty, tx - 6, ty - 8, tx + 6, ty - 8, COL_PALM_LT)
         fill_triangle(lcd, tx, ty, tx - 8, ty + 6, tx + 2, ty + 4, COL_PALM)
-        fill_ellipse(lcd, tx, ty, 2, 2, COL_TRUNK)
 
     def _draw_sonic(self, lcd, speed, tps, clt):
         # Two-head-tall chibi, facing right, centered in the playfield.
@@ -6701,15 +8629,58 @@ def make_canvas(lcd):
 class ButtonWatch:
     """Poll the face button on every call. One press starts the bench sweep.
 
+    A second press inside AUTO_SWEEP_DOUBLE_MS toggles auto-sweep and does
+    not start the sweep. The single press is held until that window passes.
     M5.update() runs at most once per FRAME_MIN_MS. wasClicked is read in
     that same call. Extra polls during a paint only feed the watchdog.
     BtnA, Btn, and BtnPWR only. This board has no touch screen.
     """
 
-    def __init__(self, btn, on_press=None):
+    def __init__(self, btn, on_press=None, on_double=None):
         self.btn = btn
         self.on_press = on_press
+        self.on_double = on_double
         self._last_poll = None
+        self._pending = None
+
+    def _click_count(self):
+        btn = self.btn
+        if btn is None:
+            return 0
+        count = 0
+        if hasattr(btn, "wasClicked"):
+            try:
+                raw = btn.wasClicked()
+            except Exception:
+                raw = 0
+            if raw is True:
+                count = 1
+            elif raw is False or raw is None:
+                count = 0
+            else:
+                try:
+                    count = int(raw)
+                except Exception:
+                    count = 1 if raw else 0
+        if hasattr(btn, "wasDoubleClicked"):
+            try:
+                if btn.wasDoubleClicked() and count < 2:
+                    count = 2
+            except Exception:
+                pass
+        if count < 0:
+            count = 0
+        return count
+
+    def _flush_single(self, now):
+        pending = self._pending
+        if pending is None:
+            return
+        gap = time.ticks_diff(now, pending)
+        if gap < 0 or gap > AUTO_SWEEP_DOUBLE_MS:
+            self._pending = None
+            if self.on_press is not None:
+                self.on_press(now)
 
     def poll(self, now=None):
         _brk_enter("poll")
@@ -6727,25 +8698,21 @@ class ButtonWatch:
                 M5.update()
             finally:
                 _brk_exit()
-            btn = self.btn
-            if btn is None:
-                return False
-            clicked = False
-            if hasattr(btn, "wasClicked"):
-                try:
-                    clicked = bool(btn.wasClicked())
-                except Exception:
-                    clicked = False
-            if hasattr(btn, "wasDoubleClicked"):
-                try:
-                    extra = bool(btn.wasDoubleClicked())
-                except Exception:
-                    extra = False
-                if extra and not clicked:
-                    clicked = True
-            if clicked and self.on_press is not None:
-                self.on_press(now)
-            return clicked
+            self._flush_single(now)
+            count = self._click_count()
+            if count >= 2 or (
+                count == 1
+                and self._pending is not None
+                and 0 <= time.ticks_diff(now, self._pending) <= AUTO_SWEEP_DOUBLE_MS
+            ):
+                self._pending = None
+                if self.on_double is not None:
+                    self.on_double(now)
+                return True
+            if count == 1:
+                self._pending = now
+                return True
+            return False
         finally:
             _brk_exit()
 
@@ -6797,12 +8764,15 @@ class Dashboard:
         t_adv = _mono_us()
         _brk_enter("adv")
         try:
-            self.sprite.advance(speed, dt, rpm)
+            brk = values.get("brk")
+            if brk is None:
+                brk = 0.0
+            self.sprite.advance(speed, dt, rpm, brk)
         finally:
             _brk_exit()
         _flow_add("adv", _us_diff(_mono_us(), t_adv))
 
-        # pushImage already covers y 0-102. Gauges repaint y 103-127.
+        # The sea tile is the full 128. Gauges repaint y 103-127 on top of it.
         # Skipping fillScreen and the canvas push avoids a second full-panel
         # flush and a clear that would wipe the playfield.
         direct = self._direct_playfield()
@@ -6925,34 +8895,165 @@ def init_can():
     )
 
 
-def pull_frames(bus, values):
+# One frame buffer for the whole session. UiFlow CAN.recv allocates a
+# tuple and a bytes object when no list is passed, and its default
+# timeout is 5 seconds. On a live car bus that allocation repeats every
+# frame until a collect stalls the panel; the task watchdog then resets
+# the board. Off the car the queue is empty, so this path never runs.
+# m5can fills this list and returns it. A timeout returns None and does
+# not write the list. The memoryview length is then the DLC, so the next
+# clear must not walk eight slots.
+_CAN_DATA = bytearray(8)
+_CAN_FRAME = [0, False, False, 0, memoryview(_CAN_DATA)]
+
+
+# Drain budget, restart spacing, and the pause after any() stays true
+# with no frame. A plugged bus that never delivers must not sit in the
+# driver ahead of ui.tick.
+CAN_DRAIN_US = 2500
+CAN_RESTART_MS = 500
+CAN_STICK_MS = 200
+CAN_INIT_MS = 2000
+CAN_TEL_MS = 2000
+_can_restart_ms = None
+_can_stick_until = None
+_can_tel_ms = 0
+_CAN_TEL = {"rx": 0, "err": 0}
+
+
+def _can_recover(bus, now):
+    """Restart a stopped or bus-off controller, at most twice a second."""
+    global _can_restart_ms
+    state = getattr(bus, "state", None)
+    restart = getattr(bus, "restart", None)
+    if state is None or restart is None:
+        return
+    if _can_restart_ms is not None and time.ticks_diff(now, _can_restart_ms) < CAN_RESTART_MS:
+        return
+    try:
+        st = state()
+    except Exception:
+        return
+    # CAN.STOPPED is 0, CAN.BUS_OFF is 4. RECOVERING (5) is already in progress.
+    if st != 0 and st != 4:
+        return
+    _can_restart_ms = now
+    try:
+        restart()
+    except Exception:
+        pass
+
+
+def _can_note(now):
+    """One short line every two seconds, and only if stdout will not block."""
+    global _can_tel_ms
+    if _can_tel_ms != 0 and time.ticks_diff(now, _can_tel_ms) < CAN_TEL_MS:
+        return
+    if not _stdout_can_write():
+        return
+    _can_tel_ms = now
+    print("can rx %d err %d" % (_CAN_TEL["rx"], _CAN_TEL["err"]))
+    _CAN_TEL["rx"] = 0
+    _CAN_TEL["err"] = 0
+
+
+def _can_waiting(bus):
+    """True when the RX queue reports a frame. fifo 0, else any()."""
+    try:
+        return bus.any(0)
+    except TypeError:
+        try:
+            return bus.any()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _can_read(bus, frame):
+    """One queued frame. timeout is 0. A bare recv() is never used.
+
+    The reused list is the primary path. m5can returns that list after
+    filling it, and returns None on timeout without writing it. A fill
+    that still returns None is a frame: the id slot is None before the
+    call. Any error, not only TypeError, tries recv(0, timeout=0). That
+    call allocates a tuple only when it actually returns a frame.
+    """
+    frame[0] = None
+    try:
+        got = bus.recv(0, frame, timeout=0)
+    except Exception:
+        _CAN_TEL["err"] += 1
+        got = None
+    else:
+        if got:
+            return got
+        if frame[0] is not None:
+            return frame
+    try:
+        return bus.recv(0, timeout=0)
+    except Exception:
+        _CAN_TEL["err"] += 1
+        return None
+
+
+def pull_frames(bus, values, now=None):
+    """Drain queued CAN frames without waiting and without allocating.
+
+    At most 64 frames or CAN_DRAIN_US, whichever comes first. timeout is
+    always 0. A bare recv() is never used. If any() stays true after both
+    reads return nothing, the next drains wait CAN_STICK_MS so a stuck
+    flag cannot call the driver on every frame.
+    """
+    global _can_stick_until
+    if now is None:
+        now = time.ticks_ms()
+    if _can_stick_until is not None and time.ticks_diff(_can_stick_until, now) > 0:
+        return 0
+    try:
+        _can_recover(bus, now)
+    except Exception:
+        _CAN_TEL["err"] += 1
+        return 0
     n = 0
-    while True:
-        waiting = False
-        try:
-            waiting = bus.any(0)
-        except TypeError:
-            waiting = bus.any()
+    frame = _CAN_FRAME
+    t0 = _mono_us()
+    while n < 64:
+        if _us_diff(_mono_us(), t0) >= CAN_DRAIN_US:
+            break
+        waiting = _can_waiting(bus)
+        if waiting is None:
+            _CAN_TEL["err"] += 1
+            break
         if not waiting:
+            _can_stick_until = None
+            break
+        data = frame[4]
+        nbyte = len(data)
+        i = 0
+        while i < nbyte:
+            data[i] = 0
+            i += 1
+        got = _can_read(bus, frame)
+        if not got:
+            if _can_waiting(bus):
+                _can_stick_until = _ticks_add(now, CAN_STICK_MS)
             break
         try:
-            msg = bus.recv(0, timeout=0)
-        except TypeError:
-            msg = bus.recv()
-        if not msg:
-            break
-        data = msg[-1]
-        decoded = decode_frame(msg[0], data)
-        if decoded is not None:
-            values[decoded[0]] = decoded[1]
-        # Brake switch lives on the same 0x17C frame as RPM.
-        if msg[0] == ID_RPM and data is not None and len(data) >= 5:
-            values["brk"] = 1.0 if (data[4] & 0x01) else 0.0
+            can_id = got[0]
+            payload = got[4]
+            decoded = decode_frame(can_id, payload)
+            if decoded is not None:
+                values[decoded[0]] = decoded[1]
+            # Brake switch lives on the same 0x17C frame as RPM.
+            if can_id == ID_RPM and payload is not None and len(payload) >= 5:
+                values["brk"] = 1.0 if (payload[4] & 0x01) else 0.0
+        except Exception:
+            _CAN_TEL["err"] += 1
         n += 1
         if (n & 7) == 0:
             _service()
-        if n >= 64:
-            break
+    _CAN_TEL["rx"] += n
     return n
 
 
@@ -6987,7 +9088,7 @@ def main():
     _show_boot_splash(lcd)
     pack = try_load_pixidx()
     sweep = Sweep()
-    button = ButtonWatch(find_btn(), sweep.start)
+    button = ButtonWatch(find_btn(), sweep.start, toggle_auto_sweep)
     # Ocean and sprite caches allocate here. Arm the watchdog after that so
     # the first build cannot reset the device.
     ui = Dashboard(lcd, pack, button=button)
@@ -6997,11 +9098,19 @@ def main():
         button.poll(time.ticks_ms())
 
     _BTN_HOOK = _face_hook
-    try:
-        import ota_client
-    except ImportError:
-        ota_client = None
-    _install_ota_fetch_timeout(ota_client)
+    ota_client = None
+    if OTA_ENABLED:
+        try:
+            import ota_client
+        except ImportError:
+            ota_client = None
+        _install_ota_fetch_timeout(ota_client)
+    else:
+        print("ota off")
+    if _auto_sweep_enabled:
+        print("auto-sweep on")
+    else:
+        print("auto-sweep off")
     _last_fetch_ms = -PIXIDX_FETCH_EVERY_MS
 
     values = {"spd": 0.0, "rpm": 800.0, "tps": 0.0, "clt": 70.0, "brk": 0.0}
@@ -7019,125 +9128,172 @@ def main():
     except Exception:
         bus = None
 
+    loop_err_ms = 0
+    gc_room_ms = 0
+    can_init_ms = 0
     while True:
-        iter_us = _mono_us()
-        _feed_wdt()
-        if next_draw is not None:
-            # Sleep the microsecond leftover once. Do not come back and
-            # sleep_ms a remainder smaller than the 10 ms tick.
-            remain = _us_diff(next_draw, _mono_us())
-            if remain > 0:
-                _feed_wdt()
-                _brk_enter("sleep")
+        try:
+            iter_us = _mono_us()
+            _feed_wdt()
+            if next_draw is not None:
+                # Sleep the microsecond leftover once. Do not come back and
+                # sleep_ms a remainder smaller than the 10 ms tick.
+                remain = _us_diff(next_draw, _mono_us())
+                if remain > 0:
+                    _feed_wdt()
+                    _brk_enter("sleep")
+                    try:
+                        _sleep_us(remain)
+                    finally:
+                        _brk_exit()
+            now = time.ticks_ms()
+            if present_t0 is None:
+                present_t0 = now
+            frame_started = _mono_us()
+            _report_presented(now)
+            button.poll(now)
+            _poll_flash_quiet()
+
+            if sweep.active:
+                _brk_enter("sweep")
                 try:
-                    _sleep_us(remain)
+                    swept = sweep.step(now)
+                    if swept is not None:
+                        values.update(swept)
+                    fault = False
                 finally:
                     _brk_exit()
-        now = time.ticks_ms()
-        if present_t0 is None:
-            present_t0 = now
-        frame_started = _mono_us()
-        _report_presented(now)
-        button.poll(now)
-
-        if sweep.active:
-            _brk_enter("sweep")
-            try:
-                swept = sweep.step(now)
-                if swept is not None:
-                    values.update(swept)
-                fault = False
-            finally:
-                _brk_exit()
-        else:
-            _brk_enter("can")
-            try:
-                if bus is not None:
-                    if pull_frames(bus, values):
-                        last_rx_ms = now
-                fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
-            finally:
-                _brk_exit()
-
-        _brk_enter("auto")
-        try:
-            start_auto, boot_sweep_armed, sweep_idle_since = auto_sweep_due(
-                now,
-                present_t0,
-                sweep.active,
-                live_can(bus, last_rx_ms, now),
-                boot_sweep_armed,
-                sweep_idle_since,
-            )
-            if start_auto:
-                sweep.start(now)
-                swept = sweep.step(now)
-                if swept is not None:
-                    values.update(swept)
-                fault = False
-                _brk_enter("serial")
+            else:
+                _brk_enter("can")
                 try:
-                    print("auto-sweep")
+                    try:
+                        if bus is None and (
+                            can_init_ms == 0 or time.ticks_diff(now, can_init_ms) >= CAN_INIT_MS
+                        ):
+                            can_init_ms = now
+                            try:
+                                bus = init_can()
+                            except Exception:
+                                bus = None
+                                _CAN_TEL["err"] += 1
+                        if bus is not None:
+                            nrx = pull_frames(bus, values, now)
+                            if nrx:
+                                last_rx_ms = now
+                    except Exception:
+                        _CAN_TEL["err"] += 1
+                    fault = bus is None or last_rx_ms == 0 or time.ticks_diff(now, last_rx_ms) > WATCHDOG_MS
+                    try:
+                        _can_note(now)
+                    except Exception:
+                        pass
                 finally:
                     _brk_exit()
-        finally:
-            _brk_exit()
 
-        if ota_client is not None and (
-            last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
-        ):
-            _brk_enter("ota")
+            _brk_enter("auto")
             try:
-                last_ota_ms = now
-                _service()
+                start_auto, boot_sweep_armed, sweep_idle_since = auto_sweep_due(
+                    now,
+                    present_t0,
+                    sweep.active,
+                    live_can(bus, last_rx_ms, now),
+                    boot_sweep_armed,
+                    sweep_idle_since,
+                    _auto_sweep_enabled,
+                )
+                if start_auto:
+                    sweep.start(now)
+                    swept = sweep.step(now)
+                    if swept is not None:
+                        values.update(swept)
+                    fault = False
+                    _brk_enter("serial")
+                    try:
+                        print("auto-sweep")
+                    finally:
+                        _brk_exit()
+            finally:
+                _brk_exit()
+
+            if OTA_ENABLED and ota_client is not None and (
+                last_ota_ms == 0 or time.ticks_diff(now, last_ota_ms) >= OTA_POLL_MS
+            ):
+                _brk_enter("ota")
                 try:
-                    ota_client.poll(now)
-                except Exception:
-                    pass
-            finally:
-                _brk_exit()
+                    last_ota_ms = now
+                    _service()
+                    try:
+                        ota_client.poll(now)
+                    except Exception:
+                        pass
+                finally:
+                    _brk_exit()
 
-        if ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
-            # Keep retrying while the current pack is missing or was rejected
-            # (a leftover V6 file must not block the download).
-            _brk_enter("pix")
+            if OTA_ENABLED and ui.sprite.pack is None and time.ticks_diff(now, _last_fetch_ms) >= PIXIDX_FETCH_EVERY_MS:
+                # Keep retrying while the current pack is missing or was rejected
+                # (a leftover V6 file must not block the download).
+                _brk_enter("pix")
+                try:
+                    wifi_ok = False
+                    if ota_client is not None and hasattr(ota_client, "wifi_connected"):
+                        try:
+                            wifi_ok = bool(ota_client.wifi_connected())
+                        except Exception:
+                            wifi_ok = False
+                    if wifi_ok or ota_client is None:
+                        _last_fetch_ms = now
+                        try:
+                            fetched = try_fetch_pixidx()
+                        except Exception:
+                            fetched = None
+                        if fetched is not None:
+                            ui.sprite.pack = fetched
+                            ui.sprite._sync_ground()
+                finally:
+                    _brk_exit()
+
+            _flow_add("loop", _us_diff(_mono_us(), loop_mark))
+            ui.tick(values, fault, now)
+            # The panel has this frame. One slice, including when this frame
+            # already ran long, so a drive cannot fill the heap and stall.
+            _gc_after_present(_us_diff(_mono_us(), frame_started))
+            # Once a minute, finish a cycle if the slices have not kept a
+            # 16-byte hole. An overnight desk run otherwise fills the heap.
+            if gc_room_ms == 0 or time.ticks_diff(now, gc_room_ms) >= 60000:
+                gc_room_ms = now
+                _gc_make_room()
+            # The panel already has this frame. The flash write is not
+            # inside compose, stamp, or the push.
             try:
-                wifi_ok = False
-                if ota_client is not None and hasattr(ota_client, "wifi_connected"):
-                    try:
-                        wifi_ok = bool(ota_client.wifi_connected())
-                    except Exception:
-                        wifi_ok = False
-                if wifi_ok or ota_client is None:
-                    _last_fetch_ms = now
-                    try:
-                        fetched = try_fetch_pixidx()
-                    except Exception:
-                        fetched = None
-                    if fetched is not None:
-                        ui.sprite.pack = fetched
-                        ui.sprite._sync_ground()
+                ui.sprite.save_rings(now)
+            except Exception:
+                pass
+            _brk_enter("pace")
+            try:
+                next_draw = pace_after(frame_started, _mono_us())
             finally:
                 _brk_exit()
-
-        _flow_add("loop", _us_diff(_mono_us(), loop_mark))
-        ui.tick(values, fault, now)
-        # The panel has this frame. One slice only if this 33 ms budget
-        # still has room. The pace below sleeps what remains.
-        _gc_after_present(_us_diff(_mono_us(), frame_started))
-        _brk_enter("pace")
-        try:
-            next_draw = pace_after(frame_started, _mono_us())
-        finally:
-            _brk_exit()
-        loop_mark = _mono_us()
-        _brk_enter("serial")
-        try:
-            _brk_maybe_print(now)
-        finally:
-            _brk_exit()
-        _brk_commit(_us_diff(_mono_us(), iter_us))
-
+            loop_mark = _mono_us()
+            _brk_enter("serial")
+            try:
+                _brk_maybe_print(now)
+            finally:
+                _brk_exit()
+            _brk_commit(_us_diff(_mono_us(), iter_us))
+        except Exception as e:
+            _feed_wdt()
+            if isinstance(e, MemoryError):
+                _gc_make_room()
+            try:
+                err_now = time.ticks_ms()
+                if loop_err_ms == 0 or time.ticks_diff(err_now, loop_err_ms) >= 1000:
+                    loop_err_ms = err_now
+                    if _stdout_can_write():
+                        print("loop", e)
+                        sys.print_exception(e)
+            except Exception:
+                pass
+            _sleep_us(20000)
 
 if __name__ == "__main__":
     try:

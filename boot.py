@@ -16,6 +16,13 @@ except Exception as e:
 
 try:
     import ota_client
-    ota_client.boot_check()
+    # main.py owns OTA_ENABLED. A read error still boots; the check runs
+    # only when that flag is explicitly True (fail open if the file is unreadable).
+    try:
+        _ota_on = b"OTA_ENABLED = True" in open("main.py", "rb").read(16384)
+    except Exception:
+        _ota_on = True
+    if _ota_on:
+        ota_client.boot_check()
 except Exception as e:
     print("boot_check", e)

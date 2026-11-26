@@ -8,6 +8,11 @@ not a resample. White and black RGB565 are unchanged by a byte swap.
 W = 128
 H = 128
 _ROW = W // 8
+# splash_128.png is only #000000 and #FFFFFF, so a white stroke is an
+# exact white pixel (the set bit). No JPEG gray is in this mark.
+# Those strokes run from y 17 through y 121, center 69. The panel center
+# is 64. Drawing the mark 5 rows higher puts that center on the screen.
+DRAW_Y = -5
 BITS = (
     b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
     b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
@@ -176,10 +181,14 @@ def show(lcd):
         i = 0
         dy = 0
         while dy < n:
-            src = (y + dy) * _ROW
+            src_y = (y + dy) - DRAW_Y
+            src = src_y * _ROW
             dx = 0
             while dx < _ROW:
-                bits = BITS[src + dx]
+                if src_y < 0 or src_y >= H:
+                    bits = 0
+                else:
+                    bits = BITS[src + dx]
                 b = 0
                 while b < 8:
                     if bits & (0x80 >> b):

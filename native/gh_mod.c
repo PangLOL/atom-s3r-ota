@@ -5,7 +5,7 @@
    gh_render.copy(tile, tw, th, off, window, vw)
    gh_render.stamp(window, vw, vh, rgb, mask, sw, sh, x, y)
    gh_render.expand(src, stride, bpp, w, h, pairs, ncolors, dst)
-   gh_render.fx(window, vw, vh, aura_i, sw_i, bar_i, aura_x, aura_y, sw_x)
+   gh_render.fx(window, vw, vh, aura_i, sw_i, bar_i, spark_i, aura_x, aura_y, sw_x, bar_x, spark_x, spark_y)
    gh_render.digits(window, vw, vh, bx, by, rings)
    gh_render.refresh_ok()  -> present-ok / refresh ok only when gh_trace is set
 
@@ -68,7 +68,6 @@ static mp_obj_t gh_compose(size_t n_args, const mp_obj_t *args) {
     mp_obj_t *offs = NULL;
     int tw, th, vw, off_c, off_w, off_g, horizon, grass;
     size_t i;
-    (void)n_args;
     need_buf(args[0], &tile, 0);
     tw = arg_int(args[1]);
     th = arg_int(args[2]);
@@ -104,9 +103,14 @@ static mp_obj_t gh_compose(size_t n_args, const mp_obj_t *args) {
     }
     need_len(&tile, (size_t)tw * (size_t)th * 2, "tile");
     need_len(&win, (size_t)vw * (size_t)th * 2, "window");
-    gh_copy_rows(tile.buf, tw, 0, horizon, off_c, win.buf, vw, 0);
-    gh_copy_rows(tile.buf, tw, horizon, grass, off_w, win.buf, vw, horizon);
-    gh_copy_rows(tile.buf, tw, grass, th, off_g, win.buf, vw, grass);
+    {
+        int sea_dy = 0;
+        if (n_args >= 12) {
+            sea_dy = arg_int(args[11]);
+        }
+        gh_compose_bands(tile.buf, tw, th, off_c, off_w, off_g,
+                         horizon, grass, sea_dy, win.buf, vw);
+    }
     for (i = 0; i < nstamp; i++) {
         size_t len = 0;
         mp_obj_t *item = NULL;
@@ -142,7 +146,7 @@ static mp_obj_t gh_compose(size_t n_args, const mp_obj_t *args) {
     }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_compose_obj, 11, 11, gh_compose);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_compose_obj, 11, 12, gh_compose);
 
 static mp_obj_t gh_copy(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t tile, win;
@@ -214,6 +218,18 @@ static mp_obj_t gh_stamp_runs_fn(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_stamp_runs_obj, 9, 9, gh_stamp_runs_fn);
 
+static mp_obj_t gh_add_begin_fn(mp_obj_t vw_in, mp_obj_t vh_in) {
+    gh_add_begin(arg_int(vw_in), arg_int(vh_in));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(gh_add_begin_obj, gh_add_begin_fn);
+
+static mp_obj_t gh_add_end_fn(void) {
+    gh_add_end();
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(gh_add_end_obj, gh_add_end_fn);
+
 static mp_obj_t gh_push_in(void) {
     if (gh_trace) {
         mp_printf(&mp_plat_print, "push-in\n");
@@ -245,10 +261,33 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_expand_obj, 8, 8, gh_expand);
 static mp_obj_t gh_fx_fn(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t win;
     int vw, vh;
+    int spark_i;
+    int aura_x, aura_y, sw_x, bar_x, spark_x, spark_y;
     (void)n_args;
     need_buf(args[0], &win, 1);
     vw = arg_int(args[1]);
     vh = arg_int(args[2]);
+    aura_x = arg_int(args[6]);
+    aura_y = arg_int(args[7]);
+    sw_x = arg_int(args[8]);
+    /* Older callers stop after the shockwave tip. Sparks stay off and the
+       barrier uses that same x. */
+    spark_i = -1;
+    bar_x = sw_x;
+    spark_x = 22;
+    spark_y = 88;
+    if (n_args >= 10) {
+        spark_i = arg_int(args[9]);
+    }
+    if (n_args >= 11) {
+        bar_x = arg_int(args[10]);
+    }
+    if (n_args >= 12) {
+        spark_x = arg_int(args[11]);
+    }
+    if (n_args >= 13) {
+        spark_y = arg_int(args[12]);
+    }
     if (vw > 0 && vh > 0) {
         if (vh >= 64 && gh_stamp_pending) {
             if (gh_trace) {
@@ -258,15 +297,15 @@ static mp_obj_t gh_fx_fn(size_t n_args, const mp_obj_t *args) {
         }
         need_len(&win, (size_t)vw * (size_t)vh * 2, "window");
         gh_fx(win.buf, vw, vh,
-              arg_int(args[3]), arg_int(args[4]), arg_int(args[5]),
-              arg_int(args[6]), arg_int(args[7]), arg_int(args[8]));
+              arg_int(args[3]), arg_int(args[4]), arg_int(args[5]), spark_i,
+              aura_x, aura_y, sw_x, bar_x, spark_x, spark_y);
         if (vh >= 64 && gh_trace) {
             mp_printf(&mp_plat_print, "fx-ok\n");
         }
     }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_fx_obj, 9, 9, gh_fx_fn);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gh_fx_obj, 9, 13, gh_fx_fn);
 
 static mp_obj_t gh_digits(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t win;
@@ -305,6 +344,8 @@ mp_obj_t mpy_init(mp_obj_fun_bc_t *self, size_t n_args, size_t n_kw, mp_obj_t *a
     mp_store_global(MP_QSTR_copy, MP_OBJ_FROM_PTR(&gh_copy_obj));
     mp_store_global(MP_QSTR_stamp, MP_OBJ_FROM_PTR(&gh_stamp_obj));
     mp_store_global(MP_QSTR_stamp_runs, MP_OBJ_FROM_PTR(&gh_stamp_runs_obj));
+    mp_store_global(MP_QSTR_add_begin, MP_OBJ_FROM_PTR(&gh_add_begin_obj));
+    mp_store_global(MP_QSTR_add_end, MP_OBJ_FROM_PTR(&gh_add_end_obj));
     mp_store_global(MP_QSTR_push_in, MP_OBJ_FROM_PTR(&gh_push_in_obj));
     mp_store_global(MP_QSTR_expand, MP_OBJ_FROM_PTR(&gh_expand_obj));
     mp_store_global(MP_QSTR_fx, MP_OBJ_FROM_PTR(&gh_fx_obj));

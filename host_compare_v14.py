@@ -171,8 +171,7 @@ def main():
     assert digest == fw.PIXIDX_SHA256, digest
     assert len(raw) == fw.PIXIDX_SIZE
     pack = fw.PixIdx(raw)
-    ocean = pack.by_name["ocean"]
-    tile, tw, th = fw.prerender_ocean_rgb565(pack, ocean)
+    tile, tw, th = fw.prerender_sea_rgb565(pack)
     stamps = fw.build_parallax_layers(tile, tw, th)
     print("stamps", len(stamps), "tile", tw, th)
 
