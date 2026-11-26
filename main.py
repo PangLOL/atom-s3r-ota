@@ -40,6 +40,8 @@ first frame.
 The brake plays the three skid frames. They face right, with the smoke from the old hockey row.
 Stopped (speed under 1 km/h, the same gate as idle) with rpm above 1200
 plays the packed spindash cycle. At 1200 rpm or below, idle is unchanged.
+The HUD ring count is kept in ring_count.0 and ring_count.1. A hard
+power-off keeps the last slot that finished. The scroll masks are not saved.
 Chao cycles are normal_chao, amy_chao, knuckles_chao, sonic_chao, and
 tails_chao. Frames 0 and 1 join, switch sides, and leave. Frames 2 and 3
 hover at Sonic's head. One Chao, at 2 fps, for up to five minutes.
@@ -83,6 +85,7 @@ sweat droplets are not drawn.
 """
 
 import math
+import os
 import sys
 import time
 
@@ -570,6 +573,11 @@ HORIZON_Y = 53
 GRASS_Y = 88
 BLADE_ROWS = 16
 RING_PERIOD = 1536  # long gaps between groups of 3-8
+# HUD total only. Two slots: a hard power-off during one write leaves the
+# other. A flash sync at 1 Hz hitches, so a changed count is written after
+# the present, and at most once per RING_SAVE_MS. The scroll masks stay RAM.
+RING_COUNT_BASE = "ring_count"
+RING_SAVE_MS = 10000
 RING_FPS_MS = 1000 // 30  # 33
 
 # World-x of mid-ground ring centres. First group matches the after still
@@ -5447,6 +5455,111 @@ def _add_fx_runs(window, vw, vh, fr, pairs, x0, y0):
             window[di + 1] = (out >> 8) & 0xFF
 
 
+def _ring_parse(text):
+    """(seq, count) from one finished slot, or None when the bytes are torn."""
+    if not isinstance(text, str):
+        return None
+    n = len(text)
+    if n < 4 or n > 24 or text[n - 1] != "\n":
+        return None
+    sp = text.find(" ")
+    if sp <= 0 or sp >= n - 2:
+        return None
+    if text.find(" ", sp + 1) >= 0:
+        return None
+    seq_s = text[:sp]
+    count_s = text[sp + 1:n - 1]
+    if (not seq_s.isdigit()) or (not count_s.isdigit()):
+        return None
+    seq = int(seq_s)
+    count = int(count_s)
+    if seq < 1 or count > 999:
+        return None
+    return seq, count
+
+
+def _ring_slot_read(base, slot):
+    path = "%s.%d" % (base, slot)
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return None
+    try:
+        data = f.read(32)
+    except Exception:
+        return None
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+    if not data or len(data) > 24:
+        return None
+    try:
+        text = data.decode("ascii")
+    except Exception:
+        return None
+    return _ring_parse(text)
+
+
+def ring_count_load(base=None):
+    """(count, seq, slot). (0, 0, -1) when neither slot is a finished write.
+
+    The scroll masks are not in the file. A torn slot is ignored, so the
+    other slot is the count that survived a hard power-off.
+    """
+    if base is None:
+        base = RING_COUNT_BASE
+    try:
+        best = None
+        for slot in (0, 1):
+            parsed = _ring_slot_read(base, slot)
+            if parsed is None:
+                continue
+            seq, count = parsed
+            if best is None or seq > best[0] or (seq == best[0] and slot > best[1]):
+                best = (seq, slot, count)
+        if best is None:
+            return 0, 0, -1
+        return best[2], best[0], best[1]
+    except Exception:
+        return 0, 0, -1
+
+
+def ring_count_store(count, seq, slot, base=None):
+    """Commit one slot. The other slot stays until this rename finishes."""
+    if base is None:
+        base = RING_COUNT_BASE
+    count = int(count) % 1000
+    if count < 0:
+        count = 0
+    seq = int(seq)
+    if seq < 1:
+        seq = 1
+    slot = 0 if int(slot) == 0 else 1
+    dest = "%s.%d" % (base, slot)
+    tmp = dest + ".tmp"
+    payload = ("%d %d\n" % (seq, count)).encode("ascii")
+    f = open(tmp, "wb")
+    try:
+        f.write(payload)
+        try:
+            f.flush()
+        except Exception:
+            pass
+    finally:
+        f.close()
+    try:
+        os.remove(dest)
+    except OSError:
+        pass
+    os.rename(tmp, dest)
+    try:
+        os.sync()
+    except Exception:
+        pass
+
+
 class Sprite:
     """Composited chibi Sonic: separate pieces, swapped by speed, retimed by phase."""
 
@@ -5458,7 +5571,12 @@ class Sprite:
         self.body_col = COL_SONIC
         self.boost = BoostFX()
         self.pack = pack
-        self.rings = 0
+        count, seq, slot = ring_count_load()
+        self.rings = count
+        self._ring_seq = seq
+        self._ring_slot = slot
+        self._ring_dirty = False
+        self._ring_save_ms = None
         self._ring_seen = 0
         self._ring_got = 0
         self.anim_tag = "idle"
@@ -6295,6 +6413,9 @@ class Sprite:
                 n += v & 1
                 v >>= 1
             self.rings = (self.rings + n) % 1000
+            # Count only. The seen/got masks stay in RAM so a reboot does
+            # not skip or repeat rings from a stale scroll position.
+            self._ring_dirty = True
             if self.pack is not None:
                 period = RING_PERIOD
                 xs = FIELD_RING_X
@@ -6307,6 +6428,39 @@ class Sprite:
                     i += 1
         self._ring_seen = mask
         self._ring_got |= gained
+
+    def save_rings(self, now):
+        """Write the HUD count after the present, at most once per RING_SAVE_MS.
+
+        A hard power-off keeps the last slot that finished. Rings collected
+        since that write are still only in RAM. The masks are not written.
+        """
+        if not self._ring_dirty:
+            return False
+        last = self._ring_save_ms
+        if last is not None and time.ticks_diff(now, last) < RING_SAVE_MS:
+            return False
+        if self._ring_slot == 0:
+            slot = 1
+        else:
+            slot = 0
+        seq = self._ring_seq + 1
+        if seq < 1:
+            seq = 1
+        count = int(self.rings) % 1000
+        _feed_wdt()
+        try:
+            ring_count_store(count, seq, slot)
+        except Exception:
+            # Stay dirty, but do not retry on the next frame.
+            self._ring_save_ms = now
+            return False
+        self.rings = count
+        self._ring_seq = seq
+        self._ring_slot = slot
+        self._ring_dirty = False
+        self._ring_save_ms = now
+        return True
 
     def _draw_hud_digits(self, lcd, bx, by):
         dx, dy = bx + 22, by + 4
@@ -9108,6 +9262,12 @@ def main():
             if gc_room_ms == 0 or time.ticks_diff(now, gc_room_ms) >= 60000:
                 gc_room_ms = now
                 _gc_make_room()
+            # The panel already has this frame. The flash write is not
+            # inside compose, stamp, or the push.
+            try:
+                ui.sprite.save_rings(now)
+            except Exception:
+                pass
             _brk_enter("pace")
             try:
                 next_draw = pace_after(frame_started, _mono_us())

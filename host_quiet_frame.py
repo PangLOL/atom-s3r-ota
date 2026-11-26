@@ -1349,6 +1349,64 @@ def main():
     waiting.scroll = 0
     waiting._collect_rings()
     assert waiting._ring_taken(0) is False
+    import shutil
+    import tempfile
+    ring_dir = tempfile.mkdtemp()
+    saved_base = fw.RING_COUNT_BASE
+    fw.RING_COUNT_BASE = os.path.join(ring_dir, "ring_count")
+    try:
+        assert fw.ring_count_load() == (0, 0, -1)
+        fw.ring_count_store(256, 1, 0)
+        assert fw.ring_count_load() == (256, 1, 0)
+        # A hard power-off after the temp write, before the rename, keeps 256.
+        open(fw.RING_COUNT_BASE + ".1.tmp", "wb").write(b"2 300\n")
+        assert fw.ring_count_load() == (256, 1, 0)
+        # A torn slot is ignored. The finished slot remains.
+        open(fw.RING_COUNT_BASE + ".1", "wb").write(b"2 30")
+        assert fw.ring_count_load() == (256, 1, 0)
+        fw.ring_count_store(300, 2, 1)
+        assert fw.ring_count_load() == (300, 2, 1)
+        kept = fw.Sprite(_RingPack())
+        assert kept.rings == 300
+        assert kept._ring_seen == 0 and kept._ring_got == 0
+        kept.scroll = fw.FIELD_RING_X[0] - fw.SONIC_FRONT_X
+        kept._collect_rings()
+        assert kept.rings == 301 and kept._ring_dirty is True
+        assert kept._ring_seen != 0
+        # Collect marks the count dirty and does not touch flash.
+        assert fw.ring_count_load() == (300, 2, 1)
+        assert kept.save_rings(1000) is True
+        assert open(fw.RING_COUNT_BASE + ".0", "rb").read() == b"3 301\n"
+        assert b"seen" not in open(fw.RING_COUNT_BASE + ".0", "rb").read()
+        assert kept._ring_dirty is False
+        kept._ring_dirty = True
+        assert kept.save_rings(1000 + 100) is False
+        assert kept.save_rings(1000 + fw.RING_SAVE_MS) is True
+        assert fw.ring_count_load()[0] == 301
+        again = fw.Sprite(_RingPack())
+        assert again.rings == 301 and again._ring_seen == 0 and again._ring_got == 0
+        calls = {"n": 0}
+
+        def _boom(*_a, **_k):
+            calls["n"] += 1
+            raise OSError("full")
+
+        saved_store = fw.ring_count_store
+        fw.ring_count_store = _boom
+        try:
+            again._ring_dirty = True
+            again._ring_save_ms = None
+            assert again.save_rings(50000) is False
+            assert again._ring_dirty is True
+            assert again.save_rings(50000 + 10) is False
+            assert calls["n"] == 1
+            assert again.save_rings(50000 + fw.RING_SAVE_MS) is False
+            assert calls["n"] == 2
+        finally:
+            fw.ring_count_store = saved_store
+    finally:
+        fw.RING_COUNT_BASE = saved_base
+        shutil.rmtree(ring_dir)
     import gc as _gc
     _gc_calls = {"n": 0}
     _saved_collect = _gc.collect
