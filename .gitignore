@@ -8,3 +8,8 @@ native/build-xtensawin/
 native/build-x64/
 native/gh_render.mpy
 native/*.o
+p4/sonic_gauge/build/
+p4/sonic_gauge/managed_components/
+p4/sonic_gauge/sdkconfig
+p4/sonic_gauge/sdkconfig.old
+p4/sonic_gauge/dependencies.lock

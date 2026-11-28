@@ -1,0 +1,5 @@
+# Matches the table already on the P4. App slot is 0x20000, 3 MiB.
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x11000,  0x6000
+phy_init,   data, phy,     0x17000,  0x1000
+factory,    app,  factory, 0x20000,  0x300000
